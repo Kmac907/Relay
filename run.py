@@ -19,6 +19,8 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
+from repo import GENERATED_AGENTS_MARKER, TARGET_AGENTS, TARGET_AGENTS_SHA256, create_exclusive
+
 MARKER = re.compile(r"<!-- relay: planned-base=([0-9a-f]{7,64}) requirements=([0-9a-f]{6,64}) -->")
 TASK_HEADING = re.compile(r"^## (TASK-\d{4}) — (.+)$")
 BUG_HEADING = re.compile(r"^## (BUG-\d{4}) — (.+)$")
@@ -325,6 +327,7 @@ def initial_state(repo: Path, metadata: dict, args: argparse.Namespace) -> dict:
         "reviewSessions": {}, "pullRequests": {}, "providerAttemptCounters": {}, "providerOperationsStarted": 0, "providerDeadlines": {},
         "auditPlanStarted": False, "auditPlanCompleted": False, "auditCallsStarted": 0,
         "auditCallLimit": 0, "auditScopes": {}, "pendingLedgerOperation": None,
+        "targetInstructions": "", "agentsBootstrap": None,
     }
 
 
@@ -609,6 +612,7 @@ def invoke_agent(store: StateStore, semaphore: threading.Semaphore, repo: Path, 
         "exec", "--ephemeral", "--sandbox", "workspace-write" if role == "worker" else "read-only",
         "--cd", str(repo), "--output-schema", str(schema), "--output-last-message", str(output), "-",
     ]
+    prompt = f"Target repository instructions:\n{store.state.get('targetInstructions', '')}\n\n{prompt}"
     try:
         with semaphore:
             store.update(lambda state: state["activeProcesses"][process_id].update(status="running", startedAt=datetime.now(timezone.utc).isoformat()))
@@ -1165,6 +1169,19 @@ def bug_assignment(bug: dict) -> dict:
     return {"id": bug["id"], "title": bug["title"], "status": "ready", "priority": bug["severity"], "dependencies": [], "allowedPaths": bug["allowedPaths"], "acceptanceCriteria": [f"Resolve: {bug['failure']}", f"Meet requirement: {bug['requirement']}"], "validationCommands": [bug["reproduction"]]}
 
 
+def target_instructions(repo: Path, create: bool = False) -> tuple[str, bytes]:
+    path = repo / "AGENTS.md"
+    if not os.path.lexists(path) and create:
+        create_exclusive(path, TARGET_AGENTS)
+    if not path.is_file():
+        raise RuntimeError("AGENTS.md must be a regular UTF-8 file")
+    content = path.read_bytes()
+    try:
+        return content.decode("utf-8"), content
+    except UnicodeDecodeError as error:
+        raise RuntimeError("AGENTS.md must be UTF-8") from error
+
+
 def github_preflight(store: StateStore) -> None:
     if store.state.get("preflightCompleted"):
         return
@@ -1180,6 +1197,141 @@ def github_preflight(store: StateStore) -> None:
     provider_with_retries(store, "preflight:auth", "auth", "status")
     provider_with_retries(store, "preflight:repo", "repo", "view", github_repository)
     store.update(lambda state: state.__setitem__("preflightCompleted", True))
+
+
+def validate_agents_bootstrap(store: StateStore, worktree: Path, sha: str) -> None:
+    bootstrap = store.state["agentsBootstrap"]
+    base = bootstrap["baseSha"]
+    if git(worktree, "merge-base", "--is-ancestor", base, sha, timeout=store.state["validationTimeoutSeconds"], check=False).returncode:
+        raise RuntimeError("AGENTS.md bootstrap does not descend from its base")
+    changed = [line for line in git(worktree, "diff", "--name-only", f"{base}..{sha}", timeout=store.state["validationTimeoutSeconds"]).stdout.splitlines() if line]
+    blob = git(worktree, "show", f"{sha}:AGENTS.md", timeout=store.state["validationTimeoutSeconds"]).stdout.encode()
+    if changed != ["AGENTS.md"] or hashlib.sha256(blob).hexdigest() != bootstrap["contentHash"] or blob != TARGET_AGENTS.encode():
+        raise RuntimeError("AGENTS.md bootstrap candidate is not the exact generated file")
+
+
+def _agents_bootstrap_needs_user(store: StateStore, status: str) -> bool:
+    def update(state: dict) -> None:
+        state["agentsBootstrap"].update(phase="needs-user", providerStatus=status)
+        state["phase"] = "needs-user"
+    store.update(update)
+    return False
+
+
+def reconcile_agents_bootstrap(store: StateStore) -> bool:
+    repository = Path(store.state["repository"])
+    agents = repository / "AGENTS.md"
+    try:
+        git_provider_with_retries(store, "AGENTS:reconcile-fetch", repository, "fetch", "origin", "main")
+        remote_sha = git(repository, "rev-parse", "origin/main", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
+        remote_blob = git(repository, "show", f"{remote_sha}:AGENTS.md", timeout=store.state["validationTimeoutSeconds"]).stdout.encode()
+        if remote_blob != TARGET_AGENTS.encode():
+            raise RuntimeError("merged AGENTS.md does not match generated content")
+        head = git(repository, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
+        if os.path.lexists(agents) and not agents.is_file():
+            return _agents_bootstrap_needs_user(store, "generated-file-modified")
+        working = agents.read_bytes() if agents.is_file() else b""
+        if working and working != TARGET_AGENTS.encode() and (head != remote_sha or working.replace(b"\r\n", b"\n") != TARGET_AGENTS.encode()):
+            return _agents_bootstrap_needs_user(store, "generated-file-modified")
+        if head != remote_sha:
+            if os.path.lexists(agents):
+                agents.unlink()
+            git(repository, "merge", "--ff-only", "origin/main", timeout=store.state["validationTimeoutSeconds"])
+        elif not agents.is_file():
+            git(repository, "restore", "--source", "origin/main", "--", "AGENTS.md", timeout=store.state["validationTimeoutSeconds"])
+        if agents.read_bytes().replace(b"\r\n", b"\n") == TARGET_AGENTS.encode():
+            agents.write_bytes(TARGET_AGENTS.encode())
+        _, content = target_instructions(repository)
+        if content != TARGET_AGENTS.encode():
+            raise RuntimeError("working AGENTS.md does not match generated content")
+        cleanup_worktree(store, "AGENTS")
+        store.update(lambda state: (state["agentsBootstrap"].update(phase="complete", providerStatus="passed"), state.update(phase="build", targetInstructions=TARGET_AGENTS)))
+        return True
+    except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
+        return _agents_bootstrap_needs_user(store, str(error))
+
+
+def bootstrap_agents(store: StateStore) -> bool:
+    bootstrap = store.state.get("agentsBootstrap")
+    if not bootstrap or bootstrap["phase"] == "complete":
+        return True
+    if bootstrap["phase"] == "needs-user":
+        store.update(lambda state: state.__setitem__("phase", "needs-user"))
+        return False
+    repository = Path(store.state["repository"])
+    agents = repository / "AGENTS.md"
+    if bootstrap["phase"] == "reconciling":
+        return reconcile_agents_bootstrap(store)
+    if not agents.is_file() or agents.read_bytes() != TARGET_AGENTS.encode():
+        return _agents_bootstrap_needs_user(store, "generated-file-modified")
+    store.update(lambda state: state.update(phase="agents-bootstrap"))
+    try:
+        worktree = Path(bootstrap["worktree"])
+        branch = bootstrap["branch"]
+        if not bootstrap.get("candidateSha"):
+            if not worktree.exists():
+                worktree.parent.mkdir(parents=True, exist_ok=True)
+                branch_exists = git(repository, "show-ref", "--verify", f"refs/heads/{branch}", timeout=store.state["providerTimeoutSeconds"], check=False).returncode == 0
+                if branch_exists:
+                    git(repository, "worktree", "add", str(worktree), branch, timeout=store.state["providerTimeoutSeconds"])
+                else:
+                    git(repository, "worktree", "add", "-b", branch, str(worktree), bootstrap["baseSha"], timeout=store.state["providerTimeoutSeconds"])
+            top = git(worktree, "rev-parse", "--show-toplevel", timeout=store.state["providerTimeoutSeconds"]).stdout.strip()
+            if Path(top).resolve() != worktree.resolve():
+                raise RuntimeError("AGENTS.md bootstrap worktree mismatch")
+            store.update(lambda state: state["worktrees"].__setitem__("AGENTS", {"path": str(worktree), "branch": branch, "baseSha": bootstrap["baseSha"]}))
+            worktree_agents = worktree / "AGENTS.md"
+            if os.path.lexists(worktree_agents):
+                if not worktree_agents.is_file() or worktree_agents.read_bytes() != TARGET_AGENTS.encode():
+                    raise RuntimeError("unexpected AGENTS.md in bootstrap worktree")
+            else:
+                create_exclusive(worktree_agents, TARGET_AGENTS)
+            head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
+            if head == bootstrap["baseSha"]:
+                git(worktree, "add", "AGENTS.md", timeout=store.state["validationTimeoutSeconds"])
+                git(worktree, "commit", "-m", "Add Relay target instructions", timeout=store.state["validationTimeoutSeconds"])
+                head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
+            validate_agents_bootstrap(store, worktree, head)
+            store.update(lambda state: state["agentsBootstrap"].update(phase="publish", candidateSha=head))
+        sha = bootstrap["candidateSha"]
+        validate_agents_bootstrap(store, worktree, sha)
+        if bootstrap.get("pushedSha") != sha:
+            remote = git_provider_with_retries(store, "AGENTS:ls-remote", worktree, "ls-remote", "--heads", "origin", f"refs/heads/{branch}")
+            remote_sha = remote.stdout.split()[0] if remote.stdout.strip() else ""
+            if remote_sha and remote_sha != sha:
+                return _agents_bootstrap_needs_user(store, "remote-branch-drift")
+            if not remote_sha:
+                git_provider_with_retries(store, f"AGENTS:push:{sha}", worktree, "push", "--set-upstream", "origin", branch)
+            store.update(lambda state: state["agentsBootstrap"].update(phase="pull-request", pushedSha=sha))
+        pr = bootstrap.get("pr")
+        if not pr:
+            existing = provider_with_retries(store, "AGENTS:pr-list", "pr", "list", "--head", branch, "--state", "all", "--json", "number,url,headRefOid,state")
+            matches = json.loads(existing.stdout) if existing.stdout.strip() else []
+            if matches:
+                pr = matches[0]
+            else:
+                body = store.path.parent / ".AGENTS-pr.md"
+                atomic_write(body, f"Relay generated target instructions\n\nCandidate: {sha}\n")
+                try:
+                    provider_with_retries(store, "AGENTS:pr-create", "pr", "create", "--base", "main", "--head", branch, "--title", "Add Relay target instructions", "--body-file", str(body))
+                    pr = json.loads(provider_with_retries(store, "AGENTS:pr-view", "pr", "view", branch, "--json", "number,url,headRefOid,state").stdout)
+                finally:
+                    body.unlink(missing_ok=True)
+            if pr.get("headRefOid") != sha:
+                return _agents_bootstrap_needs_user(store, "sha-drift")
+            store.update(lambda state: (state["agentsBootstrap"].update(phase="checks", pr=pr), state["pullRequests"].__setitem__("AGENTS", pr)))
+        status = wait_for_checks(store, "AGENTS", pr, sha)
+        if status not in {"passed", "merged"}:
+            terminal = "needs-user" if status in {"failed", "sha-drift", "repair-required"} else "waiting-provider"
+            store.update(lambda state: (state["agentsBootstrap"].update(phase=terminal, providerStatus=status), state.__setitem__("phase", terminal)))
+            return False
+        if status == "passed":
+            store.update(lambda state: state["agentsBootstrap"].update(phase="merging", providerStatus="passed"))
+            provider_with_retries(store, "AGENTS:merge", "pr", "merge", str(pr["number"]), f"--{store.state['mergeMethod']}", "--delete-branch")
+        store.update(lambda state: (state["agentsBootstrap"].update(phase="reconciling", providerStatus="passed"), state["pullRequests"]["AGENTS"].update(state="MERGED")))
+        return reconcile_agents_bootstrap(store)
+    except (RuntimeError, ValueError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
+        return _agents_bootstrap_needs_user(store, str(error))
 
 
 def reconcile(store: StateStore) -> None:
@@ -1259,7 +1411,12 @@ def run_assignments(store: StateStore, semaphore: threading.Semaphore, assignmen
 
 def execute_campaign(store: StateStore, tasks: list[dict]) -> int:
     semaphore = threading.Semaphore(store.state["workerLimit"])
+    if (store.state.get("agentsBootstrap") or {}).get("phase") == "needs-user":
+        store.update(lambda state: state.__setitem__("phase", "needs-user"))
+        return 2
     github_preflight(store)
+    if not bootstrap_agents(store):
+        return 2
     by_id = {task["id"]: task for task in tasks}
     run_assignments(store, semaphore, tasks, "task")
     unfinished = [value for key, value in store.state["taskStates"].items() if key in by_id and value["phase"] != "integrated"]
@@ -1330,11 +1487,27 @@ def initialize_campaign(repo: Path, text: str, args: argparse.Namespace) -> tupl
         path = repo / name
         if path.exists():
             raise RuntimeError(f"refusing existing {path}")
+    instructions, agents_content = target_instructions(repo, create=True)
     relay = repo / ".relay"
     relay.mkdir(parents=True, exist_ok=False)
     (relay / "logs").mkdir()
     state = initial_state(repo, metadata, args)
     state["campaignId"] = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    state["targetInstructions"] = instructions
+    tracked_agents = git(repo, "cat-file", "-e", f"{metadata['baseSha']}:AGENTS.md", timeout=args.provider_timeout, check=False).returncode == 0
+    generated = agents_content == TARGET_AGENTS.encode()
+    marked = agents_content.startswith(GENERATED_AGENTS_MARKER.encode())
+    if marked and not generated:
+        state["phase"] = "needs-user"
+        state["agentsBootstrap"] = {"phase": "needs-user", "contentHash": TARGET_AGENTS_SHA256, "providerStatus": "generated-file-modified", "terminalCondition": "exact generated AGENTS.md merged into main"}
+    elif generated and not tracked_agents:
+        branch = f"relay/agents-bootstrap-{state['campaignId']}"
+        worktree = safe_within(Path(tempfile.gettempdir()).resolve() / "relay-worktrees" / state["campaignId"] / "AGENTS", Path(tempfile.gettempdir()).resolve() / "relay-worktrees" / state["campaignId"])
+        state["agentsBootstrap"] = {
+            "phase": "pending", "contentHash": TARGET_AGENTS_SHA256, "baseSha": metadata["baseSha"],
+            "branch": branch, "worktree": str(worktree), "candidateSha": "", "pushedSha": "", "pr": None,
+            "providerStatus": "pending", "terminalCondition": "exact generated AGENTS.md merged into main",
+        }
     store = StateStore(relay / "state.json", state)
     atomic_write(repo / "tasks.md", text)
     atomic_write(repo / "bugs.md", render_bugs(state["campaignId"], repo))

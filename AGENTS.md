@@ -19,4 +19,4 @@
 - Add deterministic tests for transitions, retries, recovery, PR handling, concurrency, and cleanup.
 - Run tests with: `python -m unittest -v test_workflow.py`
 
-Relay reads and honors the target repository's `AGENTS.md`; it does not copy this file there.
+Relay reads and honors the target repository's `AGENTS.md`. When one is missing, Relay generates separate generic target rules; it never copies this development file there.
