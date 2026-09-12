@@ -138,7 +138,7 @@ def command(tool: str) -> list[str]:
 
 
 def git(repo: Path, *args: str) -> str:
-    return subprocess.run(command("git") + ["-C", str(repo), *args], check=True, capture_output=True, text=True, timeout=60).stdout.strip()
+    return subprocess.run(command("git") + ["-C", str(repo), *args], check=True, capture_output=True, encoding="utf-8", errors="replace", timeout=60).stdout.strip()
 
 
 def progress(event: str, detail: str) -> None:
@@ -191,7 +191,7 @@ def invoke_agent(repo: Path, prompt: str, schema: dict, timeout: int, budget: Ca
             "exec", "--ephemeral", "--sandbox", "read-only", "--cd", str(repo),
             "--output-schema", str(schema_path), "--output-last-message", str(result_path), "-",
         ]
-        completed = subprocess.run(invocation, input=prompt, capture_output=True, text=True, timeout=timeout)
+        completed = subprocess.run(invocation, input=prompt, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout)
         if completed.returncode or not result_path.is_file():
             raise RuntimeError(f"agent failed ({completed.returncode}): {completed.stderr[-500:]}")
         return json.loads(result_path.read_text(encoding="utf-8"))

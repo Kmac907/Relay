@@ -22,7 +22,7 @@ def positive(value: str) -> int:
 
 
 def run(tool: str, *args: str, capture: bool = False, timeout: int = 300) -> subprocess.CompletedProcess:
-    return subprocess.run(_command(tool) + list(args), check=True, capture_output=capture, text=True, timeout=timeout)
+    return subprocess.run(_command(tool) + list(args), check=True, capture_output=capture, text=True, encoding="utf-8", errors="replace", timeout=timeout)
 
 
 def create(path: Path, github: str | None = None, visibility: str | None = None, timeout: int = 300) -> tuple[Path, str, str]:

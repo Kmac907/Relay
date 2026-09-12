@@ -65,6 +65,9 @@ class ContractTests(unittest.TestCase):
         value = {"mode": "repair", "assignmentId": "TASK-0001", "status": "candidate", "candidateSha": "abc", "changedPaths": [], "validation": [], "summary": ""}
         with self.assertRaises(ValueError):
             run.validate_agent_result("worker", value, "TASK-0001", "task")
+        value["mode"], value["status"] = "task", "completed"
+        with self.assertRaises(ValueError):
+            run.validate_agent_result("worker", value, "TASK-0001", "task")
 
     def test_review_budget_formula(self):
         self.assertEqual(run.review_call_limit(2, 2), 9)
@@ -284,6 +287,15 @@ class DeterministicCoreTests(unittest.TestCase):
             with patch("run.run_tool", return_value=drift):
                 self.assertEqual(run.wait_for_checks(store, "TASK-0001", {"number": 1}, "reviewed"), "sha-drift")
 
+    def test_unknown_mergeability_polls_within_deadline(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            unknown = subprocess.CompletedProcess([], 0, json.dumps({"headRefOid": "sha", "mergeStateStatus": "UNKNOWN", "statusCheckRollup": [], "state": "OPEN"}), "")
+            clean = subprocess.CompletedProcess([], 0, json.dumps({"headRefOid": "sha", "mergeStateStatus": "CLEAN", "statusCheckRollup": [], "state": "OPEN"}), "")
+            with patch("run.run_tool", side_effect=[unknown, clean]) as provider, patch("run.time.time", side_effect=[100, 101, 102]), patch("run.time.sleep"):
+                self.assertEqual(run.wait_for_checks(store, "TASK-0001", {"number": 1}, "sha"), "passed")
+            self.assertEqual(provider.call_count, 2)
+
     def test_provider_failure_repair_uses_shared_fix_and_review_budgets(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
@@ -335,6 +347,15 @@ class DeterministicCoreTests(unittest.TestCase):
         self.assertEqual(set(run.ROLE_JSON_SCHEMAS), set(run.AGENT_SCHEMAS))
         self.assertNotIn("implementer", run.ROLE_JSON_SCHEMAS)
         self.assertNotIn("repairer", run.ROLE_JSON_SCHEMAS)
+        self.assertIn('literal string "candidate"', run.worker_prompt("task", ContractTests().task()))
+        self.assertIn("AUDIT-NNNN", run.ROLE_PROMPTS["audit-planner"])
+
+    def test_stale_coordinator_lock_is_reconciled(self):
+        with tempfile.TemporaryDirectory() as root:
+            relay = Path(root); (relay / "coordinator.lock").write_text("99999999\n", encoding="utf-8")
+            with run.coordinator_lock(relay):
+                self.assertEqual(int((relay / "coordinator.lock").read_text()), os.getpid())
+            self.assertFalse((relay / "coordinator.lock").exists())
 
     def test_complete_cleanup_preview_then_confirm(self):
         with tempfile.TemporaryDirectory() as root:
@@ -384,6 +405,7 @@ class FakeEndToEndTests(unittest.TestCase):
             self.assertLess(max(spans[task]["start"] for task in spans), min(spans[task]["end"] for task in spans))
             self.assertEqual(len(list(provider.glob("*.json"))), 2)
             self.assertTrue(all(state["providerAttemptCounters"][f"{task}:pr-create"] == 1 for task in ("TASK-0001", "TASK-0002")))
+            self.assertIn("--repo', 'fake/relay", (target / ".relay" / "logs" / "provider.log").read_text(encoding="utf-8"))
             before = (target / ".relay" / "state.json").read_bytes()
             shown = subprocess.run([sys.executable, str(Path(status.__file__)), "--repo", str(target)], capture_output=True, text=True, check=True)
             self.assertIn("Review sessions", shown.stdout)
@@ -510,7 +532,7 @@ if args[:2] == ["pr", "view"]:
     key = args[2]
     paths = list(root.glob("*.json")); records = [(path, json.loads(path.read_text())) for path in paths]
     path, record = next((item for item in records if item[1]["branch"] == key or str(item[1]["number"]) == key))
-    if "statusCheckRollup" in args[-1]: record.update(mergeStateStatus="CLEAN", statusCheckRollup=[])
+    if any("statusCheckRollup" in arg for arg in args): record.update(mergeStateStatus="CLEAN", statusCheckRollup=[])
     print(json.dumps(record)); raise SystemExit(0)
 if args[:2] == ["pr", "merge"]:
     key = args[2]

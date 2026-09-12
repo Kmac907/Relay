@@ -31,14 +31,19 @@ def main(argv: list[str] | None = None) -> int:
     state = json.loads(state_path.read_text(encoding="utf-8"))
     _, tasks = parse_tasks(tasks_path.read_text(encoding="utf-8"), runtime=True)
     _, ledger_bugs = parse_bugs((repo / "bugs.md").read_text(encoding="utf-8"))
-    processes = Counter(f"{item['role']}" + (f" ({item['mode']})" if item.get("mode") else "") for item in state["activeProcesses"].values())
+    active = [item for item in state["activeProcesses"].values() if item.get("status", "running") == "running"]
+    queued = [item for item in state["activeProcesses"].values() if item.get("status") == "queued"]
+    processes = Counter(f"{item['role']}" + (f" ({item['mode']})" if item.get("mode") else "") for item in active)
     phases = Counter(value["phase"] for value in state.get("taskStates", {}).values())
     bugs = Counter(f"{item['severity']} {item['status']}" for item in ledger_bugs)
     print(f"Relay campaign: {state['campaignId']}\nPhase:          {state['phase']}\nElapsed:        {age(state['createdAt'])}\nHeartbeat age:  {age(state['heartbeat'])}")
-    print(f"\nProcesses\n  Configured: {state['workerLimit']}\n  Active:     {len(state['activeProcesses'])}")
+    print(f"\nProcesses\n  Configured: {state['workerLimit']}\n  Active:     {len(active)}\n  Queued:     {len(queued)}")
     for role, count in sorted(processes.items()):
         print(f"  {role}: {count}")
     for process_id, process in sorted(state["activeProcesses"].items()):
+        if process.get("status") == "queued":
+            print(f"  {process_id}: queued")
+            continue
         deadline = datetime.fromisoformat(process["startedAt"]).timestamp() + process["deadlineSeconds"]
         print(f"  {process_id}: deadline-in={max(0, int(deadline - datetime.now().timestamp()))}s")
     print("\nReview sessions")

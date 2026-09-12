@@ -42,12 +42,12 @@ AGENT_SCHEMAS = {
 
 FINDING_FIELDS = {"id": str, "severity": str, "location": str, "failure": str, "reproduction": str, "requirement": str, "evidence": str, "candidateIntroduced": bool}
 ROLE_PROMPTS = {
-    "contract-reviewer": "Check only acceptance criteria, required behavior/tests, and candidate-introduced regressions. Do not inspect unrelated code.",
-    "risk-reviewer": "Independently check only candidate correctness, regression, security/data-loss, changed error paths, and missing candidate tests.",
+    "contract-reviewer": "Check only acceptance criteria, required behavior/tests, and candidate-introduced regressions. Finding severity must be exactly P0, P1, P2, or P3. Do not inspect unrelated code.",
+    "risk-reviewer": "Independently check only candidate correctness, regression, security/data-loss, changed error paths, and missing candidate tests. Finding severity must be exactly P0, P1, P2, or P3.",
     "triage-pm": "Decide each supplied finding once: accept-blocker, backlog, discard, or needs-user. Unsupported and pre-existing findings cannot block.",
     "verification-reviewer": "Verify only the accepted blocker and exact repair delta. Return resolved, unresolved, or invalid-result; do not reopen full review.",
-    "audit-planner": "Define one finite list of explicit audit scopes. Never request an unrestricted search or another audit.",
-    "audit-worker": "Inspect only the assigned finite scope, read-only, and return evidence-backed findings. Do not create more work.",
+    "audit-planner": "Define one finite list of explicit audit scopes. Every scopeId must be AUDIT-NNNN, starting at AUDIT-0001. Never request an unrestricted search or another audit.",
+    "audit-worker": "Inspect only the assigned finite scope, read-only, and return evidence-backed findings with severity exactly P0, P1, P2, or P3. Do not create more work.",
 }
 
 
@@ -60,13 +60,13 @@ def _string_array() -> dict:
 
 
 FINDING_JSON = _json_object({
-    "id": {"type": "string"}, "severity": {"type": "string"}, "location": {"type": "string"},
+    "id": {"type": "string"}, "severity": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]}, "location": {"type": "string"},
     "failure": {"type": "string"}, "reproduction": {"type": "string"}, "requirement": {"type": "string"},
     "evidence": {"type": "string"}, "candidateIntroduced": {"type": "boolean"},
 })
 ROLE_JSON_SCHEMAS = {
     "worker": _json_object({
-        "mode": {"type": "string"}, "assignmentId": {"type": "string"}, "status": {"type": "string"},
+        "mode": {"type": "string", "enum": ["task", "bug", "repair"]}, "assignmentId": {"type": "string"}, "status": {"type": "string", "enum": ["candidate"]},
         "candidateSha": {"type": "string"}, "changedPaths": _string_array(),
         "validation": {"type": "array", "items": _json_object({"command": {"type": "string"}, "exitCode": {"type": "integer"}})},
         "summary": {"type": "string"},
@@ -75,7 +75,7 @@ ROLE_JSON_SCHEMAS = {
     "risk-reviewer": _json_object({"assignmentId": {"type": "string"}, "candidateSha": {"type": "string"}, "findings": {"type": "array", "items": FINDING_JSON}}),
     "triage-pm": _json_object({"assignmentId": {"type": "string"}, "decisions": {"type": "array", "items": _json_object({"findingId": {"type": "string"}, "action": {"type": "string"}, "reason": {"type": "string"}})}}),
     "verification-reviewer": _json_object({"assignmentId": {"type": "string"}, "candidateSha": {"type": "string"}, "status": {"type": "string"}}),
-    "audit-planner": _json_object({"scopes": {"type": "array", "items": _json_object({"scopeId": {"type": "string"}, "scope": {"type": "string"}, "requirements": _string_array(), "paths": _string_array(), "commands": _string_array(), "completionCondition": {"type": "string"}})}}),
+    "audit-planner": _json_object({"scopes": {"type": "array", "items": _json_object({"scopeId": {"type": "string", "pattern": "^AUDIT-\\d{4}$"}, "scope": {"type": "string"}, "requirements": _string_array(), "paths": _string_array(), "commands": _string_array(), "completionCondition": {"type": "string"}})}}),
     "audit-worker": _json_object({"scopeId": {"type": "string"}, "findings": {"type": "array", "items": FINDING_JSON}}),
 }
 
@@ -86,7 +86,7 @@ def console(event: str, detail: str) -> None:
 
 
 def bounded_run(command, *, timeout: int, cwd: Path | None = None, check: bool = True, input: str | None = None, shell: bool = False) -> subprocess.CompletedProcess:
-    process = subprocess.Popen(command, cwd=cwd, shell=shell, stdin=subprocess.PIPE if input is not None else None, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    process = subprocess.Popen(command, cwd=cwd, shell=shell, stdin=subprocess.PIPE if input is not None else None, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", errors="replace", text=True)
     with CHILD_LOCK:
         ACTIVE_CHILDREN.add(process)
     try:
@@ -237,8 +237,8 @@ def validate_agent_result(role: str, value: object, assignment_id: str | None = 
     identity_key = "scopeId" if role == "audit-worker" else "assignmentId"
     if assignment_id is not None and value.get(identity_key) != assignment_id:
         raise ValueError("agent changed assignment ID")
-    if role == "worker" and (mode not in WORKER_MODES or value["mode"] != mode):
-        raise ValueError("agent changed Worker mode")
+    if role == "worker" and (mode not in WORKER_MODES or value["mode"] != mode or value["status"] != "candidate"):
+        raise ValueError("agent changed Worker mode or candidate status")
     if role in {"contract-reviewer", "risk-reviewer", "audit-worker"}:
         for finding in value["findings"]:
             if not isinstance(finding, dict) or any(not isinstance(finding.get(key), kind) for key, kind in FINDING_FIELDS.items()):
@@ -317,7 +317,14 @@ def atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     temporary.write_text(content, encoding="utf-8")
-    os.replace(temporary, path)
+    for attempt in range(5):
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(.02)
 
 
 class StateStore:
@@ -338,12 +345,21 @@ class StateStore:
 @contextlib.contextmanager
 def coordinator_lock(relay: Path):
     lock = relay / "coordinator.lock"
-    try:
-        descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(descriptor, f"{os.getpid()}\n".encode())
-        os.close(descriptor)
-    except FileExistsError as error:
-        raise RuntimeError(f"another Relay coordinator holds {lock}") from error
+    for attempt in range(2):
+        try:
+            descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(descriptor, f"{os.getpid()}\n".encode())
+            os.close(descriptor)
+            break
+        except FileExistsError as error:
+            try:
+                pid = int(lock.read_text(encoding="utf-8").strip())
+                os.kill(pid, 0)
+            except (OSError, ValueError):
+                lock.unlink(missing_ok=True)
+                if attempt == 0:
+                    continue
+            raise RuntimeError(f"another Relay coordinator holds {lock}") from error
     try:
         yield lock
     finally:
@@ -444,7 +460,8 @@ Acceptance criteria: {json.dumps(assignment['acceptanceCriteria'])}
 Validation commands: {json.dumps(assignment['validationCommands'])}
 Current candidate: {candidate_sha or 'none'}
 Repair blockers: {json.dumps(blockers or [])}
-Implement only this assignment, run validation, commit the candidate locally, and return the required JSON."""
+Implement only this assignment, run validation, commit the candidate locally, and return the required JSON.
+The result status must be the literal string \"candidate\", never \"completed\". The result mode must exactly match {mode}."""
 
 
 def role_prompt(role: str, assignment: dict, candidate_sha: str, context: object) -> str:
@@ -478,10 +495,9 @@ def _consume_agent_call(store: StateStore, assignment_id: str, role: str, mode: 
             state["attemptCounters"][assignment_id] = state["attemptCounters"].get(assignment_id, 0) + 1
             number = state["attemptCounters"][assignment_id]
         process_id = f"{assignment_id}:{role}:{number}"
-        state["activeProcesses"][process_id] = {"assignmentId": assignment_id, "role": role, "mode": mode, "startedAt": datetime.now(timezone.utc).isoformat(), "deadlineSeconds": state["agentTimeoutSeconds"]}
+        state["activeProcesses"][process_id] = {"assignmentId": assignment_id, "role": role, "mode": mode, "status": "queued", "reservedAt": datetime.now(timezone.utc).isoformat(), "deadlineSeconds": state["agentTimeoutSeconds"]}
         result.update(number=number, process_id=process_id)
     store.update(change)
-    console("START", f"role={role}" + (f" mode={mode}" if mode else "") + f" assignment={assignment_id} call={result['number']}")
     return result["number"], result["process_id"]
 
 
@@ -497,6 +513,8 @@ def invoke_agent(store: StateStore, semaphore: threading.Semaphore, repo: Path, 
     ]
     try:
         with semaphore:
+            store.update(lambda state: state["activeProcesses"][process_id].update(status="running", startedAt=datetime.now(timezone.utc).isoformat()))
+            console("START", f"role={role}" + (f" mode={mode}" if mode else "") + f" assignment={assignment_id} call={number}")
             completed = bounded_run(command, input=prompt, timeout=store.state["agentTimeoutSeconds"])
         atomic_write(log, completed.stdout + ("\n--- stderr ---\n" + completed.stderr if completed.stderr else ""))
         if completed.returncode or not output.is_file():
@@ -512,11 +530,12 @@ def invoke_agent(store: StateStore, semaphore: threading.Semaphore, repo: Path, 
         store.update(lambda state: state["activeProcesses"].pop(process_id, None))
 
 
-def invoke_with_replacements(store: StateStore, semaphore: threading.Semaphore, repo: Path, assignment_id: str, role: str, prompt: str, *, mode: str | None = None, review: bool = False, audit: bool = False) -> dict:
+def invoke_with_replacements(store: StateStore, semaphore: threading.Semaphore, repo: Path, assignment_id: str, role: str, prompt: str, *, mode: str | None = None, review: bool = False, audit: bool = False, validator=None) -> dict:
     error = None
     for _ in range(store.state["formatRetryAllowance"] + 1):
         try:
-            return invoke_agent(store, semaphore, repo, assignment_id, role, prompt, mode=mode, review=review, audit=audit)
+            result = invoke_agent(store, semaphore, repo, assignment_id, role, prompt, mode=mode, review=review, audit=audit)
+            return validator(result) if validator else result
         except (ValueError, json.JSONDecodeError, RuntimeError) as caught:
             error = caught
             if review:
@@ -583,7 +602,26 @@ def provider_call(store: StateStore, key: str, *args: str, check: bool = True) -
         state["providerAttemptCounters"][key] = count + 1
         result["count"] = count + 1
     store.update(consume)
-    return run_tool("gh", *args, timeout=store.state["providerTimeoutSeconds"], check=check)
+    actual = list(args)
+    if actual and actual[0] == "pr" and store.state.get("githubRepository"):
+        actual += ["--repo", store.state["githubRepository"]]
+    try:
+        completed = run_tool("gh", *actual, timeout=store.state["providerTimeoutSeconds"], check=False)
+    except subprocess.TimeoutExpired:
+        log_provider(store, f"{key} timeout={store.state['providerTimeoutSeconds']}s args={actual}")
+        raise
+    log_provider(store, f"{key} exit={completed.returncode} args={actual}\n{completed.stdout}{completed.stderr}")
+    if check and completed.returncode:
+        raise subprocess.CalledProcessError(completed.returncode, actual, completed.stdout, completed.stderr)
+    return completed
+
+
+def log_provider(store: StateStore, message: str) -> None:
+    with store.lock:
+        path = store.path.parent / "logs" / "provider.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(f"{datetime.now(timezone.utc).isoformat()} {message.rstrip()}\n")
 
 
 def provider_with_retries(store: StateStore, key: str, *args: str) -> subprocess.CompletedProcess:
@@ -603,7 +641,9 @@ def git_provider_with_retries(store: StateStore, key: str, repo: Path, *args: st
         try:
             last = git(repo, *args, timeout=store.state["providerTimeoutSeconds"], check=False)
         except subprocess.TimeoutExpired:
+            log_provider(store, f"{key} timeout={store.state['providerTimeoutSeconds']}s git={args}")
             continue
+        log_provider(store, f"{key} exit={last.returncode} git={args}\n{last.stdout}{last.stderr}")
         if last.returncode == 0:
             return last
     raise RuntimeError(f"Git provider operation exhausted attempts: {key}; {last.stderr if last else ''}")
@@ -770,7 +810,9 @@ def wait_for_checks(store: StateStore, assignment_id: str, pr: dict, reviewed_sh
         first = False
         try:
             store.update(lambda state: state.__setitem__("providerOperationsStarted", state.get("providerOperationsStarted", 0) + 1))
-            view = run_tool("gh", "pr", "view", str(pr["number"]), "--json", "headRefOid,mergeStateStatus,statusCheckRollup,state", timeout=store.state["providerTimeoutSeconds"], check=False)
+            arguments = ["pr", "view", str(pr["number"]), "--json", "headRefOid,mergeStateStatus,statusCheckRollup,state", "--repo", store.state.get("githubRepository", "fake/relay")]
+            view = run_tool("gh", *arguments, timeout=store.state["providerTimeoutSeconds"], check=False)
+            log_provider(store, f"{assignment_id}:check exit={view.returncode} args={arguments}\n{view.stdout}{view.stderr}")
         except (RuntimeError, subprocess.TimeoutExpired):
             key = f"{assignment_id}:check-errors"
             store.update(lambda state: state["providerAttemptCounters"].__setitem__(key, state["providerAttemptCounters"].get(key, 0) + 1))
@@ -797,7 +839,10 @@ def wait_for_checks(store: StateStore, assignment_id: str, pr: dict, reviewed_sh
             continue
         if data.get("mergeStateStatus") in {"BEHIND", "DIRTY"}:
             return "repair-required"
-        if data.get("mergeStateStatus") in {"BLOCKED", "UNKNOWN"}:
+        if data.get("mergeStateStatus") == "UNKNOWN":
+            time.sleep(min(10, max(0, deadline - time.time())))
+            continue
+        if data.get("mergeStateStatus") == "BLOCKED":
             return "waiting-provider"
         return "passed"
     return "waiting-provider"
@@ -939,14 +984,22 @@ def validate_audit_scopes(value: dict) -> list[dict]:
     return scopes
 
 
+def validate_audit_plan(value: dict) -> dict:
+    validate_audit_scopes(value)
+    return value
+
+
 def run_audit(store: StateStore, semaphore: threading.Semaphore, tasks: list[dict]) -> list[dict]:
+    audit_sha = store.state.get("auditBaseSha") or git(Path(store.state["repository"]), "rev-parse", "HEAD", timeout=store.state["providerTimeoutSeconds"]).stdout.strip()
+    if not store.state.get("auditBaseSha"):
+        store.update(lambda state: state.__setitem__("auditBaseSha", audit_sha))
     if store.state["auditPlanCompleted"]:
         scopes = list(store.state["auditScopes"].values())
     else:
         if not store.state["auditPlanStarted"]:
             store.update(lambda state: state.update(auditPlanStarted=True, auditCallLimit=1 + state["formatRetryAllowance"]))
         try:
-            result = invoke_with_replacements(store, semaphore, Path(store.state["repository"]), "AUDIT", "audit-planner", role_prompt("audit-planner", {"id": "AUDIT", "requirements": [], "allowedPaths": [], "acceptanceCriteria": [], "validationCommands": []}, store.state["baseSha"], {"tasks": tasks, "bugs": store.state.get("bugs", [])}), audit=True)
+            result = invoke_with_replacements(store, semaphore, Path(store.state["repository"]), "AUDIT", "audit-planner", role_prompt("audit-planner", {"id": "AUDIT", "requirements": [], "allowedPaths": [], "acceptanceCriteria": [], "validationCommands": []}, audit_sha, {"tasks": tasks, "bugs": store.state.get("bugs", [])}), audit=True, validator=validate_audit_plan)
             scopes = validate_audit_scopes(result)
         except (RuntimeError, ValueError):
             store.update(lambda state: state.update(phase="needs-user"))
@@ -965,7 +1018,7 @@ def run_audit(store: StateStore, semaphore: threading.Semaphore, tasks: list[dic
                 scope["started"] = True
                 store.save()
                 assignment = {"id": scope["scopeId"], "allowedPaths": scope["paths"], "acceptanceCriteria": [scope["completionCondition"]], "validationCommands": scope["commands"]}
-                futures[pool.submit(invoke_with_replacements, store, semaphore, Path(store.state["repository"]), scope["scopeId"], "audit-worker", role_prompt("audit-worker", assignment, store.state["baseSha"], scope), audit=True)] = scope
+                futures[pool.submit(invoke_with_replacements, store, semaphore, Path(store.state["repository"]), scope["scopeId"], "audit-worker", role_prompt("audit-worker", assignment, audit_sha, scope), audit=True)] = scope
             for future in as_completed(futures):
                 scope, result = futures[future], future.result()
                 scope.update(completed=True, findings=result["findings"])
@@ -975,7 +1028,7 @@ def run_audit(store: StateStore, semaphore: threading.Semaphore, tasks: list[dic
         findings = [finding for scope in store.state["auditScopes"].values() for finding in scope["findings"]]
     if not store.state.get("auditTriageCompleted"):
         triage_assignment = {"id": "AUDIT", "allowedPaths": [], "acceptanceCriteria": [], "validationCommands": []}
-        triage = invoke_with_replacements(store, semaphore, Path(store.state["repository"]), "AUDIT", "triage-pm", role_prompt("triage-pm", triage_assignment, store.state["baseSha"], findings), audit=True)
+        triage = invoke_with_replacements(store, semaphore, Path(store.state["repository"]), "AUDIT", "triage-pm", role_prompt("triage-pm", triage_assignment, audit_sha, findings), audit=True)
         if any(item["action"] == "needs-user" for item in triage["decisions"]):
             store.update(lambda state: state.update(phase="needs-user", auditTriageCompleted=True))
             return []
@@ -1012,10 +1065,15 @@ def github_preflight(store: StateStore) -> None:
         return
     repository = Path(store.state["repository"])
     remote = git(repository, "remote", "get-url", "origin", timeout=store.state["providerTimeoutSeconds"]).stdout.strip()
-    if not os.environ.get("RELAY_ALLOW_FAKE_PROVIDER") and not re.search(r"(?:github\.com[:/])[^/]+/[^/]+(?:\.git)?$", remote):
+    match = re.search(r"github\.com[:/]([^/\s]+/[^/\s]+)$", remote)
+    if not os.environ.get("RELAY_ALLOW_FAKE_PROVIDER") and not match:
         raise RuntimeError("origin is not a GitHub repository")
+    github_repository = match.group(1) if match else "fake/relay"
+    if github_repository.endswith(".git"):
+        github_repository = github_repository[:-4]
+    store.update(lambda state: state.__setitem__("githubRepository", github_repository))
     provider_with_retries(store, "preflight:auth", "auth", "status")
-    provider_with_retries(store, "preflight:repo", "repo", "view")
+    provider_with_retries(store, "preflight:repo", "repo", "view", github_repository)
     store.update(lambda state: state.__setitem__("preflightCompleted", True))
 
 
@@ -1035,7 +1093,8 @@ def reconcile(store: StateStore) -> None:
 def heartbeat_loop(store: StateStore, stop: threading.Event) -> None:
     while not stop.wait(min(30, max(1, store.state["agentTimeoutSeconds"] // 2))):
         store.save()
-        console("ACTIVE", f"processes={len(store.state['activeProcesses'])}/{store.state['workerLimit']} phase={store.state['phase']}")
+        running = sum(process.get("status", "running") == "running" for process in store.state["activeProcesses"].values())
+        console("ACTIVE", f"processes={running}/{store.state['workerLimit']} phase={store.state['phase']}")
 
 
 def run_assignments(store: StateStore, semaphore: threading.Semaphore, assignments: list[dict], mode: str) -> None:
@@ -1078,6 +1137,9 @@ def execute_campaign(store: StateStore, tasks: list[dict]) -> int:
         terminal = "waiting-provider" if all(value["phase"] == "waiting-provider" for value in unfinished) else "needs-user"
         store.update(lambda state: state.__setitem__("phase", terminal))
         return 2
+    repository = Path(store.state["repository"])
+    git_provider_with_retries(store, "audit:fetch", repository, "fetch", "origin", "main")
+    git(repository, "merge", "--ff-only", "origin/main", timeout=store.state["validationTimeoutSeconds"])
     store.update(lambda state: state.__setitem__("phase", "audit"))
     try:
         bugs = run_audit(store, semaphore, tasks)
