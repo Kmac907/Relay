@@ -17,6 +17,8 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from repo import TARGET_AGENTS, create_exclusive
+
 TASK_ID = re.compile(r"TASK-\d{4}")
 SCOUT_SCHEMA = {
     "scope": str, "implemented": list, "missing": list, "conflicts": list,
@@ -158,7 +160,11 @@ def inspect_repository(repo: Path) -> tuple[str, list[str], str]:
         raise ValueError(f"repository does not exist: {root}")
     base = git(root, "rev-parse", "HEAD")
     files = [line for line in git(root, "ls-files").splitlines() if line]
-    instructions = (root / "AGENTS.md").read_text(encoding="utf-8") if (root / "AGENTS.md").is_file() else ""
+    agents = root / "AGENTS.md"
+    if os.path.lexists(agents):
+        instructions = agents.read_text(encoding="utf-8") if agents.is_file() else ""
+    else:
+        instructions = TARGET_AGENTS
     return base, files, instructions
 
 
@@ -287,12 +293,9 @@ def main(argv: list[str] | None = None) -> int:
         progress("VALIDATE", f"tasks={len(tasks)}")
         output = render_tasks(tasks, base, hashlib.sha256(requirements.encode()).hexdigest()[:12], args.task_attempts, args.fix_loops)
         output_path = (args.output or repo / "PLAN.md").resolve()
-        if output_path.exists():
+        if not create_exclusive(output_path, output):
             raise ValueError(f"refusing existing plan: {output_path}")
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = output_path.with_name(f".{output_path.name}.{os.getpid()}.tmp")
-        temporary.write_text(output, encoding="utf-8")
-        os.replace(temporary, output_path)
+        create_exclusive(repo / "AGENTS.md", TARGET_AGENTS)
         progress("OUTPUT", f"ready={sum(task['status'] == 'ready' for task in tasks)} blocked={sum(task['status'] == 'blocked' for task in tasks)}")
         print(output_path)
         return 0

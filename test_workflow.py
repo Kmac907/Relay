@@ -94,8 +94,20 @@ class RepositoryTests(unittest.TestCase):
             command.side_effect = [self.completed(), self.completed(), self.completed(), self.completed("main\n"), self.completed("abcdef\n")]
             path, branch, sha = repo.create(Path(root) / "demo")
             self.assertEqual((path / "README.md").read_text(encoding="utf-8"), "# demo\n")
+            self.assertEqual((path / "AGENTS.md").read_bytes(), repo.TARGET_AGENTS.encode())
             self.assertEqual((branch, sha), ("main", "abcdef"))
             self.assertEqual(command.call_args_list[0].args[:4], ("git", "-C", str(path), "init"))
+            self.assertEqual(command.call_args_list[1].args[-2:], ("README.md", "AGENTS.md"))
+
+    def test_exclusive_create_preserves_existing_entry_and_uses_lf(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "AGENTS.md"
+            self.assertTrue(repo.create_exclusive(path, "one\ntwo\n"))
+            self.assertEqual(path.read_bytes(), b"one\ntwo\n")
+            self.assertFalse(repo.create_exclusive(path, "replacement\n"))
+            self.assertEqual(path.read_bytes(), b"one\ntwo\n")
+            directory = Path(root) / "occupied"; directory.mkdir()
+            self.assertFalse(repo.create_exclusive(directory, "replacement\n"))
 
     def test_refuses_nonempty_path_without_running_tools(self):
         with tempfile.TemporaryDirectory() as root, patch("repo.run") as command:
@@ -132,6 +144,7 @@ class RepositoryTests(unittest.TestCase):
             self.assertTrue((target / ".git").is_dir())
             self.assertEqual(branch, "main")
             self.assertEqual(git_output(target, "rev-parse", "HEAD").strip(), sha)
+            self.assertEqual(git_output(target, "ls-tree", "--name-only", "HEAD").splitlines(), ["AGENTS.md", "README.md"])
 
     def test_no_runtime_dependency_on_tools_copy(self):
         for script in (repo, plan, run, status):
@@ -180,6 +193,8 @@ class PlanningTests(unittest.TestCase):
             plan_path = target / "PLAN.md"
             self.assertTrue(Path(planned.stdout.strip()).samefile(plan_path))
             self.assertTrue(plan_path.read_text(encoding="utf-8").startswith("# Tasks\n"))
+            self.assertNotIn(b"\r\n", plan_path.read_bytes())
+            self.assertEqual((target / "AGENTS.md").read_bytes(), repo.TARGET_AGENTS.encode())
             self.assertIn("Relay Planner", planned.stderr)
             dry = subprocess.run([sys.executable, str(Path(run.__file__)), "--repo", str(target), "--dry-run"], capture_output=True, text=True)
             self.assertEqual(dry.returncode, 0, dry.stderr)
@@ -206,7 +221,21 @@ class PlanningTests(unittest.TestCase):
             self.assertLess(max(starts), min(ends))
             self.assertTrue(Path(completed.stdout.strip()).samefile(target / "PLAN.md"))
             self.assertTrue((target / "PLAN.md").read_text(encoding="utf-8").startswith("# Tasks"))
-            self.assertEqual(git_output(target, "status", "--porcelain=v1", "--untracked-files=all"), "?? PLAN.md\n")
+            self.assertEqual(git_output(target, "status", "--porcelain=v1", "--untracked-files=all"), "?? AGENTS.md\n?? PLAN.md\n")
+
+    def test_existing_agents_is_supplied_and_preserved(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); target = make_git_repository(root)
+            agents = target / "AGENTS.md"; agents.write_bytes(b"custom\r\n")
+            _, _, instructions = plan.inspect_repository(target)
+            self.assertEqual(instructions, "custom\n")
+            self.assertEqual(agents.read_bytes(), b"custom\r\n")
+
+    def test_missing_agents_uses_default_in_memory(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = make_git_repository(Path(root))
+            self.assertEqual(plan.inspect_repository(target)[2], repo.TARGET_AGENTS)
+            self.assertFalse((target / "AGENTS.md").exists())
 
     def test_scout_snapshot_exposes_only_assigned_tracked_area(self):
         with tempfile.TemporaryDirectory() as root:
@@ -366,8 +395,10 @@ class DeterministicCoreTests(unittest.TestCase):
     def test_agent_and_provider_timeouts_consume_prelaunch_counters(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
-            with patch("run.bounded_run", side_effect=subprocess.TimeoutExpired("codex", 1)), self.assertRaises(RuntimeError):
+            store.state["targetInstructions"] = "custom target rules"
+            with patch("run.bounded_run", side_effect=subprocess.TimeoutExpired("codex", 1)) as command, self.assertRaises(RuntimeError):
                 run.invoke_agent(store, __import__("threading").Semaphore(1), Path(root), "TASK-0001", "worker", "prompt", mode="task")
+            self.assertTrue(command.call_args.kwargs["input"].startswith("Target repository instructions:\ncustom target rules\n\n"))
             self.assertEqual(store.state["attemptCounters"]["TASK-0001"], 1)
             self.assertEqual(store.state["activeProcesses"], {})
             with patch("run.run_tool", side_effect=subprocess.TimeoutExpired("gh", 1)), self.assertRaises(subprocess.TimeoutExpired):
@@ -432,6 +463,8 @@ class DeterministicCoreTests(unittest.TestCase):
             campaign = "test"; marker = f"<!-- relay: campaign={campaign} repository={__import__('hashlib').sha256(str(root).encode()).hexdigest()[:12]} -->"
             (root / "tasks.md").write_text("# Tasks\n\n<!-- relay: planned-base=0123456 requirements=abc123 -->\n", encoding="utf-8")
             (root / "bugs.md").write_text(f"# Bugs\n\n{marker}\n", encoding="utf-8")
+            (root / "PLAN.md").write_text("keep plan\n", encoding="utf-8")
+            (root / "AGENTS.md").write_text("keep agents\n", encoding="utf-8")
             (root / ".git" / "info" / "exclude").write_text("tasks.md\nbugs.md\n.relay/\nkeep.me\n", encoding="utf-8")
             state = {"repository": str(root), "phase": "complete", "activeProcesses": {}, "worktrees": {}, "pullRequests": {}, "campaignId": campaign}
             (relay / "state.json").write_text(json.dumps(state), encoding="utf-8")
@@ -439,10 +472,79 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertTrue((root / "tasks.md").exists())
             self.assertEqual(run.permanent_cleanup(root, True), 0)
             self.assertFalse(relay.exists())
+            self.assertEqual((root / "PLAN.md").read_text(encoding="utf-8"), "keep plan\n")
+            self.assertEqual((root / "AGENTS.md").read_text(encoding="utf-8"), "keep agents\n")
             self.assertEqual((root / ".git" / "info" / "exclude").read_text(encoding="utf-8"), "keep.me\n")
+
+    def test_campaign_initialization_generates_only_missing_agents(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); target = make_git_repository(root)
+            args = run.parser().parse_args(["--repo", str(target)])
+            text = plan.render_tasks([ContractTests().task()], git_output(target, "rev-parse", "HEAD").strip(), "abc123")
+            store, _ = run.initialize_campaign(target, text, args)
+            self.assertEqual((target / "AGENTS.md").read_bytes(), repo.TARGET_AGENTS.encode())
+            self.assertEqual(store.state["agentsBootstrap"]["phase"], "pending")
+            self.assertEqual(store.state["agentsBootstrap"]["contentHash"], repo.TARGET_AGENTS_SHA256)
+
+    def test_custom_agents_is_honored_without_bootstrap(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); target = make_git_repository(root)
+            agents = target / "AGENTS.md"; agents.write_bytes(b"custom\r\n")
+            args = run.parser().parse_args(["--repo", str(target)])
+            text = plan.render_tasks([ContractTests().task()], git_output(target, "rev-parse", "HEAD").strip(), "abc123")
+            store, _ = run.initialize_campaign(target, text, args)
+            self.assertEqual(agents.read_bytes(), b"custom\r\n")
+            self.assertIsNone(store.state["agentsBootstrap"])
+            self.assertEqual(store.state["targetInstructions"], "custom\r\n")
+
+    def test_tracked_custom_agents_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); target = make_git_repository(root)
+            agents = target / "AGENTS.md"; agents.write_bytes(b"tracked custom\n")
+            subprocess.run(["git", "-C", str(target), "add", "AGENTS.md"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "custom agents"], check=True, capture_output=True)
+            args = run.parser().parse_args(["--repo", str(target)])
+            text = plan.render_tasks([ContractTests().task()], git_output(target, "rev-parse", "HEAD").strip(), "abc123")
+            store, _ = run.initialize_campaign(target, text, args)
+            self.assertEqual(agents.read_bytes(), b"tracked custom\n")
+            self.assertIsNone(store.state["agentsBootstrap"])
+
+    def test_modified_generated_agents_requires_user(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); target = make_git_repository(root)
+            content = repo.TARGET_AGENTS + "customized\n"
+            (target / "AGENTS.md").write_text(content, encoding="utf-8", newline="\n")
+            args = run.parser().parse_args(["--repo", str(target)])
+            text = plan.render_tasks([ContractTests().task()], git_output(target, "rev-parse", "HEAD").strip(), "abc123")
+            store, tasks = run.initialize_campaign(target, text, args)
+            self.assertEqual(store.state["phase"], "needs-user")
+            self.assertEqual(store.state["agentsBootstrap"]["providerStatus"], "generated-file-modified")
+            self.assertEqual((target / "AGENTS.md").read_text(encoding="utf-8"), content)
+            with patch("run.github_preflight") as preflight, patch("run.run_assignments") as workers:
+                self.assertEqual(run.execute_campaign(store, tasks), 2)
+            preflight.assert_not_called()
+            workers.assert_not_called()
 
 
 class FakeEndToEndTests(unittest.TestCase):
+    def test_bootstrap_timeout_resumes_without_duplicate_pr_or_task_launch(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); target = make_git_repository(root)
+            fake_codex, fake_gh = root / "fake_codex.py", root / "fake_gh.py"
+            fake_codex.write_text(FAKE_CODEX, encoding="utf-8"); fake_gh.write_text(FAKE_GH, encoding="utf-8")
+            provider = root / "provider"; provider.mkdir()
+            requirements = root / "requirements.md"; requirements.write_text("Create one file.", encoding="utf-8")
+            environment = os.environ | {"RELAY_CODEX": f"{sys.executable} {fake_codex}", "RELAY_GH": f"{sys.executable} {fake_gh}", "RELAY_ALLOW_FAKE_PROVIDER": "1", "FAKE_GH_STATE": str(provider), "FAKE_BOOTSTRAP_PENDING": "1"}
+            subprocess.run([sys.executable, str(Path(plan.__file__)), "--repo", str(target), "--requirements", str(requirements)], capture_output=True, text=True, env=environment, check=True)
+            command = [sys.executable, str(Path(run.__file__)), "--repo", str(target), "--agent-timeout", "10", "--validation-timeout", "10", "--provider-timeout", "10", "--provider-check-timeout", "1"]
+            first = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=30)
+            state = json.loads((target / ".relay" / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual((first.returncode, state["phase"], state["agentsBootstrap"]["phase"], state["taskStates"]), (2, "waiting-provider", "waiting-provider", {}))
+            resumed = subprocess.run(command, capture_output=True, text=True, env={key: value for key, value in environment.items() if key != "FAKE_BOOTSTRAP_PENDING"}, timeout=30)
+            state = json.loads((target / ".relay" / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr + json.dumps(state, indent=2))
+            self.assertEqual(state["providerAttemptCounters"]["AGENTS:pr-create"], 1)
+
     def test_parallel_workers_reviews_prs_merge_one_audit_and_complete(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
@@ -455,13 +557,13 @@ class FakeEndToEndTests(unittest.TestCase):
             requirements = root / "requirements.md"; requirements.write_text("Create two independent files.", encoding="utf-8")
             environment = os.environ | {
                 "RELAY_CODEX": f"{sys.executable} {fake_codex}", "RELAY_GH": f"{sys.executable} {fake_gh}",
-                "RELAY_ALLOW_FAKE_PROVIDER": "1", "FAKE_EVENTS": str(events), "FAKE_GH_STATE": str(provider), "FAKE_AUDIT_SCOPE": "1", "FAKE_TWO_TASKS": "1",
+                "RELAY_ALLOW_FAKE_PROVIDER": "1", "FAKE_EVENTS": str(events), "FAKE_GH_STATE": str(provider), "FAKE_AUDIT_SCOPE": "1", "FAKE_TWO_TASKS": "1", "FAKE_REQUIRE_TARGET_INSTRUCTIONS": "1",
             }
             planned = subprocess.run([sys.executable, str(Path(plan.__file__)), "--repo", str(target), "--requirements", str(requirements), "--workers", "2"], capture_output=True, text=True, env=environment, check=True)
             self.assertTrue(Path(planned.stdout.strip()).samefile(target / "PLAN.md"))
             completed = subprocess.run([sys.executable, str(Path(run.__file__)), "--repo", str(target), "--workers", "2", "--agent-timeout", "10", "--validation-timeout", "10", "--provider-timeout", "10", "--provider-check-timeout", "10"], capture_output=True, text=True, env=environment, timeout=60)
-            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
             state = json.loads((target / ".relay" / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr + json.dumps(state, indent=2))
             self.assertEqual(state["phase"], "complete")
             self.assertNotIn("tasks", state)
             self.assertNotIn("bugs", state)
@@ -470,16 +572,21 @@ class FakeEndToEndTests(unittest.TestCase):
             self.assertTrue(next(iter(state["auditScopes"].values()))["completed"])
             self.assertLessEqual(state["auditCallsStarted"], state["auditCallLimit"])
             self.assertEqual(state["worktrees"], {})
+            self.assertEqual(state["agentsBootstrap"]["phase"], "complete")
+            self.assertNotIn("AGENTS", state["reviewSessions"])
             self.assertTrue(all(value["phase"] == "integrated" for value in state["taskStates"].values()))
             self.assertTrue(all(session["initialReviewAssignmentsStarted"] == 2 and session["initialReviewAssignmentsCompleted"] == 2 and session["triageCompleted"] and session["reviewCallsStarted"] == 3 for session in state["reviewSessions"].values()))
             spans = {task: {action: float(Path(f"{events}.{task}.{action}").read_text()) for action in ("start", "end")} for task in ("TASK-0001", "TASK-0002")}
             self.assertLess(max(spans[task]["start"] for task in spans), min(spans[task]["end"] for task in spans))
-            self.assertEqual(len(list(provider.glob("*.json"))), 2)
+            self.assertEqual(len(list(provider.glob("*.json"))), 3)
+            self.assertEqual(state["providerAttemptCounters"]["AGENTS:pr-create"], 1)
+            self.assertEqual(git_output(target, "diff", "--name-only", "HEAD^..HEAD").splitlines(), ["AGENTS.md"])
             self.assertTrue(all(state["providerAttemptCounters"][f"{task}:pr-create"] == 1 for task in ("TASK-0001", "TASK-0002")))
             self.assertIn("--repo', 'fake/relay", (target / ".relay" / "logs" / "provider.log").read_text(encoding="utf-8"))
             before = (target / ".relay" / "state.json").read_bytes()
             shown = subprocess.run([sys.executable, str(Path(status.__file__)), "--repo", str(target)], capture_output=True, text=True, check=True)
             self.assertIn("Review sessions", shown.stdout)
+            self.assertIn("AGENTS.md bootstrap", shown.stdout)
             self.assertEqual((target / ".relay" / "state.json").read_bytes(), before)
 
     def test_accepted_audit_bug_runs_worker_bug_review_pr_merge_and_stops(self):
@@ -495,12 +602,12 @@ class FakeEndToEndTests(unittest.TestCase):
             }
             subprocess.run([sys.executable, str(Path(plan.__file__)), "--repo", str(target), "--requirements", str(requirements)], capture_output=True, text=True, env=environment, check=True)
             completed = subprocess.run([sys.executable, str(Path(run.__file__)), "--repo", str(target), "--agent-timeout", "10", "--validation-timeout", "10", "--provider-timeout", "10", "--provider-check-timeout", "10"], capture_output=True, text=True, env=environment, timeout=60)
-            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
             state = json.loads((target / ".relay" / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr + json.dumps(state, indent=2))
             self.assertEqual((state["phase"], state["taskStates"]["BUG-0001"]["mode"], state["taskStates"]["BUG-0001"]["phase"]), ("complete", "bug", "integrated"))
             self.assertEqual(state["auditCallsStarted"], 3)
             self.assertEqual(run.parse_bugs((target / "bugs.md").read_text(encoding="utf-8"))[1][0]["status"], "resolved")
-            self.assertEqual(len(list(provider.glob("*.json"))), 2)
+            self.assertEqual(len(list(provider.glob("*.json"))), 3)
 
     def test_adversarial_review_terminates_at_shared_repair_budget(self):
         with tempfile.TemporaryDirectory() as root:
@@ -547,6 +654,8 @@ args = sys.argv[1:]
 out = args[args.index("--output-last-message") + 1]
 cwd = args[args.index("--cd") + 1]
 prompt = sys.stdin.read()
+if os.environ.get("FAKE_REQUIRE_TARGET_INSTRUCTIONS") and "<!-- relay: generated-target-instructions v1 -->" not in prompt:
+    raise SystemExit("missing target instructions")
 assignment = re.search(r"Assignment ID: ([A-Z]+-?\d*)", prompt)
 assignment = assignment.group(1) if assignment else "AUDIT"
 candidate = re.search(r"Candidate SHA: ([0-9a-f]+)", prompt)
@@ -566,7 +675,7 @@ elif prompt.startswith("Role: Planning Project Manager"):
     if os.environ.get("FAKE_TWO_TASKS"):
         tasks.append({"id": "TASK-0002", "title": "Add another file", "status": "ready", "priority": "P1", "dependencies": [], "allowedPaths": ["two.txt"], "acceptanceCriteria": ["File exists."], "validationCommands": ["python -c \"from pathlib import Path; assert Path('two.txt').is_file()\""]})
     result = {"tasks": tasks}
-elif prompt.startswith("Role: Worker"):
+elif "Role: Worker" in prompt:
     mode = re.search(r"Mode: (task|bug|repair)", prompt).group(1)
     allowed = json.loads(re.search(r"Allowed paths: (\[[^\n]+\])", prompt).group(1))
     path = os.path.join(cwd, allowed[0])
@@ -612,7 +721,7 @@ with open(out, "w", encoding="utf-8") as stream: json.dump(result, stream)
 
 
 FAKE_GH = textwrap.dedent(r'''
-import json, os, pathlib, re, sys
+import json, os, pathlib, re, subprocess, sys
 args = sys.argv[1:]
 root = pathlib.Path(os.environ["FAKE_GH_STATE"])
 def file_for(branch): return root / (branch.replace("/", "_") + ".json")
@@ -630,13 +739,18 @@ if args[:2] == ["pr", "view"]:
     key = args[2]
     paths = list(root.glob("*.json")); records = [(path, json.loads(path.read_text())) for path in paths]
     path, record = next((item for item in records if item[1]["branch"] == key or str(item[1]["number"]) == key))
-    if any("statusCheckRollup" in arg for arg in args): record.update(mergeStateStatus="CLEAN", statusCheckRollup=[])
+    if any("statusCheckRollup" in arg for arg in args):
+        checks = [{"status": "IN_PROGRESS"}] if os.environ.get("FAKE_BOOTSTRAP_PENDING") and "agents-bootstrap" in record["branch"] else []
+        record.update(mergeStateStatus="CLEAN", statusCheckRollup=checks)
     print(json.dumps(record)); raise SystemExit(0)
 if args[:2] == ["pr", "merge"]:
     key = args[2]
     for path in root.glob("*.json"):
         record = json.loads(path.read_text())
         if str(record["number"]) == key:
+            if "agents-bootstrap" in record["branch"]:
+                remote = root.parent / "remote.git"
+                subprocess.run(["git", "--git-dir", str(remote), "update-ref", "refs/heads/main", record["headRefOid"]], check=True)
             record["state"] = "MERGED"; path.write_text(json.dumps(record)); raise SystemExit(0)
 raise SystemExit(f"unknown gh args: {args}")
 ''')

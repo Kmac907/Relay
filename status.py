@@ -37,6 +37,12 @@ def main(argv: list[str] | None = None) -> int:
     phases = Counter(value["phase"] for value in state.get("taskStates", {}).values())
     bugs = Counter(f"{item['severity']} {item['status']}" for item in ledger_bugs)
     print(f"Relay campaign: {state['campaignId']}\nPhase:          {state['phase']}\nElapsed:        {age(state['createdAt'])}\nHeartbeat age:  {age(state['heartbeat'])}")
+    bootstrap = state.get("agentsBootstrap")
+    if bootstrap:
+        pr = bootstrap.get("pr") or {}
+        deadline = state.get("providerDeadlines", {}).get("AGENTS")
+        remaining = f"{max(0, int(deadline - datetime.now().timestamp()))}s" if deadline else "not-started"
+        print(f"\nAGENTS.md bootstrap\n  Phase:     {bootstrap['phase']}\n  Branch:    {bootstrap.get('branch', 'not-created')}\n  PR:        {pr.get('url', pr.get('number', 'not-created'))}\n  Checks:    {bootstrap.get('providerStatus', 'pending')}\n  Deadline:  {remaining}\n  Terminal:  {bootstrap.get('terminalCondition', 'AGENTS.md merged into main')}")
     print(f"\nProcesses\n  Configured: {state['workerLimit']}\n  Active:     {len(active)}\n  Queued:     {len(queued)}")
     for role, count in sorted(processes.items()):
         print(f"  {role}: {count}")

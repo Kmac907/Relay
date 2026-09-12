@@ -118,13 +118,14 @@
 
   Relay reads and honors the target repository’s own AGENTS.md.
 
-  Relay does not copy its AGENTS.md into target repositories.
+  When a target has no AGENTS.md, Relay creates generic target rules and publishes them through a provider-check-only bootstrap PR before Workers start. Existing entries are never overwritten, and Relay never copies its own development AGENTS.md into targets.
 
   # Target-repository files
 
   A Relay campaign creates:
 
   <target-repository>\
+  ├── AGENTS.md
   ├── PLAN.md
   ├── tasks.md
   ├── bugs.md
@@ -1172,6 +1173,7 @@
   ## Repository creation
 
   - Existing valid repo.py behavior is preserved.
+  - New repositories commit the generic AGENTS.md with README.md.
   - Nonempty targets are never overwritten.
   - Existing repositories are never replaced.
   - GitHub failure preserves local work.
@@ -1179,10 +1181,12 @@
 
   ## Planning
 
+  - Missing AGENTS.md uses the same generic instructions in prompts and is created only after PLAN.md.
+  - Existing tracked, untracked, customized, and invalid AGENTS.md entries are preserved.
   - Scouts are read-only and scope-bounded.
   - Independent scouts overlap in execution.
   - Planning PM receives all scout evidence.
-  - plan.py never modifies the target.
+  - plan.py writes only a new PLAN.md and, when missing, a generic AGENTS.md; neither existing entry is overwritten.
   - Progress never enters stdout; stdout contains only the resulting plan path.
   - Stdout contains only valid tasks.md.
   - Planning attempts terminate at their configured limit.
@@ -1190,6 +1194,13 @@
   - planningCallsStarted never exceeds scout count + 1 + formatRetryAllowance.
   - Hung scouts and Planning PM calls stop at agentTimeoutSeconds.
   - plan.py followed by run.py works without a pipe.
+
+  ## AGENTS.md bootstrap
+
+  - Existing repositories publish only the exact generated AGENTS.md before Workers launch.
+  - Bootstrap commit, push, PR, checks, merge, and local reconciliation resume without duplicate publication.
+  - Bootstrap uses provider checks and approvals without Codex review calls.
+  - Failed checks, SHA drift, timeouts, required approvals, and modified generated content stop task launch.
 
   ## Agent dispatch
 

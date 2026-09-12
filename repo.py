@@ -3,11 +3,38 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import shlex
 import subprocess
 from pathlib import Path
+
+GENERATED_AGENTS_MARKER = "<!-- relay: generated-target-instructions v1 -->"
+TARGET_AGENTS = f"""{GENERATED_AGENTS_MARKER}
+# Relay target instructions
+
+- Follow the assigned role, mode, paths, and acceptance criteria.
+- Treat `PLAN.md` as user-owned and `tasks.md`, `bugs.md`, and `.relay` as coordinator-owned.
+- Only Workers may modify source, and only within their assigned worktree and allowed paths.
+- Do not create, push, or merge pull requests; change provider settings; spawn subagents; or edit ledgers.
+- Run the assigned validation, make focused commits, and report evidence for every result.
+"""
+TARGET_AGENTS_SHA256 = hashlib.sha256(TARGET_AGENTS.encode()).hexdigest()
+
+
+def create_exclusive(path: Path, content: str) -> bool:
+    """Create a UTF-8/LF file, or preserve any existing filesystem entry."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        stream = path.open("x", encoding="utf-8", newline="\n")
+    except OSError:
+        if os.path.lexists(path):
+            return False
+        raise
+    with stream:
+        stream.write(content)
+    return True
 
 
 def _command(tool: str) -> list[str]:
@@ -34,8 +61,9 @@ def create(path: Path, github: str | None = None, visibility: str | None = None,
         raise ValueError(f"refusing existing Git repository: {target}")
 
     run("git", "-C", str(target), "init", "--initial-branch=main", timeout=timeout)
-    (target / "README.md").write_text(f"# {target.name}\n", encoding="utf-8")
-    run("git", "-C", str(target), "add", "README.md", timeout=timeout)
+    create_exclusive(target / "README.md", f"# {target.name}\n")
+    create_exclusive(target / "AGENTS.md", TARGET_AGENTS)
+    run("git", "-C", str(target), "add", "README.md", "AGENTS.md", timeout=timeout)
     run("git", "-C", str(target), "commit", "-m", "Initial commit", timeout=timeout)
     branch = run("git", "-C", str(target), "branch", "--show-current", capture=True, timeout=timeout).stdout.strip()
     sha = run("git", "-C", str(target), "rev-parse", "HEAD", capture=True, timeout=timeout).stdout.strip()
