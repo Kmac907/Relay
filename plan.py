@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -47,8 +48,11 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--repo", required=True, type=Path)
     result.add_argument("--requirements", required=True, type=Path)
     result.add_argument("--workers", type=positive, default=3)
+    result.add_argument("--task-attempts", type=positive, default=3)
+    result.add_argument("--fix-loops", type=nonnegative, default=2)
     result.add_argument("--agent-timeout", type=positive, default=3600, dest="agent_timeout")
     result.add_argument("--format-retries", type=nonnegative, default=2, dest="format_retries")
+    result.add_argument("--output", type=Path, help="plan path (default: <repo>/PLAN.md)")
     return result
 
 
@@ -101,6 +105,9 @@ def validate_scout(value: object, expected_scope: str) -> dict:
     result = validate_dict(value, SCOUT_SCHEMA, "scout result")
     if result["scope"] != expected_scope or any(not isinstance(item, str) for key in SCOUT_SCHEMA if key != "scope" for item in result[key]):
         raise ValueError("scout widened scope or returned invalid evidence")
+    areas = {item.strip() for item in expected_scope.split(",")}
+    if any(not valid_relative_path(path) or path.replace("\\", "/").split("/", 1)[0] not in areas for path in result["relevantPaths"]):
+        raise ValueError("scout returned a path outside its filesystem view")
     return result
 
 
@@ -109,7 +116,7 @@ def valid_relative_path(value: str) -> bool:
     return bool(value.strip()) and not path.is_absolute() and ".." not in path.parts
 
 
-def render_tasks(tasks: list[dict], base_sha: str, requirements_hash: str) -> str:
+def render_tasks(tasks: list[dict], base_sha: str, requirements_hash: str, task_attempts: int = 3, fix_loops: int = 2) -> str:
     lines = ["# Tasks", "", f"<!-- relay: planned-base={base_sha} requirements={requirements_hash} -->", ""]
     for task in tasks:
         dependencies = ", ".join(task["dependencies"]) or "none"
@@ -120,7 +127,7 @@ def render_tasks(tasks: list[dict], base_sha: str, requirements_hash: str) -> st
             *[f"  - `{item}`" for item in task["allowedPaths"]],
             "- Acceptance criteria:", *[f"  - {item}" for item in task["acceptanceCriteria"]],
             "- Validation:", *[f"  - `{item}`" for item in task["validationCommands"]],
-            "- Attempt: 0/3", "- Fix loop: 0/2", "- Branch: pending",
+            f"- Attempt: 0/{task_attempts}", f"- Fix loop: 0/{fix_loops}", "- Branch: pending",
             "- Pull request: pending", "- Candidate: pending", "",
         ]
     return "\n".join(lines).rstrip() + "\n"
@@ -164,6 +171,25 @@ def scout_scopes(files: list[str], workers: int) -> list[str]:
     for index, area in enumerate(areas):
         groups[index % count].append(area)
     return [", ".join(group) for group in groups]
+
+
+def create_scout_snapshot(repo: Path, files: list[str], scope: str, destination: Path) -> Path:
+    """Copy only tracked files assigned to one scout into its private view."""
+    areas = {item.strip() for item in scope.split(",")}
+    destination.mkdir()
+    root = repo.resolve()
+    for relative in files:
+        normalized = relative.replace("\\", "/")
+        if normalized.split("/", 1)[0] not in areas:
+            continue
+        source = root / relative
+        resolved = source.resolve()
+        if root not in resolved.parents or source.is_symlink() or not source.is_file():
+            continue
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+    return destination
 
 
 class CallBudget:
@@ -248,19 +274,27 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Repository:   {repo}\nRequirements: {requirements_file}\nWorkers:      {args.workers} configured", file=sys.stderr)
         evidence = []
         if scopes:
-            with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            with tempfile.TemporaryDirectory(prefix="relay-scouts-") as temporary, ThreadPoolExecutor(max_workers=args.workers) as pool:
                 futures = []
                 for slot, scope in enumerate(scopes, 1):
                     progress("SCOUT", f"slot={slot} scope={scope}")
+                    snapshot = create_scout_snapshot(repo, files, scope, Path(temporary) / f"scope-{slot}")
                     prompt = scout_prompt(scope, requirements, instructions)
-                    futures.append(pool.submit(invoke_validated, repo, prompt, json_schema(SCOUT_SCHEMA), lambda value, expected=scope: validate_scout(value, expected), args.agent_timeout, budget, args.format_retries))
+                    futures.append(pool.submit(invoke_validated, snapshot, prompt, json_schema(SCOUT_SCHEMA), lambda value, expected=scope: validate_scout(value, expected), args.agent_timeout, budget, args.format_retries))
                 evidence = [future.result() for future in futures]
         progress("SYNTHESIZE", "role=planning-pm")
         tasks = invoke_validated(repo, planning_prompt(requirements, instructions, files, base, evidence), json_schema(TASK_SCHEMA, "tasks"), validate_tasks, args.agent_timeout, budget, args.format_retries)
         progress("VALIDATE", f"tasks={len(tasks)}")
-        output = render_tasks(tasks, base, hashlib.sha256(requirements.encode()).hexdigest()[:12])
+        output = render_tasks(tasks, base, hashlib.sha256(requirements.encode()).hexdigest()[:12], args.task_attempts, args.fix_loops)
+        output_path = (args.output or repo / "PLAN.md").resolve()
+        if output_path.exists():
+            raise ValueError(f"refusing existing plan: {output_path}")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output_path.with_name(f".{output_path.name}.{os.getpid()}.tmp")
+        temporary.write_text(output, encoding="utf-8")
+        os.replace(temporary, output_path)
         progress("OUTPUT", f"ready={sum(task['status'] == 'ready' for task in tasks)} blocked={sum(task['status'] == 'blocked' for task in tasks)}")
-        sys.stdout.write(output)
+        print(output_path)
         return 0
     except (ValueError, RuntimeError, OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         print(f"plan.py: {error}", file=sys.stderr)

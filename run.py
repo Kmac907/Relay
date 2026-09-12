@@ -140,6 +140,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--provider-check-timeout", type=positive, default=3600)
     result.add_argument("--provider-attempts", type=positive, default=3)
     result.add_argument("--merge-method", choices=("squash", "merge", "rebase"), default="squash")
+    result.add_argument("--plan", type=Path, help="plan path (default for new campaigns: <repo>/PLAN.md)")
     result.add_argument("--dry-run", action="store_true")
     result.add_argument("--cleanup", action="store_true")
     result.add_argument("--confirm", action="store_true")
@@ -190,12 +191,18 @@ def parse_tasks(text: str, runtime: bool = False) -> tuple[dict, list[dict]]:
             else:
                 _field(block, field)
         dependencies = [] if _field(block, "Dependencies") == "none" else [item.strip() for item in _field(block, "Dependencies").split(",")]
+        attempt = re.fullmatch(r"(\d+)/(\d+)", _field(block, "Attempt"))
+        fix_loop = re.fullmatch(r"(\d+)/(\d+)", _field(block, "Fix loop"))
+        if not attempt or not fix_loop:
+            raise ValueError(f"invalid counters for {match.group(1)}")
         tasks.append({
             "id": match.group(1), "title": match.group(2), "status": _field(block, "Status"),
             "priority": _field(block, "Priority"), "dependencies": dependencies,
             "allowedPaths": _sublist(block, "Allowed paths"),
             "acceptanceCriteria": _sublist(block, "Acceptance criteria"),
             "validationCommands": _sublist(block, "Validation"),
+            "attempt": int(attempt.group(1)), "attemptLimit": int(attempt.group(2)),
+            "fixLoop": int(fix_loop.group(1)), "fixLoopLimit": int(fix_loop.group(2)),
         })
     ids = [task["id"] for task in tasks]
     if not tasks or len(ids) != len(set(ids)):
@@ -211,6 +218,10 @@ def parse_tasks(text: str, runtime: bool = False) -> tuple[dict, list[dict]]:
             raise ValueError(f"empty contract for {task['id']}")
         if any(not valid_relative_path(path) for path in task["allowedPaths"]):
             raise ValueError(f"unsafe allowed path for {task['id']}")
+        if task["attemptLimit"] <= 0 or task["fixLoopLimit"] < 0 or task["attempt"] > task["attemptLimit"] or task["fixLoop"] > task["fixLoopLimit"]:
+            raise ValueError(f"invalid task counters for {task['id']}")
+        if not runtime and (task["attempt"] or task["fixLoop"]):
+            raise ValueError(f"new plan counters must start at zero for {task['id']}")
     visiting, visited = set(), set()
     graph = {task["id"]: task["dependencies"] for task in tasks}
     def visit(task_id: str) -> None:
@@ -224,7 +235,11 @@ def parse_tasks(text: str, runtime: bool = False) -> tuple[dict, list[dict]]:
             visited.add(task_id)
     for task_id in ids:
         visit(task_id)
-    return {"baseSha": marker.group(1), "requirementsHash": marker.group(2)}, tasks
+    attempt_limits = {task["attemptLimit"] for task in tasks}
+    fix_loop_limits = {task["fixLoopLimit"] for task in tasks}
+    if len(attempt_limits) != 1 or len(fix_loop_limits) != 1:
+        raise ValueError("task limits must be consistent")
+    return {"baseSha": marker.group(1), "requirementsHash": marker.group(2), "taskAttemptLimit": attempt_limits.pop(), "fixLoopLimit": fix_loop_limits.pop()}, tasks
 
 
 def validate_agent_result(role: str, value: object, assignment_id: str | None = None, mode: str | None = None) -> dict:
@@ -300,7 +315,7 @@ def paths_conflict(paths: list[str], active: set[str]) -> bool:
 def initial_state(repo: Path, metadata: dict, args: argparse.Namespace) -> dict:
     return {
         "schemaVersion": 1, "campaignId": "", "repository": str(repo.resolve()), "phase": "build",
-        "baseSha": metadata["baseSha"], "workerLimit": args.workers, "taskAttemptLimit": args.task_attempts,
+        "baseSha": metadata["baseSha"], "requirementsHash": metadata.get("requirementsHash", "000000"), "workerLimit": args.workers, "taskAttemptLimit": args.task_attempts,
         "fixLoopLimit": args.fix_loops, "formatRetryAllowance": args.format_retries,
         "agentTimeoutSeconds": args.agent_timeout, "validationTimeoutSeconds": args.validation_timeout,
         "providerTimeoutSeconds": args.provider_timeout, "providerCheckTimeoutSeconds": args.provider_check_timeout,
@@ -345,25 +360,34 @@ class StateStore:
 @contextlib.contextmanager
 def coordinator_lock(relay: Path):
     lock = relay / "coordinator.lock"
-    for attempt in range(2):
-        try:
-            descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(descriptor, f"{os.getpid()}\n".encode())
-            os.close(descriptor)
-            break
-        except FileExistsError as error:
-            try:
-                pid = int(lock.read_text(encoding="utf-8").strip())
-                os.kill(pid, 0)
-            except (OSError, ValueError):
-                lock.unlink(missing_ok=True)
-                if attempt == 0:
-                    continue
-            raise RuntimeError(f"another Relay coordinator holds {lock}") from error
+    descriptor = os.open(lock, os.O_CREAT | os.O_RDWR)
+    locked = False
     try:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                if os.fstat(descriptor).st_size == 0:
+                    os.write(descriptor, b"\0")
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            raise RuntimeError(f"another Relay coordinator holds {lock}") from error
+        locked = True
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        os.ftruncate(descriptor, 0)
+        os.write(descriptor, f"{os.getpid()}\n".encode())
         yield lock
     finally:
-        lock.unlink(missing_ok=True)
+        if locked:
+            if os.name == "nt":
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def tool_command(tool: str) -> list[str]:
@@ -399,8 +423,10 @@ def render_bugs(campaign: str, repo: Path, bugs: list[dict] | None = None) -> st
     for bug in bugs or []:
         lines += [
             f"## {bug['id']} — {bug['title']}", "", f"- Severity: {bug['severity']}", f"- Status: {bug['status']}",
-            f"- Source: {bug['source']}", f"- Location: {bug['location']}", f"- Observable failure: {bug['failure']}",
+            f"- Source: {bug['source']}", f"- Source finding: {bug.get('sourceFindingId', bug['id'])}",
+            f"- Location: {bug['location']}", f"- Observable failure: {bug['failure']}",
             f"- Reproduction: `{bug['reproduction']}`", f"- Requirement: {bug['requirement']}", f"- Evidence: {bug['evidence']}",
+            "- Allowed paths:", *[f"  - `{item}`" for item in bug.get("allowedPaths", [bug["location"].replace("\\", "/").split(":", 1)[0]])],
             f"- Branch: {bug.get('branch', 'pending')}", f"- Pull request: {bug.get('pullRequest', 'pending')}", f"- Candidate: {bug.get('candidate', 'pending')}", "",
         ]
     return "\n".join(lines).rstrip() + "\n"
@@ -424,6 +450,8 @@ def parse_bugs(text: str) -> tuple[dict, list[dict]]:
         bugs.append({
             "id": heading.group(1), "title": heading.group(2), "severity": values["Severity"], "status": values["Status"],
             "source": values["Source"], "location": values["Location"], "failure": values["Observable failure"],
+            "sourceFindingId": _field(block, "Source finding") if "- Source finding:" in block else heading.group(1),
+            "allowedPaths": _sublist(block, "Allowed paths") if "- Allowed paths:" in block else [values["Location"].replace("\\", "/").split(":", 1)[0]],
             "reproduction": reproduction[1:-1] if reproduction.startswith("`") and reproduction.endswith("`") else reproduction,
             "requirement": values["Requirement"], "evidence": values["Evidence"], "branch": values["Branch"],
             "pullRequest": values["Pull request"], "candidate": values["Candidate"],
@@ -434,19 +462,82 @@ def parse_bugs(text: str) -> tuple[dict, list[dict]]:
     return {"campaignId": marker.group(1), "repositoryHash": marker.group(2)}, bugs
 
 
-def update_task_ledger(path: Path, assignment_id: str, **values: str) -> None:
+def _validate_ledger(store: StateStore, name: str, text: str) -> None:
+    repo = Path(store.state["repository"])
+    if name == "tasks.md":
+        metadata, _ = parse_tasks(text, runtime=True)
+        for key in ("baseSha", "requirementsHash", "taskAttemptLimit", "fixLoopLimit"):
+            if metadata[key] != store.state[key]:
+                raise RuntimeError(f"tasks.md {key} does not match campaign state")
+    elif name == "bugs.md":
+        metadata, _ = parse_bugs(text)
+        expected = hashlib.sha256(str(repo.resolve()).encode()).hexdigest()[:12]
+        if metadata != {"campaignId": store.state["campaignId"], "repositoryHash": expected}:
+            raise RuntimeError("bugs.md ownership does not match campaign state")
+    else:
+        raise ValueError(f"unsupported ledger: {name}")
+
+
+def write_ledger(store: StateStore, name: str, text: str) -> None:
+    """Persist a replayable intent before atomically replacing a ledger."""
+    with store.lock:
+        _validate_ledger(store, name, text)
+        operation = {"ledger": name, "content": text, "sha256": hashlib.sha256(text.encode()).hexdigest()}
+        store.state["pendingLedgerOperation"] = operation
+        store.save()
+        atomic_write(Path(store.state["repository"]) / name, text)
+        store.state["pendingLedgerOperation"] = None
+        store.save()
+
+
+def recover_pending_ledger(store: StateStore) -> None:
+    operation = store.state.get("pendingLedgerOperation")
+    if operation is None:
+        return
+    if not isinstance(operation, dict) or set(operation) != {"ledger", "content", "sha256"}:
+        raise RuntimeError("invalid pending ledger operation")
+    name, text = operation["ledger"], operation["content"]
+    if not isinstance(name, str) or not isinstance(text, str) or operation["sha256"] != hashlib.sha256(text.encode()).hexdigest():
+        raise RuntimeError("corrupt pending ledger operation")
+    _validate_ledger(store, name, text)
+    atomic_write(Path(store.state["repository"]) / name, text)
+    store.state["pendingLedgerOperation"] = None
+    store.save()
+
+
+def load_tasks(store: StateStore) -> list[dict]:
+    path = Path(store.state["repository"]) / "tasks.md"
     text = path.read_text(encoding="utf-8")
-    start = text.index(f"## {assignment_id} ")
-    next_start = text.find("\n## ", start + 1)
-    end = len(text) if next_start < 0 else next_start
-    block = text[start:end]
-    names = {"status": "Status", "branch": "Branch", "pullRequest": "Pull request", "candidate": "Candidate"}
-    for key, value in values.items():
-        label = names[key]
-        block, count = re.subn(rf"^- {re.escape(label)}:.*$", f"- {label}: {value}", block, count=1, flags=re.MULTILINE)
-        if count != 1:
-            raise ValueError(f"ledger field missing: {label}")
-    atomic_write(path, text[:start] + block + text[end:])
+    _validate_ledger(store, "tasks.md", text)
+    return parse_tasks(text, runtime=True)[1]
+
+
+def load_bugs(store: StateStore) -> list[dict]:
+    path = Path(store.state["repository"]) / "bugs.md"
+    text = path.read_text(encoding="utf-8")
+    _validate_ledger(store, "bugs.md", text)
+    return parse_bugs(text)[1]
+
+
+def write_bugs(store: StateStore, bugs: list[dict]) -> None:
+    write_ledger(store, "bugs.md", render_bugs(store.state["campaignId"], Path(store.state["repository"]), bugs))
+
+
+def update_task_ledger(store: StateStore, assignment_id: str, **values: str) -> None:
+    with store.lock:
+        path = Path(store.state["repository"]) / "tasks.md"
+        text = path.read_text(encoding="utf-8")
+        start = text.index(f"## {assignment_id} ")
+        next_start = text.find("\n## ", start + 1)
+        end = len(text) if next_start < 0 else next_start
+        block = text[start:end]
+        names = {"status": "Status", "attempt": "Attempt", "fixLoop": "Fix loop", "branch": "Branch", "pullRequest": "Pull request", "candidate": "Candidate"}
+        for key, value in values.items():
+            label = names[key]
+            block, count = re.subn(rf"^- {re.escape(label)}:.*$", f"- {label}: {value}", block, count=1, flags=re.MULTILINE)
+            if count != 1:
+                raise ValueError(f"ledger field missing: {label}")
+        write_ledger(store, "tasks.md", text[:start] + block + text[end:])
 
 
 def worker_prompt(mode: str, assignment: dict, candidate_sha: str = "", blockers: list[dict] | None = None) -> str:
@@ -498,6 +589,13 @@ def _consume_agent_call(store: StateStore, assignment_id: str, role: str, mode: 
         state["activeProcesses"][process_id] = {"assignmentId": assignment_id, "role": role, "mode": mode, "status": "queued", "reservedAt": datetime.now(timezone.utc).isoformat(), "deadlineSeconds": state["agentTimeoutSeconds"]}
         result.update(number=number, process_id=process_id)
     store.update(change)
+    if assignment_id.startswith("TASK-") and role == "worker":
+        if mode == "repair":
+            count = store.state["reviewSessions"][assignment_id]["repairAttemptsStarted"]
+            update_task_ledger(store, assignment_id, fixLoop=f"{count}/{store.state['fixLoopLimit']}")
+        else:
+            count = store.state["attemptCounters"][assignment_id]
+            update_task_ledger(store, assignment_id, attempt=f"{count}/{store.state['taskAttemptLimit']}")
     return result["number"], result["process_id"]
 
 
@@ -680,8 +778,8 @@ def publish_candidate(store: StateStore, assignment: dict, worktree: Path, branc
 def record_findings(store: StateStore, assignment_id: str, findings: list[dict], decisions: list[dict]) -> list[dict]:
     actions = {item["findingId"]: item["action"] for item in decisions}
     accepted = []
-    bugs = store.state.setdefault("bugs", [])
-    known = {bug["sourceFindingId"] for bug in bugs}
+    bugs = load_bugs(store)
+    known = {(bug["source"], bug["sourceFindingId"]) for bug in bugs}
     for finding in findings:
         action = actions.get(finding["id"], "discard")
         if action == "accept-blocker" and (finding["severity"] not in {"P0", "P1"} or not finding["candidateIntroduced"] or not all(finding[key] for key in ("location", "failure", "reproduction", "requirement", "evidence"))):
@@ -691,7 +789,8 @@ def record_findings(store: StateStore, assignment_id: str, findings: list[dict],
         if finding["severity"] == "P3":
             action = "discard"
         if action in {"accept-blocker", "backlog"}:
-            if finding["id"] not in known:
+            finding_key = (assignment_id, finding["id"])
+            if finding_key not in known:
                 bug = {
                     "id": f"BUG-{len(bugs) + 1:04d}", "title": finding["failure"][:80], "severity": finding["severity"],
                     "status": "active" if action == "accept-blocker" else "backlog", "source": assignment_id,
@@ -699,13 +798,12 @@ def record_findings(store: StateStore, assignment_id: str, findings: list[dict],
                     "reproduction": finding["reproduction"], "requirement": finding["requirement"], "evidence": finding["evidence"],
                 }
                 bugs.append(bug)
-                known.add(finding["id"])
+                known.add(finding_key)
             else:
-                bug = next(item for item in bugs if item["sourceFindingId"] == finding["id"])
+                bug = next(item for item in bugs if (item["source"], item["sourceFindingId"]) == finding_key)
             if action == "accept-blocker":
                 accepted.append(bug)
-    store.save()
-    atomic_write(store.path.parent.parent / "bugs.md", render_bugs(store.state["campaignId"], Path(store.state["repository"]), bugs))
+    write_bugs(store, bugs)
     return accepted
 
 
@@ -771,7 +869,7 @@ def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: di
                 return False
             store.update(lambda state: state["reviewSessions"][assignment_id].__setitem__("repairAttemptsStarted", state["reviewSessions"][assignment_id]["repairAttemptsStarted"] + 1))
             console("REPAIR", f"role=worker mode=repair assignment={assignment_id} fix={number}/{store.state['fixLoopLimit']}")
-            blockers = [bug for bug in store.state.get("bugs", []) if bug["id"] in session["acceptedBlockerIds"]]
+            blockers = [bug for bug in load_bugs(store) if bug["id"] in session["acceptedBlockerIds"]]
             repair = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt("repair", assignment, sha, blockers), mode="repair", review=True)
             repaired_sha = validate_candidate(store, assignment, worktree, repair)
             transition_review(session, f"verify-{number}", store.state["fixLoopLimit"])
@@ -785,10 +883,10 @@ def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: di
                 transition_review(session, "approved", store.state["fixLoopLimit"])
                 session["reviewedSha"] = sha
                 with store.lock:
+                    bugs = load_bugs(store)
                     for bug in blockers:
-                        bug["status"] = "resolved"
-                    store.save()
-                    atomic_write(store.path.parent.parent / "bugs.md", render_bugs(store.state["campaignId"], Path(store.state["repository"]), store.state.get("bugs", [])))
+                        next(item for item in bugs if item["id"] == bug["id"])["status"] = "resolved"
+                    write_bugs(store, bugs)
                 break
             target = f"repair-{number + 1}" if number < store.state["fixLoopLimit"] else "needs-user"
             transition_review(session, target, store.state["fixLoopLimit"])
@@ -953,14 +1051,14 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
             return False
         if mode == "task":
             with store.lock:
-                update_task_ledger(store.path.parent.parent / "tasks.md", assignment_id, status="integrated", branch=branch, pullRequest=str(pr.get("url", pr.get("number"))), candidate=session["reviewedSha"])
+                update_task_ledger(store, assignment_id, status="integrated", branch=branch, pullRequest=str(pr.get("url", pr.get("number"))), candidate=session["reviewedSha"])
         else:
             with store.lock:
-                for bug in store.state.get("bugs", []):
+                bugs = load_bugs(store)
+                for bug in bugs:
                     if bug["id"] == assignment_id:
                         bug.update(status="resolved", branch=branch, pullRequest=str(pr.get("url", pr.get("number"))), candidate=session["reviewedSha"])
-                store.save()
-                atomic_write(store.path.parent.parent / "bugs.md", render_bugs(store.state["campaignId"], Path(store.state["repository"]), store.state.get("bugs", [])))
+                write_bugs(store, bugs)
         cleanup_worktree(store, assignment_id)
         return True
     except (RuntimeError, ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
@@ -999,7 +1097,7 @@ def run_audit(store: StateStore, semaphore: threading.Semaphore, tasks: list[dic
         if not store.state["auditPlanStarted"]:
             store.update(lambda state: state.update(auditPlanStarted=True, auditCallLimit=1 + state["formatRetryAllowance"]))
         try:
-            result = invoke_with_replacements(store, semaphore, Path(store.state["repository"]), "AUDIT", "audit-planner", role_prompt("audit-planner", {"id": "AUDIT", "requirements": [], "allowedPaths": [], "acceptanceCriteria": [], "validationCommands": []}, audit_sha, {"tasks": tasks, "bugs": store.state.get("bugs", [])}), audit=True, validator=validate_audit_plan)
+            result = invoke_with_replacements(store, semaphore, Path(store.state["repository"]), "AUDIT", "audit-planner", role_prompt("audit-planner", {"id": "AUDIT", "requirements": [], "allowedPaths": [], "acceptanceCriteria": [], "validationCommands": []}, audit_sha, {"tasks": tasks, "bugs": load_bugs(store)}), audit=True, validator=validate_audit_plan)
             scopes = validate_audit_scopes(result)
         except (RuntimeError, ValueError):
             store.update(lambda state: state.update(phase="needs-user"))
@@ -1034,26 +1132,33 @@ def run_audit(store: StateStore, semaphore: threading.Semaphore, tasks: list[dic
             return []
         actions = {item["findingId"]: item["action"] for item in triage["decisions"]}
         accepted = []
+        bugs = load_bugs(store)
+        known = {(bug["source"], bug["sourceFindingId"]): bug for bug in bugs}
         for finding in findings:
             action = actions.get(finding["id"], "discard")
             if action == "accept-blocker" and finding["severity"] in {"P0", "P1"} and all(finding[key] for key in ("location", "failure", "reproduction", "requirement", "evidence")):
-                bug = {
-                    "id": f"BUG-{len(store.state.setdefault('bugs', [])) + 1:04d}", "title": finding["failure"][:80],
-                    "severity": finding["severity"], "status": "active", "source": "audit", "sourceFindingId": finding["id"],
-                    "location": finding["location"], "failure": finding["failure"], "reproduction": finding["reproduction"],
-                    "requirement": finding["requirement"], "evidence": finding["evidence"],
-                }
-                store.state["bugs"].append(bug)
+                bug = known.get(("audit", finding["id"]))
+                if bug is None:
+                    bug = {
+                        "id": f"BUG-{len(bugs) + 1:04d}", "title": finding["failure"][:80],
+                        "severity": finding["severity"], "status": "active", "source": "audit", "sourceFindingId": finding["id"],
+                        "location": finding["location"], "failure": finding["failure"], "reproduction": finding["reproduction"],
+                        "requirement": finding["requirement"], "evidence": finding["evidence"],
+                    }
+                    bugs.append(bug)
+                    known[("audit", finding["id"])] = bug
                 scope = next((item for item in store.state["auditScopes"].values() if finding in item.get("findings", [])), None)
                 bug["allowedPaths"] = (scope or {}).get("paths") or [finding["location"].replace("\\", "/").split(":", 1)[0]]
                 accepted.append(bug)
             elif action == "backlog" and finding["severity"] == "P2":
-                store.state.setdefault("bugs", []).append({"id": f"BUG-{len(store.state['bugs']) + 1:04d}", "title": finding["failure"][:80], "severity": "P2", "status": "backlog", "source": "audit", "sourceFindingId": finding["id"], "location": finding["location"], "failure": finding["failure"], "reproduction": finding["reproduction"], "requirement": finding["requirement"], "evidence": finding["evidence"]})
-        store.state["auditTriageCompleted"] = True
-        store.save()
-        atomic_write(store.path.parent.parent / "bugs.md", render_bugs(store.state["campaignId"], Path(store.state["repository"]), store.state.get("bugs", [])))
+                if ("audit", finding["id"]) not in known:
+                    bug = {"id": f"BUG-{len(bugs) + 1:04d}", "title": finding["failure"][:80], "severity": "P2", "status": "backlog", "source": "audit", "sourceFindingId": finding["id"], "location": finding["location"], "failure": finding["failure"], "reproduction": finding["reproduction"], "requirement": finding["requirement"], "evidence": finding["evidence"]}
+                    bugs.append(bug)
+                    known[("audit", finding["id"])] = bug
+        write_bugs(store, bugs)
+        store.update(lambda state: state.__setitem__("auditTriageCompleted", True))
         return accepted
-    return [bug for bug in store.state.get("bugs", []) if bug["source"] == "audit" and bug["status"] == "active"]
+    return [bug for bug in load_bugs(store) if bug["source"] == "audit" and bug["status"] == "active"]
 
 
 def bug_assignment(bug: dict) -> dict:
@@ -1078,16 +1183,41 @@ def github_preflight(store: StateStore) -> None:
 
 
 def reconcile(store: StateStore) -> None:
+    metadata, _ = parse_tasks((Path(store.state["repository"]) / "tasks.md").read_text(encoding="utf-8"), runtime=True)
+    store.state.setdefault("requirementsHash", metadata["requirementsHash"])
+    recover_pending_ledger(store)
     if store.state["activeProcesses"]:
         for process in store.state["activeProcesses"].values():
             process["interrupted"] = True
         store.state.setdefault("interruptedProcesses", []).extend(store.state["activeProcesses"].values())
         store.state["activeProcesses"] = {}
-    store.state["pendingLedgerOperation"] = None
+    store.state.pop("tasks", None)
+    store.state.pop("bugs", None)
     for task_state in store.state.get("taskStates", {}).values():
         if task_state.get("phase") == "waiting-provider":
             task_state["phase"] = "resume-provider"
     store.save()
+    for task in load_tasks(store):
+        task_state = store.state.get("taskStates", {}).get(task["id"], {})
+        values = {
+            "attempt": f"{store.state['attemptCounters'].get(task['id'], 0)}/{store.state['taskAttemptLimit']}",
+            "fixLoop": f"{store.state.get('reviewSessions', {}).get(task['id'], {}).get('repairAttemptsStarted', 0)}/{store.state['fixLoopLimit']}",
+        }
+        if task_state.get("phase") == "integrated":
+            pr = store.state.get("pullRequests", {}).get(task["id"], {})
+            values.update(status="integrated", branch=task_state.get("branch", "pending"), pullRequest=str(pr.get("url", pr.get("number", "pending"))), candidate=task_state.get("candidateSha", "pending"))
+        if task["attempt"] != store.state["attemptCounters"].get(task["id"], 0) or task["fixLoop"] != store.state.get("reviewSessions", {}).get(task["id"], {}).get("repairAttemptsStarted", 0) or (task_state.get("phase") == "integrated" and task["status"] != "integrated"):
+            update_task_ledger(store, task["id"], **values)
+    bugs = load_bugs(store)
+    changed = False
+    for bug in bugs:
+        task_state = store.state.get("taskStates", {}).get(bug["id"], {})
+        if task_state.get("phase") == "integrated" and bug["status"] != "resolved":
+            pr = store.state.get("pullRequests", {}).get(bug["id"], {})
+            bug.update(status="resolved", branch=task_state.get("branch", "pending"), pullRequest=str(pr.get("url", pr.get("number", "pending"))), candidate=task_state.get("candidateSha", "pending"))
+            changed = True
+    if changed:
+        write_bugs(store, bugs)
 
 
 def heartbeat_loop(store: StateStore, stop: threading.Event) -> None:
@@ -1147,7 +1277,7 @@ def execute_campaign(store: StateStore, tasks: list[dict]) -> int:
             return 2
         if bugs:
             run_assignments(store, semaphore, [bug_assignment(bug) for bug in bugs], "bug")
-        unresolved = [bug for bug in store.state.get("bugs", []) if bug["status"] == "active"]
+        unresolved = [bug for bug in load_bugs(store) if bug["status"] == "active"]
         if unresolved:
             store.update(lambda state: state.__setitem__("phase", "needs-user"))
             return 2
@@ -1191,6 +1321,8 @@ def permanent_cleanup(repo: Path, confirm: bool) -> int:
 
 def initialize_campaign(repo: Path, text: str, args: argparse.Namespace) -> tuple[StateStore, list[dict]]:
     metadata, tasks = parse_tasks(text)
+    if metadata["taskAttemptLimit"] != args.task_attempts or metadata["fixLoopLimit"] != args.fix_loops:
+        raise RuntimeError("plan limits do not match --task-attempts and --fix-loops")
     head = git(repo, "rev-parse", "HEAD", timeout=args.provider_timeout).stdout.strip()
     if head != metadata["baseSha"]:
         raise RuntimeError(f"planned base {metadata['baseSha']} does not match HEAD {head}")
@@ -1203,7 +1335,6 @@ def initialize_campaign(repo: Path, text: str, args: argparse.Namespace) -> tupl
     (relay / "logs").mkdir()
     state = initial_state(repo, metadata, args)
     state["campaignId"] = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    state["tasks"] = tasks
     store = StateStore(relay / "state.json", state)
     atomic_write(repo / "tasks.md", text)
     atomic_write(repo / "bugs.md", render_bugs(state["campaignId"], repo))
@@ -1223,25 +1354,35 @@ def main(argv: list[str] | None = None) -> int:
         except (RuntimeError, ValueError, OSError, json.JSONDecodeError) as error:
             print(f"run.py: {error}", file=sys.stderr)
             return 1
-    text = sys.stdin.read() if not sys.stdin.isatty() else ""
+    stdin_text = sys.stdin.read() if not sys.stdin.isatty() else ""
     relay_state = repo / ".relay" / "state.json"
     try:
         if args.dry_run:
+            text = stdin_text
             if not text:
-                raise ValueError("a plan on stdin is required for --dry-run")
+                plan_path = (args.plan or repo / "PLAN.md").resolve()
+                text = plan_path.read_text(encoding="utf-8") if plan_path.is_file() else ""
+            if not text:
+                raise ValueError("a plan on stdin or in PLAN.md is required for --dry-run")
             parse_tasks(text)
             return 0
         if relay_state.exists():
-            if text.strip():
+            if stdin_text.strip() or args.plan:
                 raise RuntimeError("resume does not accept a new plan")
             state = json.loads(relay_state.read_text(encoding="utf-8"))
             if Path(state["repository"]).resolve() != repo:
                 raise RuntimeError("campaign repository mismatch")
-            store, tasks = StateStore(relay_state, state), state["tasks"]
+            store, tasks = StateStore(relay_state, state), None
             resuming = True
         else:
+            text = stdin_text
             if not text:
-                raise ValueError("a plan on stdin is required for a new campaign")
+                plan_path = (args.plan or repo / "PLAN.md").resolve()
+                if not plan_path.is_file():
+                    raise ValueError(f"plan does not exist: {plan_path}")
+                text = plan_path.read_text(encoding="utf-8")
+            if not text:
+                raise ValueError("a plan on stdin or in PLAN.md is required for a new campaign")
             # Read and validate all stdin before creating any target file.
             parse_tasks(text)
             store, tasks = initialize_campaign(repo, text, args)
@@ -1250,6 +1391,7 @@ def main(argv: list[str] | None = None) -> int:
         with coordinator_lock(store.path.parent):
             if resuming:
                 reconcile(store)
+                tasks = load_tasks(store)
             stop = threading.Event()
             heartbeat = threading.Thread(target=heartbeat_loop, args=(store, stop), daemon=True)
             heartbeat.start()

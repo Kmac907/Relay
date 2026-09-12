@@ -10,11 +10,11 @@ It uses Python 3.11's standard library, top-level `codex exec` processes, Git wo
 
 ```powershell
 python repo.py --path C:\Code\Projects\Example
-python plan.py --repo C:\Code\Projects\Example --requirements requirements.md --workers 3 |
-  python run.py --repo C:\Code\Projects\Example --workers 3 --fix-loops 2
+python plan.py --repo C:\Code\Projects\Example --requirements requirements.md --workers 3 --fix-loops 2
+python run.py --repo C:\Code\Projects\Example --workers 3 --fix-loops 2
 python status.py --repo C:\Code\Projects\Example
 ```
 
 Use `python run.py --repo <path> --cleanup` to preview permanent campaign cleanup, then repeat with `--confirm`. Run the deterministic gate with `python -m unittest -v test_workflow.py`.
 
-Relay writes `tasks.md`, `bugs.md`, and `.relay/state.json` in the target repository and excludes them locally through `.git/info/exclude`. Campaign evidence remains until confirmed cleanup.
+`plan.py` writes `PLAN.md`; `run.py` reads it without a pipe and creates `tasks.md`, `bugs.md`, and `.relay/state.json`. Attempt and fix-loop options must match between planning and execution. `PLAN.md` remains user-owned; campaign evidence remains until confirmed cleanup.

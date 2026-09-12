@@ -156,6 +156,9 @@ class PlanningTests(unittest.TestCase):
         value = {"scope": "elsewhere", "implemented": [], "missing": [], "conflicts": [], "relevantPaths": [], "validationCommands": [], "evidence": []}
         with self.assertRaises(ValueError):
             plan.validate_scout(value, "src")
+        value["scope"], value["relevantPaths"] = "src", ["tests/test_other.py"]
+        with self.assertRaises(ValueError):
+            plan.validate_scout(value, "src")
 
     def test_hung_planning_call_consumes_budget(self):
         with tempfile.TemporaryDirectory() as root, patch("plan.subprocess.run", side_effect=subprocess.TimeoutExpired("codex", .01)):
@@ -164,7 +167,7 @@ class PlanningTests(unittest.TestCase):
                 plan.invoke_agent(Path(root), "prompt", {"type": "object"}, .01, budget)
             self.assertEqual(budget.started, 1)
 
-    def test_real_plan_to_dry_run_pipe_is_read_only(self):
+    def test_real_plan_file_to_dry_run_needs_no_pipe(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
             target = make_git_repository(root)
@@ -173,13 +176,14 @@ class PlanningTests(unittest.TestCase):
             fake = root / "fake_codex.py"
             fake.write_text(FAKE_CODEX, encoding="utf-8")
             environment = os.environ | {"RELAY_CODEX": f"{sys.executable} {fake}"}
-            before = git_output(target, "status", "--porcelain=v1", "--untracked-files=all")
             planned = subprocess.run([sys.executable, str(Path(plan.__file__)), "--repo", str(target), "--requirements", str(requirements), "--workers", "2"], capture_output=True, text=True, env=environment, check=True)
-            self.assertTrue(planned.stdout.startswith("# Tasks\n"))
+            plan_path = target / "PLAN.md"
+            self.assertTrue(Path(planned.stdout.strip()).samefile(plan_path))
+            self.assertTrue(plan_path.read_text(encoding="utf-8").startswith("# Tasks\n"))
             self.assertIn("Relay Planner", planned.stderr)
-            dry = subprocess.run([sys.executable, str(Path(run.__file__)), "--repo", str(target), "--dry-run"], input=planned.stdout, capture_output=True, text=True)
+            dry = subprocess.run([sys.executable, str(Path(run.__file__)), "--repo", str(target), "--dry-run"], capture_output=True, text=True)
             self.assertEqual(dry.returncode, 0, dry.stderr)
-            self.assertEqual(git_output(target, "status", "--porcelain=v1", "--untracked-files=all"), before)
+            self.assertFalse((target / ".relay").exists())
 
     def test_nontrivial_scopes_overlap_and_pm_receives_all_evidence(self):
         with tempfile.TemporaryDirectory() as root:
@@ -200,16 +204,41 @@ class PlanningTests(unittest.TestCase):
             ends = [float(path.read_text()) for path in root.glob("scout.*.end")]
             self.assertEqual((len(starts), len(ends)), (2, 2))
             self.assertLess(max(starts), min(ends))
-            self.assertTrue(completed.stdout.startswith("# Tasks"))
-            self.assertEqual(git_output(target, "status", "--porcelain=v1", "--untracked-files=all"), before)
+            self.assertTrue(Path(completed.stdout.strip()).samefile(target / "PLAN.md"))
+            self.assertTrue((target / "PLAN.md").read_text(encoding="utf-8").startswith("# Tasks"))
+            self.assertEqual(git_output(target, "status", "--porcelain=v1", "--untracked-files=all"), "?? PLAN.md\n")
+
+    def test_scout_snapshot_exposes_only_assigned_tracked_area(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); repo_path = root / "repo"; repo_path.mkdir()
+            for relative in ("src/a.py", "tests/test_a.py"):
+                path = repo_path / relative; path.parent.mkdir(); path.write_text(relative, encoding="utf-8")
+            snapshot = plan.create_scout_snapshot(repo_path, ["src/a.py", "tests/test_a.py"], "src", root / "view")
+            self.assertTrue((snapshot / "src" / "a.py").is_file())
+            self.assertFalse((snapshot / "tests").exists())
+
+    def test_configured_limits_are_rendered(self):
+        text = plan.render_tasks([ContractTests().task()], "0123456", "abc123", task_attempts=5, fix_loops=1)
+        metadata, _ = run.parse_tasks(text)
+        self.assertEqual((metadata["taskAttemptLimit"], metadata["fixLoopLimit"]), (5, 1))
+
+    def test_run_rejects_plan_limit_mismatch_before_creating_campaign(self):
+        with tempfile.TemporaryDirectory() as root:
+            args = run.parser().parse_args(["--repo", root, "--task-attempts", "3", "--fix-loops", "2"])
+            text = plan.render_tasks([ContractTests().task()], "0123456", "abc123", task_attempts=4, fix_loops=1)
+            with self.assertRaises(RuntimeError):
+                run.initialize_campaign(Path(root), text, args)
+            self.assertFalse((Path(root) / ".relay").exists())
 
 
 class DeterministicCoreTests(unittest.TestCase):
     def state_store(self, root, fix_loops=2, format_retries=2):
         args = run.parser().parse_args(["--repo", str(root), "--fix-loops", str(fix_loops), "--format-retries", str(format_retries)])
-        state = run.initial_state(Path(root), {"baseSha": "0123456"}, args)
+        state = run.initial_state(Path(root), {"baseSha": "0123456", "requirementsHash": "abc123"}, args)
         state["campaignId"] = "test"
         path = Path(root) / ".relay" / "state.json"
+        Path(root, "tasks.md").write_text(plan.render_tasks([ContractTests().task()], "0123456", "abc123", args.task_attempts, args.fix_loops), encoding="utf-8")
+        Path(root, "bugs.md").write_text(run.render_bugs("test", Path(root)), encoding="utf-8")
         return run.StateStore(path, state)
 
     def test_ready_tasks_respect_dependencies_priority_and_paths(self):
@@ -245,6 +274,7 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(final["phase"], "needs-user")
             self.assertEqual(final["repairAttemptsStarted"], 2)
             self.assertLessEqual(final["reviewCallsStarted"], final["reviewCallLimit"])
+            self.assertEqual(run.parse_tasks((Path(root) / "tasks.md").read_text(encoding="utf-8"), runtime=True)[1][0]["fixLoop"], 2)
 
     def test_attempt_counter_is_persisted_before_launch_and_bounded(self):
         with tempfile.TemporaryDirectory() as root:
@@ -254,6 +284,7 @@ class DeterministicCoreTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 run._consume_agent_call(store, "TASK-0001", "worker", "task", False, False)
             self.assertEqual(json.loads(store.path.read_text(encoding="utf-8"))["attemptCounters"]["TASK-0001"], 3)
+            self.assertEqual(run.parse_tasks((Path(root) / "tasks.md").read_text(encoding="utf-8"), runtime=True)[1][0]["attempt"], 3)
 
     def test_cleanup_preview_removes_nothing_and_incomplete_refused(self):
         with tempfile.TemporaryDirectory() as root:
@@ -354,8 +385,46 @@ class DeterministicCoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             relay = Path(root); (relay / "coordinator.lock").write_text("99999999\n", encoding="utf-8")
             with run.coordinator_lock(relay):
-                self.assertEqual(int((relay / "coordinator.lock").read_text()), os.getpid())
-            self.assertFalse((relay / "coordinator.lock").exists())
+                pass
+            self.assertEqual(int((relay / "coordinator.lock").read_text()), os.getpid())
+
+    def test_active_windows_safe_lock_probe_does_not_signal_owner(self):
+        with tempfile.TemporaryDirectory() as root:
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import sys; from pathlib import Path; import run;\nwith run.coordinator_lock(Path(sys.argv[1])):\n print('ready', flush=True); sys.stdin.readline()", root],
+                cwd=Path(run.__file__).parent, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+            )
+            try:
+                self.assertEqual(child.stdout.readline().strip(), "ready")
+                with self.assertRaises(RuntimeError):
+                    with run.coordinator_lock(Path(root)):
+                        pass
+                self.assertIsNone(child.poll())
+            finally:
+                if child.poll() is None:
+                    child.stdin.write("\n"); child.stdin.flush(); child.wait(timeout=5)
+                child.stdin.close(); child.stdout.close()
+
+    def test_pending_ledger_operation_is_replayed(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            updated = (Path(root) / "tasks.md").read_text(encoding="utf-8").replace("- Status: ready", "- Status: integrated")
+            store.state["pendingLedgerOperation"] = {"ledger": "tasks.md", "content": updated, "sha256": __import__("hashlib").sha256(updated.encode()).hexdigest()}
+            store.save()
+            run.reconcile(store)
+            self.assertIn("- Status: integrated", (Path(root) / "tasks.md").read_text(encoding="utf-8"))
+            self.assertIsNone(store.state["pendingLedgerOperation"])
+
+    def test_markdown_is_resume_authority_not_state_task_copy(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            store.state["tasks"] = [{"id": "TASK-9999", "title": "stale"}]
+            store.state["bugs"] = [{"id": "BUG-9999", "title": "stale"}]
+            store.save()
+            run.reconcile(store)
+            self.assertEqual([task["id"] for task in run.load_tasks(store)], ["TASK-0001"])
+            self.assertNotIn("tasks", store.state)
+            self.assertNotIn("bugs", store.state)
 
     def test_complete_cleanup_preview_then_confirm(self):
         with tempfile.TemporaryDirectory() as root:
@@ -389,11 +458,13 @@ class FakeEndToEndTests(unittest.TestCase):
                 "RELAY_ALLOW_FAKE_PROVIDER": "1", "FAKE_EVENTS": str(events), "FAKE_GH_STATE": str(provider), "FAKE_AUDIT_SCOPE": "1", "FAKE_TWO_TASKS": "1",
             }
             planned = subprocess.run([sys.executable, str(Path(plan.__file__)), "--repo", str(target), "--requirements", str(requirements), "--workers", "2"], capture_output=True, text=True, env=environment, check=True)
-            plan_text = planned.stdout
-            completed = subprocess.run([sys.executable, str(Path(run.__file__)), "--repo", str(target), "--workers", "2", "--agent-timeout", "10", "--validation-timeout", "10", "--provider-timeout", "10", "--provider-check-timeout", "10"], input=plan_text, capture_output=True, text=True, env=environment, timeout=60)
+            self.assertTrue(Path(planned.stdout.strip()).samefile(target / "PLAN.md"))
+            completed = subprocess.run([sys.executable, str(Path(run.__file__)), "--repo", str(target), "--workers", "2", "--agent-timeout", "10", "--validation-timeout", "10", "--provider-timeout", "10", "--provider-check-timeout", "10"], capture_output=True, text=True, env=environment, timeout=60)
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
             state = json.loads((target / ".relay" / "state.json").read_text(encoding="utf-8"))
             self.assertEqual(state["phase"], "complete")
+            self.assertNotIn("tasks", state)
+            self.assertNotIn("bugs", state)
             self.assertTrue(state["auditPlanStarted"] and state["auditPlanCompleted"] and state["auditTriageCompleted"])
             self.assertEqual(len(state["auditScopes"]), 1)
             self.assertTrue(next(iter(state["auditScopes"].values()))["completed"])
@@ -410,6 +481,26 @@ class FakeEndToEndTests(unittest.TestCase):
             shown = subprocess.run([sys.executable, str(Path(status.__file__)), "--repo", str(target)], capture_output=True, text=True, check=True)
             self.assertIn("Review sessions", shown.stdout)
             self.assertEqual((target / ".relay" / "state.json").read_bytes(), before)
+
+    def test_accepted_audit_bug_runs_worker_bug_review_pr_merge_and_stops(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); target = make_git_repository(root)
+            fake_codex, fake_gh = root / "fake_codex.py", root / "fake_gh.py"
+            fake_codex.write_text(FAKE_CODEX, encoding="utf-8"); fake_gh.write_text(FAKE_GH, encoding="utf-8")
+            provider = root / "provider"; provider.mkdir()
+            requirements = root / "requirements.md"; requirements.write_text("Create one file and audit it.", encoding="utf-8")
+            environment = os.environ | {
+                "RELAY_CODEX": f"{sys.executable} {fake_codex}", "RELAY_GH": f"{sys.executable} {fake_gh}",
+                "RELAY_ALLOW_FAKE_PROVIDER": "1", "FAKE_GH_STATE": str(provider), "FAKE_AUDIT_SCOPE": "1", "FAKE_AUDIT_BUG": "1",
+            }
+            subprocess.run([sys.executable, str(Path(plan.__file__)), "--repo", str(target), "--requirements", str(requirements)], capture_output=True, text=True, env=environment, check=True)
+            completed = subprocess.run([sys.executable, str(Path(run.__file__)), "--repo", str(target), "--agent-timeout", "10", "--validation-timeout", "10", "--provider-timeout", "10", "--provider-check-timeout", "10"], capture_output=True, text=True, env=environment, timeout=60)
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            state = json.loads((target / ".relay" / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual((state["phase"], state["taskStates"]["BUG-0001"]["mode"], state["taskStates"]["BUG-0001"]["phase"]), ("complete", "bug", "integrated"))
+            self.assertEqual(state["auditCallsStarted"], 3)
+            self.assertEqual(run.parse_bugs((target / "bugs.md").read_text(encoding="utf-8"))[1][0]["status"], "resolved")
+            self.assertEqual(len(list(provider.glob("*.json"))), 2)
 
     def test_adversarial_review_terminates_at_shared_repair_budget(self):
         with tempfile.TemporaryDirectory() as root:
@@ -499,14 +590,21 @@ elif "Role: contract-reviewer" in prompt or "Role: risk-reviewer" in prompt:
         findings = [{"id": role, "severity": "P1", "location": "file.txt:1", "failure": "always fails", "reproduction": "python -c \"raise SystemExit(1)\"", "requirement": "must pass", "evidence": "deterministic failure", "candidateIntroduced": True}]
     result = {"assignmentId": assignment, "candidateSha": candidate, "findings": findings}
 elif "Role: triage-pm" in prompt:
-    decisions = [{"findingId": role, "action": "accept-blocker", "reason": "reproduced"} for role in ("contract-reviewer", "risk-reviewer")] if os.environ.get("FAKE_ADVERSARIAL") and assignment != "AUDIT" else []
+    if os.environ.get("FAKE_ADVERSARIAL") and assignment != "AUDIT":
+        decisions = [{"findingId": role, "action": "accept-blocker", "reason": "reproduced"} for role in ("contract-reviewer", "risk-reviewer")]
+    elif os.environ.get("FAKE_AUDIT_BUG") and assignment == "AUDIT":
+        decisions = [{"findingId": "audit-bug", "action": "accept-blocker", "reason": "reproduced"}]
+    else:
+        decisions = []
     result = {"assignmentId": assignment, "decisions": decisions}
 elif "Role: verification-reviewer" in prompt:
     result = {"assignmentId": assignment, "candidateSha": candidate, "status": "unresolved" if os.environ.get("FAKE_ADVERSARIAL") else "resolved"}
 elif "Role: audit-planner" in prompt:
-    result = {"scopes": [{"scopeId": "AUDIT-0001", "scope": "README", "requirements": ["fixture"], "paths": ["README.md"], "commands": [], "completionCondition": "README inspected"}]} if os.environ.get("FAKE_AUDIT_SCOPE") else {"scopes": []}
+    paths = ["audit_fix.txt"] if os.environ.get("FAKE_AUDIT_BUG") else ["README.md"]
+    result = {"scopes": [{"scopeId": "AUDIT-0001", "scope": "fixture", "requirements": ["fixture"], "paths": paths, "commands": [], "completionCondition": "scope inspected"}]} if os.environ.get("FAKE_AUDIT_SCOPE") else {"scopes": []}
 elif "Role: audit-worker" in prompt:
-    result = {"scopeId": assignment, "findings": []}
+    findings = [{"id": "audit-bug", "severity": "P1", "location": "audit_fix.txt:1", "failure": "audit fix is missing", "reproduction": "python -c \"from pathlib import Path; assert Path('audit_fix.txt').is_file()\"", "requirement": "audit fix exists", "evidence": "file absent", "candidateIntroduced": False}] if os.environ.get("FAKE_AUDIT_BUG") else []
+    result = {"scopeId": assignment, "findings": findings}
 else:
     raise SystemExit("unknown prompt")
 with open(out, "w", encoding="utf-8") as stream: json.dump(result, stream)

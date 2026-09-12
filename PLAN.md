@@ -4,7 +4,7 @@
 
   repo.py → plan.py → run.py → status.py
 
-  Relay creates repositories, converts project requirements into tasks.md, always creates bugs.md, executes independent work concurrently through top-level Codex
+  Relay creates repositories, converts project requirements into PLAN.md and then tasks.md, always creates bugs.md, executes independent work concurrently through top-level Codex
   processes, creates GitHub pull requests, performs bounded reviews and repairs, runs a bounded audit, and recovers safely after interruption.
 
   Relay is separate from Brace. Relay is the temporary workflow used to build Brace; Brace remains the eventual full CLI product.
@@ -17,9 +17,9 @@
   - Use Python 3.11’s standard library.
   - Reuse the unfinished existing repo.py.
   - Accept text or Markdown requirements.
-  - Convert requirements into tasks.md.
+  - Convert requirements into PLAN.md, which run.py ingests into tasks.md.
   - Always create bugs.md.
-  - Pipe plan.py output directly into run.py.
+  - Run plan.py and run.py without requiring a shell pipe.
   - Use multiple top-level codex exec processes.
   - Never use Codex subagents.
   - Use isolated Git worktrees.
@@ -125,13 +125,14 @@
   A Relay campaign creates:
 
   <target-repository>\
+  ├── PLAN.md
   ├── tasks.md
   ├── bugs.md
   └── .relay\
       ├── state.json
       └── logs\
 
-  The canonical name is tasks.md, plural. There is no separate runtime plan.md; the output from plan.py becomes tasks.md.
+  PLAN.md is the user-owned planning handoff. run.py validates it and copies its content into the authoritative active-campaign tasks.md ledger. Stdin remains a compatibility input.
 
   Relay adds these paths to .git\info\exclude:
 
@@ -143,7 +144,8 @@
 
   Responsibilities:
 
-  - tasks.md: authoritative implementation plan.
+  - PLAN.md: user-owned plan produced before campaign initialization.
+  - tasks.md: authoritative active-campaign implementation plan.
   - bugs.md: authoritative bug ledger.
   - .relay\state.json: mechanical execution and recovery state.
   - .relay\logs: separate raw output for every agent call.
@@ -594,9 +596,9 @@
     --requirements C:\Code\brace-plan.txt `
     --workers 3
 
-  plan.py is read-only with respect to the target.
+  plan.py changes only its requested PLAN.md output artifact; all scout and Planning PM processes are read-only.
 
-  It runs scouts when useful, runs the Planning PM, validates structured output, and emits only canonical tasks.md content to stdout.
+  It runs scouts when useful, runs the Planning PM, validates structured output, writes canonical task content to PLAN.md, and prints only that path to stdout.
 
   Progress goes to stderr:
 
@@ -612,7 +614,7 @@
   15:11:58  VALIDATE   tasks=24
   15:11:59  OUTPUT     ready=7 blocked=17
 
-  Stdout contains only:
+  PLAN.md contains:
 
   # Tasks
 
@@ -637,34 +639,36 @@
   - Pull request: pending
   - Candidate: pending
 
-  # Plan-to-run pipeline
+  # Plan-to-run handoff
 
   python C:\Code\Projects\Relay\plan.py `
     --repo C:\Code\Projects\Brace `
     --requirements C:\Code\brace-plan.txt `
-    --workers 3 |
+    --workers 3 `
+    --fix-loops 2
+
   python C:\Code\Projects\Relay\run.py `
     --repo C:\Code\Projects\Brace `
     --workers 3 `
     --fix-loops 2 `
     --merge-method squash
 
-  To inspect the plan first:
+  To use a different user-owned plan path:
 
   python C:\Code\Projects\Relay\plan.py `
     --repo C:\Code\Projects\Brace `
     --requirements C:\Code\brace-plan.txt `
-    > C:\Code\proposed-tasks.md
+    --output C:\Code\proposed-tasks.md
 
   Then:
 
-  Get-Content -Raw C:\Code\proposed-tasks.md |
   python C:\Code\Projects\Relay\run.py `
     --repo C:\Code\Projects\Brace `
+    --plan C:\Code\proposed-tasks.md `
     --workers 3 `
     --fix-loops 2
 
-  A redirected plan is user-owned and is never deleted by Relay.
+  PLAN.md and any alternate plan path are user-owned and are never deleted by Relay.
 
   # run.py initialization
 
@@ -1124,9 +1128,9 @@
   11. Implement repository scouts in plan.py.
   12. Implement the Planning PM.
   13. Implement structured planning validation.
-  14. Emit canonical Markdown exclusively on stdout.
+  14. Write canonical Markdown to PLAN.md and print only its path to stdout.
   15. Send planning progress exclusively to stderr.
-  16. Implement piped-plan ingestion in run.py.
+  16. Implement PLAN.md ingestion in run.py, retaining stdin compatibility.
   17. Implement mandatory ledger creation.
   18. Implement Relay ownership markers and local exclusion.
   19. Implement runtime state, locking, and recoverable ledger writes.
@@ -1179,13 +1183,13 @@
   - Independent scouts overlap in execution.
   - Planning PM receives all scout evidence.
   - plan.py never modifies the target.
-  - Progress never enters stdout.
+  - Progress never enters stdout; stdout contains only the resulting plan path.
   - Stdout contains only valid tasks.md.
   - Planning attempts terminate at their configured limit.
   - Scout assignments are fixed before launch and cannot recursively expand.
   - planningCallsStarted never exceeds scout count + 1 + formatRetryAllowance.
   - Hung scouts and Planning PM calls stop at agentTimeoutSeconds.
-  - plan.py | run.py works as a real pipe.
+  - plan.py followed by run.py works without a pipe.
 
   ## Agent dispatch
 
@@ -1328,7 +1332,7 @@
   ─────────────────────────────────────  ──────────────────────────────────────────────
    Requirements become task plan          plan.py
   ─────────────────────────────────────  ──────────────────────────────────────────────
-   Pipe plan into runner                  Plan-to-run pipeline
+   Pass PLAN.md into runner               Plan-to-run handoff
   ─────────────────────────────────────  ──────────────────────────────────────────────
    Always create tasks.md                 run.py initialization
   ─────────────────────────────────────  ──────────────────────────────────────────────
