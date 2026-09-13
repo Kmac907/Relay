@@ -317,6 +317,8 @@ class DeterministicCoreTests(unittest.TestCase):
                 self.assertEqual(actual, expected)
         with self.assertRaises(ValueError):
             run.detect_provider("https://github.com.evil.invalid/owner/repo")
+        with self.assertRaises(ValueError):
+            run.detect_provider("file://github.com/owner/repo")
 
     def test_old_github_state_is_inferred_on_resume(self):
         with tempfile.TemporaryDirectory() as root:

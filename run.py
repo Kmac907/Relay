@@ -744,6 +744,8 @@ def detect_provider(remote: str) -> dict[str, str]:
         host, path = scp.group(1).lower(), scp.group(2)
     else:
         parsed = urlsplit(value)
+        if parsed.scheme.lower() not in {"http", "https", "ssh"}:
+            raise ValueError("origin uses an unsupported URL scheme")
         host, path = (parsed.hostname or "").lower(), parsed.path.lstrip("/")
     parts = [unquote(part) for part in path.rstrip("/").split("/") if part]
     if parts and parts[-1].endswith(".git"):
