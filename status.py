@@ -36,7 +36,8 @@ def main(argv: list[str] | None = None) -> int:
     processes = Counter(f"{item['role']}" + (f" ({item['mode']})" if item.get("mode") else "") for item in active)
     phases = Counter(value["phase"] for value in state.get("taskStates", {}).values())
     bugs = Counter(f"{item['severity']} {item['status']}" for item in ledger_bugs)
-    print(f"Relay campaign: {state['campaignId']}\nPhase:          {state['phase']}\nElapsed:        {age(state['createdAt'])}\nHeartbeat age:  {age(state['heartbeat'])}")
+    provider = "Azure DevOps" if state.get("provider") == "azure-devops" else "GitHub" if state.get("provider") == "github" or state.get("githubRepository") else "not-detected"
+    print(f"Relay campaign: {state['campaignId']}\nProvider:       {provider}\nPhase:          {state['phase']}\nElapsed:        {age(state['createdAt'])}\nHeartbeat age:  {age(state['heartbeat'])}")
     bootstrap = state.get("agentsBootstrap")
     if bootstrap:
         pr = bootstrap.get("pr") or {}

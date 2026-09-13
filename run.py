@@ -18,6 +18,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote, unquote, urlsplit
 
 from repo import GENERATED_AGENTS_MARKER, TARGET_AGENTS, TARGET_AGENTS_SHA256, create_exclusive
 
@@ -705,10 +706,9 @@ def provider_call(store: StateStore, key: str, *args: str, check: bool = True) -
         result["count"] = count + 1
     store.update(consume)
     actual = list(args)
-    if actual and actual[0] == "pr" and store.state.get("githubRepository"):
-        actual += ["--repo", store.state["githubRepository"]]
+    tool = "az" if store.state.get("provider") == "azure-devops" else "gh"
     try:
-        completed = run_tool("gh", *actual, timeout=store.state["providerTimeoutSeconds"], check=False)
+        completed = run_tool(tool, *actual, timeout=store.state["providerTimeoutSeconds"], check=False)
     except subprocess.TimeoutExpired:
         log_provider(store, f"{key} timeout={store.state['providerTimeoutSeconds']}s args={actual}")
         raise
@@ -733,7 +733,114 @@ def provider_with_retries(store: StateStore, key: str, *args: str) -> subprocess
             return provider_call(store, key, *args)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as caught:
             error = caught
-    raise RuntimeError(f"provider operation exhausted attempts: {key}") from error
+    raise RuntimeError(f"{provider_name(store.state)} operation exhausted attempts: {key}") from error
+
+
+def detect_provider(remote: str) -> dict[str, str]:
+    """Return normalized provider identity from a supported origin URL."""
+    value = remote.strip()
+    scp = re.fullmatch(r"(?:[^@\s]+@)?([^:/\s]+):(.+)", value)
+    if scp and "://" not in value:
+        host, path = scp.group(1).lower(), scp.group(2)
+    else:
+        parsed = urlsplit(value)
+        host, path = (parsed.hostname or "").lower(), parsed.path.lstrip("/")
+    parts = [unquote(part) for part in path.rstrip("/").split("/") if part]
+    if parts and parts[-1].endswith(".git"):
+        parts[-1] = parts[-1][:-4]
+    if host == "github.com" and len(parts) == 2 and all(parts):
+        return {"provider": "github", "githubRepository": "/".join(parts)}
+    if host in {"ssh.dev.azure.com", "vs-ssh.visualstudio.com"}:
+        if parts[:1] == ["v3"]:
+            parts = parts[1:]
+        if len(parts) == 3 and all(parts):
+            return {"provider": "azure-devops", "azureOrganization": parts[0], "azureProject": parts[1], "azureRepository": parts[2]}
+    if host == "dev.azure.com" and len(parts) == 4 and parts[2].lower() == "_git" and all(parts):
+        return {"provider": "azure-devops", "azureOrganization": parts[0], "azureProject": parts[1], "azureRepository": parts[3]}
+    if host.endswith(".visualstudio.com") and host != "visualstudio.com" and "_git" in [part.lower() for part in parts]:
+        marker = [part.lower() for part in parts].index("_git")
+        if marker >= 1 and marker + 1 == len(parts) - 1:
+            return {"provider": "azure-devops", "azureOrganization": unquote(host[:-len(".visualstudio.com")]), "azureProject": parts[marker - 1], "azureRepository": parts[marker + 1]}
+    raise ValueError("origin is not a supported GitHub or Azure DevOps Services repository")
+
+
+def provider_name(state: dict) -> str:
+    return "Azure DevOps" if state.get("provider") == "azure-devops" else "GitHub"
+
+
+def _azure_organization(state: dict) -> str:
+    return f"https://dev.azure.com/{quote(state['azureOrganization'], safe='')}"
+
+
+def _azure_context(state: dict, *, repository: bool = True, project: bool = True) -> list[str]:
+    result = ["--organization", _azure_organization(state)]
+    if project:
+        result += ["--project", state["azureProject"]]
+    if repository:
+        result += ["--repository", state["azureRepository"]]
+    return result
+
+
+def normalize_pr(state: dict, data: object) -> dict:
+    if not isinstance(data, dict):
+        raise ValueError("provider pull request output must be an object")
+    if state.get("provider") == "azure-devops":
+        number = data.get("pullRequestId")
+        commit = data.get("lastMergeSourceCommit")
+        head = commit.get("commitId") if isinstance(commit, dict) else None
+        raw_state = str(data.get("status", "")).lower()
+        normalized_state = {"active": "OPEN", "completed": "MERGED", "abandoned": "CLOSED"}.get(raw_state)
+        links = data.get("_links")
+        web = links.get("web") if isinstance(links, dict) else None
+        url = web.get("href") if isinstance(web, dict) else None
+        if not url and isinstance(number, int):
+            url = f"{_azure_organization(state)}/{quote(state['azureProject'], safe='')}/_git/{quote(state['azureRepository'], safe='')}/pullrequest/{number}"
+    else:
+        number, head, normalized_state, url = data.get("number"), data.get("headRefOid"), str(data.get("state", "")).upper(), data.get("url")
+    if isinstance(number, bool) or not isinstance(number, int) or not isinstance(url, str) or not url or not isinstance(head, str) or not head or normalized_state not in {"OPEN", "CLOSED", "MERGED"}:
+        raise ValueError("invalid provider pull request output")
+    return {"number": number, "url": url, "headRefOid": head, "state": normalized_state}
+
+
+def _provider_json(completed: subprocess.CompletedProcess) -> object:
+    value = json.loads(completed.stdout)
+    if not isinstance(value, (dict, list)):
+        raise ValueError("provider output must be a JSON object or array")
+    return value
+
+
+def pr_discover(store: StateStore, key: str, branch: str) -> list[dict]:
+    if store.state.get("provider") == "azure-devops":
+        args = ["repos", "pr", "list", "--source-branch", branch, "--status", "all", *_azure_context(store.state), "--output", "json"]
+    else:
+        args = ["pr", "list", "--head", branch, "--state", "all", "--json", "number,url,headRefOid,state", "--repo", store.state.get("githubRepository", "fake/relay")]
+    data = _provider_json(provider_with_retries(store, key, *args))
+    if not isinstance(data, list):
+        raise ValueError("provider pull request list must be an array")
+    return [normalize_pr(store.state, item) for item in data]
+
+
+def pr_inspect(store: StateStore, key: str, identifier: str | int) -> dict:
+    if store.state.get("provider") == "azure-devops":
+        args = ["repos", "pr", "show", "--id", str(identifier), *_azure_context(store.state, repository=False, project=False), "--output", "json"]
+    else:
+        args = ["pr", "view", str(identifier), "--json", "number,url,headRefOid,state", "--repo", store.state.get("githubRepository", "fake/relay")]
+    return normalize_pr(store.state, _provider_json(provider_with_retries(store, key, *args)))
+
+
+def pr_create(store: StateStore, key: str, branch: str, title: str, body: Path) -> dict:
+    if store.state.get("provider") == "azure-devops":
+        args = ["repos", "pr", "create", "--source-branch", branch, "--target-branch", "main", "--title", title, "--description", body.read_text(encoding="utf-8"), *_azure_context(store.state), "--output", "json"]
+        return normalize_pr(store.state, _provider_json(provider_with_retries(store, key, *args)))
+    provider_with_retries(store, key, "pr", "create", "--base", "main", "--head", branch, "--title", title, "--body-file", str(body), "--repo", store.state.get("githubRepository", "fake/relay"))
+    return pr_inspect(store, key.replace("pr-create", "pr-view"), branch)
+
+
+def pr_merge(store: StateStore, key: str, number: int) -> None:
+    if store.state.get("provider") == "azure-devops":
+        provider_with_retries(store, key, "repos", "pr", "update", "--id", str(number), "--status", "completed", "--squash", "true" if store.state["mergeMethod"] == "squash" else "false", "--delete-source-branch", "true", *_azure_context(store.state, repository=False, project=False), "--output", "json")
+    else:
+        provider_with_retries(store, key, "pr", "merge", str(number), f"--{store.state['mergeMethod']}", "--delete-branch", "--repo", store.state.get("githubRepository", "fake/relay"))
 
 
 def git_provider_with_retries(store: StateStore, key: str, repo: Path, *args: str) -> subprocess.CompletedProcess:
@@ -764,14 +871,13 @@ def publish_candidate(store: StateStore, assignment: dict, worktree: Path, branc
     body = store.path.parent / f".{assignment_id}-pr.md"
     atomic_write(body, f"Relay assignment {assignment_id}\n\nCandidate: {sha}\n")
     try:
-        existing = provider_call(store, f"{assignment_id}:pr-list", "pr", "list", "--head", branch, "--state", "all", "--json", "number,url,headRefOid,state", check=False)
-        matches = json.loads(existing.stdout) if existing.returncode == 0 and existing.stdout.strip() else []
+        matches = pr_discover(store, f"{assignment_id}:pr-list", branch)
         if matches:
             pr = matches[0]
         else:
-            provider_with_retries(store, f"{assignment_id}:pr-create", "pr", "create", "--base", "main", "--head", branch, "--title", f"{assignment_id}: {assignment['title']}", "--body-file", str(body))
-            view = provider_with_retries(store, f"{assignment_id}:pr-view", "pr", "view", branch, "--json", "number,url,headRefOid,state")
-            pr = json.loads(view.stdout)
+            pr = pr_create(store, f"{assignment_id}:pr-create", branch, f"{assignment_id}: {assignment['title']}", body)
+        if pr["headRefOid"] != sha:
+            raise RuntimeError("provider pull request source commit does not match candidate")
         store.update(lambda state: (state["taskStates"][assignment_id].__setitem__("pr", pr), state["pullRequests"].__setitem__(assignment_id, pr)))
         console("PR", f"assignment={assignment_id} number={pr.get('number')}")
         return pr
@@ -912,8 +1018,13 @@ def wait_for_checks(store: StateStore, assignment_id: str, pr: dict, reviewed_sh
         first = False
         try:
             store.update(lambda state: state.__setitem__("providerOperationsStarted", state.get("providerOperationsStarted", 0) + 1))
-            arguments = ["pr", "view", str(pr["number"]), "--json", "headRefOid,mergeStateStatus,statusCheckRollup,state", "--repo", store.state.get("githubRepository", "fake/relay")]
-            view = run_tool("gh", *arguments, timeout=store.state["providerTimeoutSeconds"], check=False)
+            if store.state.get("provider") == "azure-devops":
+                arguments = ["repos", "pr", "show", "--id", str(pr["number"]), *_azure_context(store.state, repository=False, project=False), "--output", "json"]
+                tool = "az"
+            else:
+                arguments = ["pr", "view", str(pr["number"]), "--json", "number,url,headRefOid,mergeStateStatus,statusCheckRollup,state", "--repo", store.state.get("githubRepository", "fake/relay")]
+                tool = "gh"
+            view = run_tool(tool, *arguments, timeout=store.state["providerTimeoutSeconds"], check=False)
             log_provider(store, f"{assignment_id}:check exit={view.returncode} args={arguments}\n{view.stdout}{view.stderr}")
         except (RuntimeError, subprocess.TimeoutExpired):
             key = f"{assignment_id}:check-errors"
@@ -927,11 +1038,52 @@ def wait_for_checks(store: StateStore, assignment_id: str, pr: dict, reviewed_sh
             if store.state["providerAttemptCounters"][key] >= store.state["providerAttemptLimit"]:
                 return "waiting-provider"
             continue
-        data = json.loads(view.stdout)
-        if data["headRefOid"] != reviewed_sha:
+        data = _provider_json(view)
+        current = normalize_pr(store.state, data) if store.state.get("provider") == "azure-devops" else data
+        if current.get("headRefOid") != reviewed_sha:
             return "sha-drift"
-        if data.get("state") == "MERGED":
+        if str(current.get("state", "")).upper() == "MERGED":
             return "merged"
+        if str(current.get("state", "")).upper() == "CLOSED":
+            return "failed"
+        if store.state.get("provider") == "azure-devops":
+            merge_status = str(data.get("mergeStatus", "")).lower()
+            if merge_status == "conflicts":
+                return "repair-required"
+            try:
+                store.update(lambda state: state.__setitem__("providerOperationsStarted", state.get("providerOperationsStarted", 0) + 1))
+                arguments = ["repos", "pr", "policy", "list", "--id", str(pr["number"]), *_azure_context(store.state, repository=False, project=False), "--output", "json"]
+                policies = run_tool("az", *arguments, timeout=store.state["providerTimeoutSeconds"], check=False)
+                log_provider(store, f"{assignment_id}:policy exit={policies.returncode} args={arguments}\n{policies.stdout}{policies.stderr}")
+                if policies.returncode:
+                    raise RuntimeError("Azure DevOps policy inspection failed")
+                policy_data = _provider_json(policies)
+                if not isinstance(policy_data, list):
+                    raise ValueError("Azure DevOps policy output must be an array")
+                blocking = []
+                for policy in policy_data:
+                    if not isinstance(policy, dict):
+                        raise ValueError("invalid Azure DevOps policy output")
+                    configuration = policy.get("configuration")
+                    is_blocking = configuration.get("isBlocking") if isinstance(configuration, dict) else policy.get("isBlocking")
+                    if is_blocking is True:
+                        blocking.append(str(policy.get("status", "")).lower())
+            except (RuntimeError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired):
+                key = f"{assignment_id}:check-errors"
+                store.update(lambda state: state["providerAttemptCounters"].__setitem__(key, state["providerAttemptCounters"].get(key, 0) + 1))
+                if store.state["providerAttemptCounters"][key] >= store.state["providerAttemptLimit"]:
+                    return "waiting-provider"
+                continue
+            if set(blocking) & {"rejected", "broken"} or merge_status == "failure":
+                return "failed"
+            if set(blocking) & {"queued", "running"} or merge_status == "queued":
+                time.sleep(min(10, max(0, deadline - time.time())))
+                continue
+            if any(status not in {"approved", "notapplicable"} for status in blocking):
+                return "failed"
+            if merge_status == "rejectedbypolicy":
+                return "waiting-provider"
+            return "passed"
         checks = data.get("statusCheckRollup") or []
         states = {str(item.get("conclusion") or item.get("state") or item.get("status", "")).upper() for item in checks}
         if states & {"FAILURE", "FAILED", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED"}:
@@ -959,7 +1111,7 @@ def merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignme
             store.update(lambda state: state["taskStates"][assignment_id].update(phase="needs-user", providerStatus=status))
             return False
         store.update(lambda state: state["reviewSessions"][assignment_id].__setitem__("repairAttemptsStarted", state["reviewSessions"][assignment_id]["repairAttemptsStarted"] + 1))
-        blocker = [{"id": f"PROVIDER-{session['repairAttemptsStarted']}", "failure": status, "evidence": "GitHub checks or merge readiness failed"}]
+        blocker = [{"id": f"PROVIDER-{session['repairAttemptsStarted']}", "failure": status, "evidence": f"{provider_name(store.state)} checks or merge readiness failed"}]
         try:
             git_provider_with_retries(store, f"{assignment_id}:repair-fetch:{session['repairAttemptsStarted']}", worktree, "fetch", "origin", "main")
             current_base = git(worktree, "rev-parse", "origin/main", timeout=store.state["providerTimeoutSeconds"], check=False)
@@ -992,7 +1144,7 @@ def merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignme
     if status != "passed":
         store.update(lambda state: state["taskStates"][assignment_id].update(phase="needs-user" if status in {"failed", "sha-drift"} else "waiting-provider", providerStatus=status))
         return False
-    provider_with_retries(store, f"{assignment_id}:merge", "pr", "merge", str(pr["number"]), f"--{store.state['mergeMethod']}", "--delete-branch")
+    pr_merge(store, f"{assignment_id}:merge", pr["number"])
     store.update(lambda state: (state["taskStates"][assignment_id].update(phase="integrated", merged=True, providerStatus="passed"), state["pullRequests"][assignment_id].update(state="MERGED")))
     console("MERGED", f"assignment={assignment_id} pr={pr['number']}")
     return True
@@ -1182,21 +1334,37 @@ def target_instructions(repo: Path, create: bool = False) -> tuple[str, bytes]:
         raise RuntimeError("AGENTS.md must be UTF-8") from error
 
 
-def github_preflight(store: StateStore) -> None:
+def provider_preflight(store: StateStore) -> None:
+    if not store.state.get("provider") and store.state.get("githubRepository"):
+        store.update(lambda state: state.__setitem__("provider", "github"))
     if store.state.get("preflightCompleted"):
+        console("PROVIDER", provider_name(store.state))
+        if store.state.get("provider") == "azure-devops" and store.state["mergeMethod"] == "rebase":
+            raise RuntimeError("Azure DevOps does not support Relay's rebase merge method; use squash or merge")
         return
     repository = Path(store.state["repository"])
-    remote = git(repository, "remote", "get-url", "origin", timeout=store.state["providerTimeoutSeconds"]).stdout.strip()
-    match = re.search(r"github\.com[:/]([^/\s]+/[^/\s]+)$", remote)
-    if not os.environ.get("RELAY_ALLOW_FAKE_PROVIDER") and not match:
-        raise RuntimeError("origin is not a GitHub repository")
-    github_repository = match.group(1) if match else "fake/relay"
-    if github_repository.endswith(".git"):
-        github_repository = github_repository[:-4]
-    store.update(lambda state: state.__setitem__("githubRepository", github_repository))
-    provider_with_retries(store, "preflight:auth", "auth", "status")
-    provider_with_retries(store, "preflight:repo", "repo", "view", github_repository)
+    remote = git(repository, "config", "--get", "remote.origin.url", timeout=store.state["providerTimeoutSeconds"]).stdout.strip()
+    try:
+        identity = detect_provider(remote)
+    except ValueError:
+        if not os.environ.get("RELAY_ALLOW_FAKE_PROVIDER"):
+            raise
+        identity = {"provider": "github", "githubRepository": "fake/relay"}
+    store.update(lambda state: state.update(identity))
+    console("PROVIDER", provider_name(store.state))
+    if identity["provider"] == "azure-devops":
+        if store.state["mergeMethod"] == "rebase":
+            raise RuntimeError("Azure DevOps does not support Relay's rebase merge method; use squash or merge")
+        provider_with_retries(store, "preflight:auth", "devops", "project", "show", "--project", identity["azureProject"], "--organization", _azure_organization(identity), "--output", "json")
+        provider_with_retries(store, "preflight:repo", "repos", "show", "--repository", identity["azureRepository"], "--project", identity["azureProject"], "--organization", _azure_organization(identity), "--output", "json")
+    else:
+        provider_with_retries(store, "preflight:auth", "auth", "status")
+        provider_with_retries(store, "preflight:repo", "repo", "view", identity["githubRepository"])
     store.update(lambda state: state.__setitem__("preflightCompleted", True))
+
+
+# Kept for callers that imported the old internal name.
+github_preflight = provider_preflight
 
 
 def validate_agents_bootstrap(store: StateStore, worktree: Path, sha: str) -> None:
@@ -1305,16 +1473,14 @@ def bootstrap_agents(store: StateStore) -> bool:
             store.update(lambda state: state["agentsBootstrap"].update(phase="pull-request", pushedSha=sha))
         pr = bootstrap.get("pr")
         if not pr:
-            existing = provider_with_retries(store, "AGENTS:pr-list", "pr", "list", "--head", branch, "--state", "all", "--json", "number,url,headRefOid,state")
-            matches = json.loads(existing.stdout) if existing.stdout.strip() else []
+            matches = pr_discover(store, "AGENTS:pr-list", branch)
             if matches:
                 pr = matches[0]
             else:
                 body = store.path.parent / ".AGENTS-pr.md"
                 atomic_write(body, f"Relay generated target instructions\n\nCandidate: {sha}\n")
                 try:
-                    provider_with_retries(store, "AGENTS:pr-create", "pr", "create", "--base", "main", "--head", branch, "--title", "Add Relay target instructions", "--body-file", str(body))
-                    pr = json.loads(provider_with_retries(store, "AGENTS:pr-view", "pr", "view", branch, "--json", "number,url,headRefOid,state").stdout)
+                    pr = pr_create(store, "AGENTS:pr-create", branch, "Add Relay target instructions", body)
                 finally:
                     body.unlink(missing_ok=True)
             if pr.get("headRefOid") != sha:
@@ -1327,7 +1493,7 @@ def bootstrap_agents(store: StateStore) -> bool:
             return False
         if status == "passed":
             store.update(lambda state: state["agentsBootstrap"].update(phase="merging", providerStatus="passed"))
-            provider_with_retries(store, "AGENTS:merge", "pr", "merge", str(pr["number"]), f"--{store.state['mergeMethod']}", "--delete-branch")
+            pr_merge(store, "AGENTS:merge", pr["number"])
         store.update(lambda state: (state["agentsBootstrap"].update(phase="reconciling", providerStatus="passed"), state["pullRequests"]["AGENTS"].update(state="MERGED")))
         return reconcile_agents_bootstrap(store)
     except (RuntimeError, ValueError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
@@ -1414,7 +1580,7 @@ def execute_campaign(store: StateStore, tasks: list[dict]) -> int:
     if (store.state.get("agentsBootstrap") or {}).get("phase") == "needs-user":
         store.update(lambda state: state.__setitem__("phase", "needs-user"))
         return 2
-    github_preflight(store)
+    provider_preflight(store)
     if not bootstrap_agents(store):
         return 2
     by_id = {task["id"]: task for task in tasks}

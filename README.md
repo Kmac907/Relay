@@ -1,6 +1,6 @@
 # Relay
 
-Relay is a bounded, resumable coordinator that turns requirements into isolated GitHub pull requests. It plans work, dispatches constrained coding agents, validates their commits, reviews candidates, merges approved PRs, and runs one finite post-build audit.
+Relay is a bounded, resumable coordinator that turns requirements into isolated GitHub or Azure DevOps Services pull requests. It plans work, dispatches constrained coding agents, validates their commits, reviews candidates, merges approved PRs, and runs one finite post-build audit.
 
 ```text
 requirements
@@ -12,7 +12,7 @@ plan.py -> PLAN.md + missing AGENTS.md
 run.py -> AGENTS.md bootstrap PR (when needed)
     |
     v
-Workers -> validation -> review/repair -> GitHub PRs -> merge
+Workers -> validation -> review/repair -> provider PRs -> merge
     |
     v
 finite audit -> accepted bug fixes -> complete
@@ -20,18 +20,21 @@ finite audit -> accepted bug fixes -> complete
 status.py observes the active campaign without changing it.
 ```
 
-Relay is four directly executable Python scripts. It uses only Python 3.11's standard library and shells out to `git`, `gh`, and `codex`.
+Relay is four directly executable Python scripts. It uses only Python 3.11's standard library and shells out to `git`, `codex`, and either `gh` or `az`.
 
 ## Prerequisites
 
 - Python 3.11 or newer.
 - Git with an author name and email configured.
-- The GitHub CLI authenticated with `gh auth login`.
+- For GitHub, the GitHub CLI authenticated with `gh auth login`.
+- For Azure DevOps Services, Azure CLI 2.30+ with the `azure-devops` extension and authentication configured through its supported Microsoft Entra or PAT flow. Azure DevOps Server is not supported.
 - Codex available as `codex`.
-- A target repository whose integration branch and GitHub PR base are `main`.
-- An `origin` GitHub remote before running a campaign. `repo.py --github` can create it.
+- A target repository whose integration branch and PR base are `main`.
+- A supported GitHub or Azure Repos `origin` before running a campaign. `repo.py` can create it.
 
-Set `RELAY_GIT`, `RELAY_GH`, or `RELAY_CODEX` only when Relay should invoke those tools through different commands.
+Set `RELAY_GIT`, `RELAY_GH`, `RELAY_AZ`, or `RELAY_CODEX` only when Relay should invoke those tools through different commands. Relay never reads or stores provider credentials.
+
+For Azure, install the official extension with `az extension add --name azure-devops`, then authenticate with `az login` or pipe a PAT to `az devops login --organization https://dev.azure.com/ORGANIZATION`. The Azure CLI owns that credential flow; do not pass credentials to Relay.
 
 ## Quick start
 
@@ -42,6 +45,14 @@ python repo.py `
   --path C:\Code\Projects\Example `
   --github OWNER/Example `
   --private
+```
+
+Or create it in an existing Azure DevOps project (repository visibility is inherited from the project):
+
+```powershell
+python repo.py `
+  --path C:\Code\Projects\Example `
+  --azure-devops ORGANIZATION PROJECT Example
 ```
 
 Write the requirements, then plan and run the campaign:
@@ -69,7 +80,7 @@ For an existing repository, skip `repo.py` and run `plan.py` against its selecte
 
 ### 1. Repository creation
 
-`repo.py` refuses to overwrite a nonempty path. It initializes `main`, creates `README.md` and Relay's generic target `AGENTS.md`, and commits both. With `--github OWNER/NAME` plus exactly one of `--private` or `--public`, it also creates and pushes the GitHub repository.
+`repo.py` refuses to overwrite a nonempty path. It initializes `main`, creates `README.md` and Relay's generic target `AGENTS.md`, and commits both. `--github OWNER/NAME` requires exactly one of `--private` or `--public`. `--azure-devops ORGANIZATION PROJECT REPOSITORY` uses `az repos create`, adds its returned HTTPS clone URL as `origin`, and pushes the initial commit; the project must already exist. Publication failures preserve the local repository. The two provider options are mutually exclusive, and visibility flags are GitHub-only.
 
 ### 2. Planning
 
@@ -98,7 +109,9 @@ Ready tasks run concurrently only when dependencies are satisfied and allowed pa
 
 Relay then pushes the branch, opens or recovers one PR, and runs two independent read-only reviews followed by one triage decision. Accepted blockers enter the same bounded Worker repair loop and receive a focused verification review. Initial blockers, merge conflicts, integration failures, and provider-check repairs share one persisted fix-loop budget.
 
-Approved candidates must retain the reviewed SHA and pass GitHub checks and required approvals before Relay merges them. Completed worktrees and local branches are removed.
+Approved candidates must retain the reviewed SHA and pass the selected provider's required checks and approvals before Relay merges them. For Azure, blocking branch-policy evaluations are authoritative: approved and not-applicable pass, queued and running wait within the persisted deadline, and rejected or broken fail. Conflicts enter the shared repair budget, and Relay never bypasses policies. Azure supports Relay's `squash` and standard no-fast-forward `merge` completion modes; `rebase` is rejected during preflight. Completed worktrees and local branches are removed.
+
+`run.py` detects canonical GitHub and Azure HTTPS/SSH origins, including legacy `visualstudio.com` Azure URLs, then persists the provider identity. Resume uses that identity and the normalized PR number, URL, source SHA, and state; older campaigns containing `githubRepository` continue as GitHub campaigns. Use the same `run.py --repo ...` command after provider action or interruption. Push, PR creation, policy polling, merge, reconciliation, and the no-AI-review `AGENTS.md` bootstrap all resume without intentionally duplicating completed operations.
 
 ### 5. Finite audit
 
