@@ -5,7 +5,7 @@
   repo.py → plan.py → run.py → status.py
 
   Relay creates repositories, converts project requirements into PLAN.md and then tasks.md, always creates bugs.md, executes independent work concurrently through top-level Codex
-  processes, creates GitHub pull requests, performs bounded reviews and repairs, runs a bounded audit, and recovers safely after interruption.
+  processes, creates GitHub or Azure DevOps Services pull requests, performs bounded reviews and repairs, runs a bounded audit, and recovers safely after interruption.
 
   Relay is separate from Brace. Relay is the temporary workflow used to build Brace; Brace remains the eventual full CLI product.
 
@@ -23,7 +23,7 @@
   - Use multiple top-level codex exec processes.
   - Never use Codex subagents.
   - Use isolated Git worktrees.
-  - Push code through GitHub pull requests using gh.
+  - Push code through GitHub pull requests using gh or Azure Repos pull requests using az.
   - Separate semantic agent decisions from mechanical coordinator decisions.
   - Expose every agent role explicitly.
   - Show concise live progress without interleaving raw agent output.
@@ -59,7 +59,7 @@
   - Web interface
   - Third-party Python dependency
   - Runtime dependency on multi-agent-prompt.txt
-  - Provider abstraction before another provider is needed
+  - Provider plugin framework or REST client
 
   # Existing repo.py
 
@@ -588,6 +588,16 @@
 
   It preserves the local repository if GitHub creation fails.
 
+  ## Azure DevOps Services creation
+
+  python C:\Code\Projects\Relay\repo.py `
+    --path C:\Code\Projects\NewProject `
+    --azure-devops organization project new-project
+
+  The Azure project already exists. Relay uses `az repos create`, validates its JSON `remoteUrl`, adds `origin`, and pushes the existing initial `main` commit. Repository visibility is inherited from the project, so `--private` and `--public` remain GitHub-only. `--github` and `--azure-devops` are mutually exclusive. Publication failure preserves the local repository.
+
+  Azure DevOps Services requires Azure CLI 2.30 or newer, the official `azure-devops` extension, and its supported Microsoft Entra or PAT authentication. Relay accepts `RELAY_AZ` as a command override but never reads or stores credentials. Azure DevOps Server is excluded because the extension is cloud-only.
+
   # plan.py
 
   Command:
@@ -703,6 +713,10 @@
     "schemaVersion": 1,
     "campaignId": "20260911-142301",
     "repository": "C:\\Code\\Projects\\Brace",
+    "provider": "azure-devops",
+    "azureOrganization": "organization",
+    "azureProject": "project",
+    "azureRepository": "repository",
     "phase": "build",
     "baseSha": "0123456789abcdef",
     "workerLimit": 3,
@@ -813,27 +827,29 @@
   - Changed paths stay within scope.
   - Required validation passes.
   - PR head matches the reviewed SHA.
-  - Required GitHub checks pass.
+  - Required provider checks pass.
   - Review and repair counters have not exceeded limits.
   - The requested transition is legal from the persisted phase.
   - The review session and all its counters match the original reviewSessionId.
 
-  # GitHub pull requests
+  # Provider pull requests
 
   ## Preflight
 
   Before launching workers:
 
-  git remote get-url origin
-  gh auth status
-  gh repo view
+  git config --get remote.origin.url
+
+  Relay detects GitHub and Azure DevOps Services from canonical HTTPS or SSH origins, including legacy `visualstudio.com` Azure URLs and URL-encoded names. It persists the provider and Azure organization/project/repository identity. A legacy campaign with `githubRepository` and no provider field resumes as GitHub.
+
+  GitHub preflight runs `gh auth status` and `gh repo view`. Azure preflight runs `az devops project show` and `az repos show` with explicit organization, project, and repository arguments. Azure rejects `--merge-method rebase`; `squash` and `merge` remain supported.
 
   Relay stops if:
 
   - origin is missing.
-  - The remote is not GitHub.
-  - gh authentication fails.
-  - The GitHub repository cannot be queried.
+  - The remote is not a supported GitHub or Azure DevOps Services URL.
+  - Provider authentication fails.
+  - The selected repository cannot be queried.
 
   ## Candidate publication
 
@@ -841,7 +857,7 @@
 
   git push --set-upstream origin relay/TASK-0001
 
-  Only run.py creates PRs:
+  Only run.py creates PRs. GitHub uses:
 
   gh pr create `
     --base main `
@@ -849,11 +865,13 @@
     --title "TASK-0001: Preserve review counters" `
     --body-file <generated-pr-body>
 
+  Azure uses `az repos pr list/create/show` with explicit source branch and repository identity. Relay records both providers in one normalized shape: `number`, `url`, `headRefOid`, and `state`. Discovery precedes creation on every recoverable path, and the provider source commit must equal Relay's reviewed SHA.
+
   The PR number and URL are recorded in tasks.md or bugs.md.
 
   ## Checks and merge
 
-  Relay polls GitHub checks without occupying a Codex process.
+  Relay polls provider checks without occupying a Codex process.
 
   A PR merges only when:
 
@@ -861,12 +879,14 @@
   - Local validation passes.
   - Internal bounded review passes.
   - No accepted P0/P1 blocker remains.
-  - Required GitHub checks pass.
+  - Required provider checks pass.
   - The PR is mergeable.
 
   Default:
 
   gh pr merge <number> --squash --delete-branch
+
+  For Azure, `az repos pr policy list` is the authority for blocking builds, status checks, and reviewer approval. Approved and not-applicable evaluations pass; queued and running evaluations wait within the persisted deadline; rejected and broken evaluations fail. Merge conflicts require a counted repair, and Relay never bypasses policies. Completion uses `az repos pr update --status completed`, `--squash true` for squash or `--squash false` for standard no-fast-forward merge, and `--delete-source-branch true`.
 
   Supported merge methods:
 
@@ -1357,7 +1377,8 @@
   ─────────────────────────────────────  ──────────────────────────────────────────────
    Git worktrees                          Parallel execution
   ─────────────────────────────────────  ──────────────────────────────────────────────
-   GitHub PRs through gh                  GitHub pull requests
+   GitHub PRs through gh                  Provider pull requests
+   Azure Repos PRs through az             Provider pull requests
   ─────────────────────────────────────  ──────────────────────────────────────────────
    Finite review loop                     Finite review policy
   ─────────────────────────────────────  ──────────────────────────────────────────────

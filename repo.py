@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Create a new local repository and optionally a private or public GitHub repo."""
+"""Create a local repository and optionally publish it."""
 from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import shlex
@@ -52,7 +53,15 @@ def run(tool: str, *args: str, capture: bool = False, timeout: int = 300) -> sub
     return subprocess.run(_command(tool) + list(args), check=True, capture_output=capture, text=True, encoding="utf-8", errors="replace", timeout=timeout)
 
 
-def create(path: Path, github: str | None = None, visibility: str | None = None, timeout: int = 300) -> tuple[Path, str, str]:
+def create(path: Path, github: str | None = None, visibility: str | None = None, timeout: int = 300, azure_devops: tuple[str, str, str] | None = None) -> tuple[Path, str, str]:
+    if github and azure_devops:
+        raise ValueError("choose either GitHub or Azure DevOps")
+    if visibility and not github:
+        raise ValueError("--private and --public are GitHub-only")
+    if github and visibility not in {"private", "public"}:
+        raise ValueError("GitHub visibility must be explicit")
+    if azure_devops and (len(azure_devops) != 3 or not re.fullmatch(r"[^/\s]+", azure_devops[0]) or any(not value.strip() for value in azure_devops[1:])):
+        raise ValueError("invalid Azure DevOps organization, project, or repository")
     target = path.expanduser().resolve()
     if target.exists() and any(target.iterdir()):
         raise ValueError(f"refusing nonempty path: {target}")
@@ -69,21 +78,29 @@ def create(path: Path, github: str | None = None, visibility: str | None = None,
     sha = run("git", "-C", str(target), "rev-parse", "HEAD", capture=True, timeout=timeout).stdout.strip()
 
     if github:
-        if visibility not in {"private", "public"}:
-            raise ValueError("GitHub visibility must be explicit")
         run("gh", "auth", "status", timeout=timeout)
         run("gh", "repo", "create", github, f"--{visibility}", "--source", str(target), "--remote", "origin", "--push", timeout=timeout)
+    elif azure_devops:
+        organization, project, repository = azure_devops
+        created = run("az", "repos", "create", "--name", repository, "--organization", f"https://dev.azure.com/{organization}", "--project", project, "--output", "json", capture=True, timeout=timeout)
+        data = json.loads(created.stdout)
+        if not isinstance(data, dict) or not isinstance(data.get("remoteUrl"), str) or not data["remoteUrl"]:
+            raise ValueError("az repos create returned no remoteUrl")
+        run("git", "-C", str(target), "remote", "add", "origin", data["remoteUrl"], timeout=timeout)
+        run("git", "-C", str(target), "push", "--set-upstream", "origin", "main", timeout=timeout)
     return target, branch, sha
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description="Create a new local repository and optionally publish it to GitHub.")
+    result = argparse.ArgumentParser(description="Create a new local repository and optionally publish it to GitHub or Azure DevOps Services.")
     result.add_argument("--path", required=True, type=Path)
     def github_name(value: str) -> str:
         if not re.fullmatch(r"[^/\s]+/[^/\s]+", value):
             raise argparse.ArgumentTypeError("must be OWNER/NAME")
         return value
-    result.add_argument("--github", metavar="OWNER/NAME", type=github_name)
+    provider = result.add_mutually_exclusive_group()
+    provider.add_argument("--github", metavar="OWNER/NAME", type=github_name)
+    provider.add_argument("--azure-devops", nargs=3, metavar=("ORGANIZATION", "PROJECT", "REPOSITORY"))
     visibility = result.add_mutually_exclusive_group()
     visibility.add_argument("--private", action="store_const", const="private", dest="visibility")
     visibility.add_argument("--public", action="store_const", const="public", dest="visibility")
@@ -93,11 +110,15 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
-    if bool(args.github) != bool(args.visibility):
+    if args.github and not args.visibility:
         parser().error("--github requires exactly one of --private or --public")
+    if args.visibility and not args.github:
+        parser().error("--private and --public are GitHub-only")
+    if args.azure_devops and (not re.fullmatch(r"[^/\s]+", args.azure_devops[0]) or any(not value.strip() for value in args.azure_devops[1:])):
+        parser().error("invalid Azure DevOps organization, project, or repository")
     try:
-        path, branch, sha = create(args.path, args.github, args.visibility, args.provider_timeout)
-    except (ValueError, OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        path, branch, sha = create(args.path, args.github, args.visibility, args.provider_timeout, tuple(args.azure_devops) if args.azure_devops else None)
+    except (ValueError, OSError, json.JSONDecodeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         raise SystemExit(str(error)) from error
     print(f"Path:   {path}")
     print(f"Branch: {branch}")

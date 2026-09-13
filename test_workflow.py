@@ -127,9 +127,32 @@ class RepositoryTests(unittest.TestCase):
                 repo.create(target, "owner/demo", "private")
             self.assertTrue((target / "README.md").is_file())
 
+    def test_creates_azure_repository_adds_remote_and_pushes(self):
+        with tempfile.TemporaryDirectory() as root, patch("repo.run") as command:
+            created = json.dumps({"remoteUrl": "https://dev.azure.com/org/project/_git/demo"})
+            command.side_effect = [self.completed(), self.completed(), self.completed(), self.completed("main\n"), self.completed("abcdef\n"), self.completed(created), self.completed(), self.completed()]
+            target = Path(root) / "demo"
+            repo.create(target, timeout=10, azure_devops=("org", "project", "demo"))
+            self.assertEqual(command.call_args_list[5].args, ("az", "repos", "create", "--name", "demo", "--organization", "https://dev.azure.com/org", "--project", "project", "--output", "json"))
+            self.assertEqual(command.call_args_list[6].args[-2:], ("origin", "https://dev.azure.com/org/project/_git/demo"))
+            self.assertEqual(command.call_args_list[7].args[-3:], ("--set-upstream", "origin", "main"))
+
+    def test_azure_publish_failure_preserves_local_repository(self):
+        with tempfile.TemporaryDirectory() as root, patch("repo.run") as command:
+            created = json.dumps({"remoteUrl": "https://dev.azure.com/org/project/_git/demo"})
+            command.side_effect = [self.completed(), self.completed(), self.completed(), self.completed("main\n"), self.completed("abcdef\n"), self.completed(created), self.completed(), subprocess.CalledProcessError(1, "git")]
+            target = Path(root) / "demo"
+            with self.assertRaises(subprocess.CalledProcessError):
+                repo.create(target, azure_devops=("org", "project", "demo"))
+            self.assertTrue((target / "README.md").is_file())
+
     def test_visibility_is_required_for_github(self):
         with self.assertRaises(SystemExit):
             repo.parser().parse_args(["--path", "x", "--github", "owner/x", "--private", "--public"])
+        with self.assertRaises(SystemExit):
+            repo.parser().parse_args(["--path", "x", "--github", "owner/x", "--azure-devops", "org", "project", "repo"])
+        with self.assertRaises(SystemExit):
+            repo.main(["--path", "x", "--azure-devops", "org", "project", "repo", "--private"])
 
     def test_refuses_existing_git_repository(self):
         with tempfile.TemporaryDirectory() as root, patch("repo.run") as command:
@@ -269,6 +292,103 @@ class DeterministicCoreTests(unittest.TestCase):
         Path(root, "tasks.md").write_text(plan.render_tasks([ContractTests().task()], "0123456", "abc123", args.task_attempts, args.fix_loops), encoding="utf-8")
         Path(root, "bugs.md").write_text(run.render_bugs("test", Path(root)), encoding="utf-8")
         return run.StateStore(path, state)
+
+    def azure_store(self, root, merge_method="squash"):
+        store = self.state_store(root)
+        store.state.update(provider="azure-devops", azureOrganization="my org", azureProject="My Project", azureRepository="My Repo", mergeMethod=merge_method)
+        return store
+
+    def azure_pr(self, status="active", merge_status="succeeded", sha="abc"):
+        return {"pullRequestId": 7, "status": status, "mergeStatus": merge_status, "lastMergeSourceCommit": {"commitId": sha}}
+
+    def test_detects_supported_provider_remotes_and_decodes_names(self):
+        cases = {
+            "https://github.com/owner/repo.git": ("github", "owner/repo"),
+            "git@github.com:owner/repo.git": ("github", "owner/repo"),
+            "https://dev.azure.com/myorg/My%20Project/_git/My%20Repo": ("azure-devops", "myorg", "My Project", "My Repo"),
+            "git@ssh.dev.azure.com:v3/myorg/My%20Project/My%20Repo": ("azure-devops", "myorg", "My Project", "My Repo"),
+            "https://myorg.visualstudio.com/DefaultCollection/My%20Project/_git/My%20Repo": ("azure-devops", "myorg", "My Project", "My Repo"),
+            "git@vs-ssh.visualstudio.com:v3/myorg/My%20Project/My%20Repo": ("azure-devops", "myorg", "My Project", "My Repo"),
+        }
+        for remote, expected in cases.items():
+            with self.subTest(remote=remote):
+                identity = run.detect_provider(remote)
+                actual = (identity["provider"], identity.get("githubRepository")) if identity["provider"] == "github" else (identity["provider"], identity["azureOrganization"], identity["azureProject"], identity["azureRepository"])
+                self.assertEqual(actual, expected)
+        with self.assertRaises(ValueError):
+            run.detect_provider("https://github.com.evil.invalid/owner/repo")
+        with self.assertRaises(ValueError):
+            run.detect_provider("file://github.com/owner/repo")
+
+    def test_old_github_state_is_inferred_on_resume(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            store.state.update(githubRepository="owner/repo", preflightCompleted=True)
+            with patch("run.git") as git, patch("run.provider_with_retries") as provider:
+                run.provider_preflight(store)
+            self.assertEqual(store.state["provider"], "github")
+            git.assert_not_called()
+            provider.assert_not_called()
+
+    def test_azure_pr_discovery_is_normalized(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.azure_store(root)
+            completed = subprocess.CompletedProcess([], 0, json.dumps([self.azure_pr()]), "")
+            with patch("run.provider_with_retries", return_value=completed) as provider:
+                prs = run.pr_discover(store, "list", "relay/TASK-0001")
+            self.assertEqual(prs, [{"number": 7, "url": "https://dev.azure.com/my%20org/My%20Project/_git/My%20Repo/pullrequest/7", "headRefOid": "abc", "state": "OPEN"}])
+            self.assertIn("--source-branch", provider.call_args.args)
+
+    def test_azure_pr_create_uses_description_and_validates_sha(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.azure_store(root)
+            body = Path(root) / "body.md"; body.write_text("Candidate: abc\n", encoding="utf-8")
+            completed = subprocess.CompletedProcess([], 0, json.dumps(self.azure_pr()), "")
+            with patch("run.provider_with_retries", return_value=completed) as provider:
+                pr = run.pr_create(store, "create", "relay/TASK-0001", "title", body)
+            self.assertEqual(pr["headRefOid"], "abc")
+            self.assertIn("Candidate: abc\n", provider.call_args.args)
+
+    def test_azure_policy_pass_failure_conflict_and_timeout(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.azure_store(root)
+            show = subprocess.CompletedProcess([], 0, json.dumps(self.azure_pr()), "")
+            approved = subprocess.CompletedProcess([], 0, json.dumps([{"configuration": {"isBlocking": True}, "status": "approved"}, {"configuration": {"isBlocking": False}, "status": "rejected"}]), "")
+            with patch("run.run_tool", side_effect=[show, approved]):
+                self.assertEqual(run.wait_for_checks(store, "PASS", {"number": 7}, "abc"), "passed")
+            rejected = subprocess.CompletedProcess([], 0, json.dumps([{"configuration": {"isBlocking": True}, "status": "broken"}]), "")
+            with patch("run.run_tool", side_effect=[show, rejected]):
+                self.assertEqual(run.wait_for_checks(store, "FAIL", {"number": 7}, "abc"), "failed")
+            conflict = subprocess.CompletedProcess([], 0, json.dumps(self.azure_pr(merge_status="conflicts")), "")
+            with patch("run.run_tool", return_value=conflict):
+                self.assertEqual(run.wait_for_checks(store, "CONFLICT", {"number": 7}, "abc"), "repair-required")
+            store.state["providerCheckTimeoutSeconds"] = .01
+            queued = subprocess.CompletedProcess([], 0, json.dumps([{"configuration": {"isBlocking": True}, "status": "queued"}]), "")
+            with patch("run.run_tool", side_effect=lambda *args, **kwargs: queued if "policy" in args else show):
+                self.assertEqual(run.wait_for_checks(store, "TIMEOUT", {"number": 7}, "abc"), "waiting-provider")
+
+    def test_azure_sha_drift_and_merge_modes(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.azure_store(root)
+            drift = subprocess.CompletedProcess([], 0, json.dumps(self.azure_pr(sha="changed")), "")
+            with patch("run.run_tool", return_value=drift):
+                self.assertEqual(run.wait_for_checks(store, "DRIFT", {"number": 7}, "abc"), "sha-drift")
+            with patch("run.provider_with_retries") as provider:
+                run.pr_merge(store, "merge", 7)
+                self.assertIn("true", provider.call_args.args)
+                store.state["mergeMethod"] = "merge"
+                run.pr_merge(store, "merge-2", 7)
+                self.assertIn("false", provider.call_args.args)
+                self.assertIn("--delete-source-branch", provider.call_args.args)
+
+    def test_azure_rebase_is_rejected_during_preflight(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.azure_store(root, "rebase")
+            store.state.pop("provider")
+            remote = subprocess.CompletedProcess([], 0, "https://dev.azure.com/org/project/_git/repo\n", "")
+            with patch("run.git", return_value=remote), patch("run.provider_with_retries") as provider, self.assertRaisesRegex(RuntimeError, "rebase"):
+                run.provider_preflight(store)
+            provider.assert_not_called()
 
     def test_ready_tasks_respect_dependencies_priority_and_paths(self):
         tasks = [ContractTests().task("TASK-0002", ["TASK-0001"]), ContractTests().task("TASK-0001")]
@@ -527,6 +647,29 @@ class DeterministicCoreTests(unittest.TestCase):
 
 
 class FakeEndToEndTests(unittest.TestCase):
+    def test_azure_campaign_bootstrap_pr_task_pr_and_complete(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); target = make_git_repository(root)
+            azure_url = "https://dev.azure.com/org/project/_git/repo"
+            remote = root / "remote.git"
+            subprocess.run(["git", "-C", str(target), "remote", "set-url", "origin", azure_url], check=True)
+            subprocess.run(["git", "-C", str(target), "config", f"url.{remote}.insteadOf", azure_url], check=True)
+            fake_codex, fake_az = root / "fake_codex.py", root / "fake_az.py"
+            fake_codex.write_text(FAKE_CODEX, encoding="utf-8"); fake_az.write_text(FAKE_AZ, encoding="utf-8")
+            provider = root / "provider"; provider.mkdir()
+            requirements = root / "requirements.md"; requirements.write_text("Create one file.", encoding="utf-8")
+            environment = os.environ | {
+                "RELAY_CODEX": f"{sys.executable} {fake_codex}", "RELAY_AZ": f"{sys.executable} {fake_az}",
+                "FAKE_AZ_STATE": str(provider), "FAKE_AZ_REMOTE": str(remote),
+            }
+            subprocess.run([sys.executable, str(Path(plan.__file__)), "--repo", str(target), "--requirements", str(requirements)], capture_output=True, text=True, env=environment, check=True)
+            completed = subprocess.run([sys.executable, str(Path(run.__file__)), "--repo", str(target), "--agent-timeout", "10", "--validation-timeout", "10", "--provider-timeout", "10", "--provider-check-timeout", "10"], capture_output=True, text=True, env=environment, timeout=60)
+            state = json.loads((target / ".relay" / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr + json.dumps(state, indent=2))
+            self.assertEqual((state["provider"], state["azureOrganization"], state["azureProject"], state["azureRepository"]), ("azure-devops", "org", "project", "repo"))
+            self.assertEqual(state["phase"], "complete")
+            self.assertEqual(len(list(provider.glob("*.json"))), 2)
+
     def test_bootstrap_timeout_resumes_without_duplicate_pr_or_task_launch(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root); target = make_git_repository(root)
@@ -753,6 +896,41 @@ if args[:2] == ["pr", "merge"]:
                 subprocess.run(["git", "--git-dir", str(remote), "update-ref", "refs/heads/main", record["headRefOid"]], check=True)
             record["state"] = "MERGED"; path.write_text(json.dumps(record)); raise SystemExit(0)
 raise SystemExit(f"unknown gh args: {args}")
+''')
+
+
+FAKE_AZ = textwrap.dedent(r'''
+import json, os, pathlib, re, subprocess, sys
+args = sys.argv[1:]
+root = pathlib.Path(os.environ["FAKE_AZ_STATE"])
+def file_for(branch): return root / (branch.replace("/", "_") + ".json")
+if args[:3] == ["devops", "project", "show"] or args[:2] == ["repos", "show"]:
+    print("{}"); raise SystemExit(0)
+if args[:3] == ["repos", "pr", "list"]:
+    branch = args[args.index("--source-branch") + 1]; path = file_for(branch)
+    print(json.dumps([json.loads(path.read_text())] if path.exists() else [])); raise SystemExit(0)
+if args[:3] == ["repos", "pr", "create"]:
+    branch = args[args.index("--source-branch") + 1]
+    description = args[args.index("--description") + 1]
+    sha = re.search(r"Candidate: ([0-9a-f]+)", description).group(1)
+    number = int(re.search(r"(\d+)$", branch).group(1))
+    record = {"pullRequestId": number, "status": "active", "mergeStatus": "succeeded", "lastMergeSourceCommit": {"commitId": sha}, "branch": branch}
+    file_for(branch).write_text(json.dumps(record)); print(json.dumps(record)); raise SystemExit(0)
+if args[:3] == ["repos", "pr", "show"]:
+    number = args[args.index("--id") + 1]
+    record = next(json.loads(path.read_text()) for path in root.glob("*.json") if str(json.loads(path.read_text())["pullRequestId"]) == number)
+    print(json.dumps(record)); raise SystemExit(0)
+if args[:4] == ["repos", "pr", "policy", "list"]:
+    print("[]"); raise SystemExit(0)
+if args[:3] == ["repos", "pr", "update"]:
+    number = args[args.index("--id") + 1]
+    for path in root.glob("*.json"):
+        record = json.loads(path.read_text())
+        if str(record["pullRequestId"]) == number:
+            if "agents-bootstrap" in record["branch"]:
+                subprocess.run(["git", "--git-dir", os.environ["FAKE_AZ_REMOTE"], "update-ref", "refs/heads/main", record["lastMergeSourceCommit"]["commitId"]], check=True)
+            record["status"] = "completed"; path.write_text(json.dumps(record)); print(json.dumps(record)); raise SystemExit(0)
+raise SystemExit(f"unknown az args: {args}")
 ''')
 
 
