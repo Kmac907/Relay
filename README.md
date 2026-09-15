@@ -109,11 +109,15 @@ Relay never copies this repository's development `AGENTS.md` into a target. The 
 
 Ready tasks run concurrently only when dependencies are satisfied and allowed paths do not overlap. Each task gets an isolated branch and Git worktree. The Worker is the only write-capable role and must commit a candidate locally. Before publication, Relay verifies ancestry, the reported SHA, changed paths, and every assigned validation command.
 
+Validation commands run explicitly through `pwsh -NoLogo -NoProfile -NonInteractive -Command` on Windows and `/bin/sh -c` on POSIX; set `RELAY_PWSH` to override the PowerShell executable. Relay checks that shell before launching Workers. Each command's shell, exit code, stdout, and stderr is captured in `.relay/logs/<assignment>-validation-<number>.log`; console and state errors contain only the command number, result, and log path. A failed initial validation stays within the task-attempt budget, while repair validation stays within the shared fix-loop and review-call budgets.
+
 Relay then pushes the branch, opens or recovers one PR, and runs two independent read-only reviews followed by one triage decision. Accepted blockers enter the same bounded Worker repair loop and receive a focused verification review. Initial blockers, merge conflicts, integration failures, and provider-check repairs share one persisted fix-loop budget.
 
 Approved candidates must retain the reviewed SHA and pass the selected provider's required checks and approvals before Relay merges them. For Azure, blocking branch-policy evaluations are authoritative: approved and not-applicable pass, queued and running wait within the persisted deadline, and rejected or broken fail. Conflicts enter the shared repair budget, and Relay never bypasses policies. Azure supports Relay's `squash` and standard no-fast-forward `merge` completion modes; `rebase` is rejected during preflight. Completed worktrees and local branches are removed.
 
 `run.py` detects canonical GitHub and Azure HTTPS/SSH origins, including legacy `visualstudio.com` Azure URLs, then persists the provider identity. Azure PR descriptions are passed as a single line for Windows `az.cmd` compatibility; GitHub continues to receive the body file. When `--repo` names a subdirectory of a Git repository, Relay preserves that prefix in bootstrap and Worker worktrees and rejects changes outside it. Resume uses the persisted provider identity and normalized PR number, URL, source SHA, and state; older campaigns containing `githubRepository` continue as GitHub campaigns. Use the same `run.py --repo ...` command after provider action or interruption. Push, PR creation, policy polling, merge, reconciliation, and the no-AI-review `AGENTS.md` bootstrap all resume without intentionally duplicating completed operations. A legacy Azure bootstrap stopped specifically after exhausting `AGENTS:pr-create` is recovered once with separate bounded v2 list/create counters, reusing its existing commit, branch, push, and worktree.
+
+A legacy candidate stranded in `needs-user` by the old implicit Windows shell is revalidated once when its branch and clean worktree still contain only an unpublished, in-scope descendant of the recorded base. Relay reuses that exact commit without another Worker attempt and marks the task with validation shell version 2 before running commands, so failure or interruption cannot trigger another automatic recovery.
 
 ### 5. Finite audit
 
@@ -163,6 +167,6 @@ Run Relay's deterministic test gate with:
 python -m unittest -v test_workflow.py
 ```
 
-Exit codes are `0` for completion, `1` for an operational or validation failure, `2` when user or provider action is required, and `130` when interrupted. A nonzero campaign result emits `STOPPED` on stderr with the persisted phase and coordinator-owned reason; the targeted Azure recovery emits `RECOVER`. Raw provider output remains in `.relay/logs/provider.log`.
+Exit codes are `0` for completion, `1` for an operational or validation failure, `2` when user or provider action is required, and `130` when interrupted. A stopped campaign emits one `STOPPED` event with the assignment count followed by one sorted `BLOCKED` event per unresolved assignment or bootstrap operation. Targeted recoveries emit `RECOVER`. Raw provider and validation output remain in `.relay/logs/`.
 
 Run any script with `--help` for all limits, deadlines, merge methods, and path options. See `PLAN.md` for the full behavioral specification.

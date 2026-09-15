@@ -15,6 +15,8 @@ import repo
 import run
 import status
 
+VALIDATION_ENV = {"RELAY_PWSH": "powershell.exe"} if os.name == "nt" else {}
+
 
 class ContractTests(unittest.TestCase):
     def task(self, task_id="TASK-0001", dependencies=None):
@@ -283,7 +285,7 @@ class PlanningTests(unittest.TestCase):
             requirements.write_text("Add one file.", encoding="utf-8")
             fake = root / "fake_codex.py"
             fake.write_text(FAKE_CODEX, encoding="utf-8")
-            environment = os.environ | {"RELAY_CODEX": f"{sys.executable} {fake}"}
+            environment = os.environ | VALIDATION_ENV | {"RELAY_CODEX": f"{sys.executable} {fake}"}
             planned = subprocess.run([sys.executable, str(Path(plan.__file__)), "--repo", str(target), "--requirements", str(requirements), "--workers", "2"], capture_output=True, text=True, env=environment, check=True)
             plan_path = target / "PLAN.md"
             self.assertTrue(Path(planned.stdout.strip()).samefile(plan_path))
@@ -307,7 +309,7 @@ class PlanningTests(unittest.TestCase):
             requirements = root / "requirements.md"; requirements.write_text("Inspect the repository.", encoding="utf-8")
             fake, events = root / "fake_codex.py", root / "scout"
             fake.write_text(FAKE_CODEX, encoding="utf-8")
-            environment = os.environ | {"RELAY_CODEX": f"{sys.executable} {fake}", "FAKE_SCOUT_EVENTS": str(events), "FAKE_REQUIRE_EVIDENCE": "1"}
+            environment = os.environ | VALIDATION_ENV | {"RELAY_CODEX": f"{sys.executable} {fake}", "FAKE_SCOUT_EVENTS": str(events), "FAKE_REQUIRE_EVIDENCE": "1"}
             before = git_output(target, "status", "--porcelain=v1", "--untracked-files=all")
             completed = subprocess.run([sys.executable, str(Path(plan.__file__)), "--repo", str(target), "--requirements", str(requirements), "--workers", "2"], capture_output=True, text=True, env=environment, check=True)
             starts = [float(path.read_text()) for path in root.glob("scout.*.start")]
@@ -372,6 +374,151 @@ class DeterministicCoreTests(unittest.TestCase):
 
     def azure_pr(self, status="active", merge_status="succeeded", sha="abc"):
         return {"pullRequestId": 7, "status": status, "mergeStatus": merge_status, "lastMergeSourceCommit": {"commitId": sha}}
+
+    def test_validation_uses_explicit_platform_shells(self):
+        command = "$items = @('one', 'two'); $items | ForEach-Object { $_ }"
+        with patch.object(run.os, "name", "nt"), patch("run.tool_command", return_value=[r"C:\Tools\pwsh.exe"]):
+            self.assertEqual(run.validation_command(command), [r"C:\Tools\pwsh.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command])
+        with patch.object(run.os, "name", "posix"):
+            self.assertEqual(run.validation_command(command), ["/bin/sh", "-c", command])
+
+    def test_unlaunchable_validation_shell_fails_preflight(self):
+        with patch("run.validation_command", return_value=["missing-shell"]), patch("run.os.path.isfile", return_value=False), patch("run.shutil.which", return_value=None), patch("run.bounded_run") as launch, self.assertRaisesRegex(RuntimeError, "validation shell is unavailable"):
+            run.require_validation_shell()
+        launch.assert_not_called()
+
+    def test_validation_failure_and_timeout_are_logged_after_counter_is_persisted(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            store.state["taskStates"][assignment["id"]] = {"phase": "candidate-validation"}
+            completed = subprocess.CompletedProcess([], 7, "standard output\n", "standard error\n")
+            def failed(*args, **kwargs):
+                self.assertEqual(store.state["validationCommandsStarted"][assignment["id"]], 1)
+                return completed
+            with patch("run.validation_command", return_value=["explicit-shell", assignment["validationCommands"][0]]), patch("run.bounded_run", side_effect=failed) as command, self.assertRaisesRegex(RuntimeError, r"command 1 exited with code 7; log:"):
+                run.run_validations(store, assignment, Path(root))
+            self.assertNotIn("shell", command.call_args.kwargs)
+            log = Path(root) / ".relay" / "logs" / "TASK-0001-validation-1.log"
+            self.assertIn("standard output\n\n--- stderr ---\nstandard error", log.read_text(encoding="utf-8"))
+
+            timeout = subprocess.TimeoutExpired("validation", 1, output="before timeout\n", stderr="timeout error\n")
+            with patch("run.validation_command", return_value=["explicit-shell", "command"]), patch("run.bounded_run", side_effect=timeout), self.assertRaisesRegex(RuntimeError, r"command 1 timed out after 1800s; log:"):
+                run.run_validations(store, assignment, Path(root))
+            self.assertEqual(store.state["validationCommandsStarted"][assignment["id"]], 2)
+            timeout_log = Path(root) / ".relay" / "logs" / "TASK-0001-validation-2.log"
+            self.assertIn("before timeout\n\n--- stderr ---\ntimeout error", timeout_log.read_text(encoding="utf-8"))
+
+    def test_initial_validation_failure_uses_next_task_attempt_and_keeps_last_error(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            store.state["taskAttemptLimit"] = 2
+            assignment = ContractTests().task()
+            prompts = []
+            def worker(*args, **kwargs):
+                prompts.append(args[5])
+                store.state["attemptCounters"][assignment["id"]] = store.state["attemptCounters"].get(assignment["id"], 0) + 1
+                return {"status": "candidate"}
+            with patch("run.create_worktree", return_value=(Path(root), "branch")), patch("run.invoke_with_replacements", side_effect=worker), patch("run.validate_candidate", side_effect=[RuntimeError("validation command 1 exited with code 1; log: first.log"), RuntimeError("validation command 1 exited with code 2; log: second.log")]):
+                self.assertFalse(run.process_assignment(store, threading.Semaphore(1), assignment, "task"))
+            self.assertEqual(store.state["attemptCounters"][assignment["id"]], 2)
+            self.assertIn("first.log", prompts[1])
+            self.assertEqual(store.state["taskStates"][assignment["id"]]["error"], "validation command 1 exited with code 2; log: second.log")
+
+    def test_repair_validation_failures_consume_shared_fix_budget(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root, fix_loops=2)
+            assignment = ContractTests().task()
+            store.state["taskStates"][assignment["id"]] = {"phase": "initial-review"}
+            store.state["worktrees"][assignment["id"]] = {"baseSha": "base"}
+            store.state["reviewSessions"][assignment["id"]] = {
+                "phase": "repair-1", "acceptedBlockerIds": [], "repairAttemptsStarted": 0,
+                "reviewCallsStarted": 0, "reviewCallLimit": 9,
+            }
+            candidate = {"status": "candidate"}
+            with patch("run.invoke_with_replacements", return_value=candidate) as worker, patch("run.validate_candidate", side_effect=[RuntimeError("first validation"), RuntimeError("last validation")]):
+                self.assertFalse(run.run_review(store, threading.Semaphore(1), assignment, Path(root), "sha"))
+            session = store.state["reviewSessions"][assignment["id"]]
+            self.assertEqual((worker.call_count, session["repairAttemptsStarted"], session["phase"]), (2, 2, "needs-user"))
+            self.assertEqual(store.state["taskStates"][assignment["id"]]["error"], "last validation")
+
+    def test_legacy_candidate_recovery_reuses_head_once_without_worker(self):
+        with tempfile.TemporaryDirectory() as root:
+            campaign = Path(root) / "relay-worktrees" / "test"; campaign.mkdir(parents=True)
+            target = make_git_repository(campaign)
+            temporary_root = patch("run.tempfile.gettempdir", return_value=root); temporary_root.start(); self.addCleanup(temporary_root.stop)
+            base = git_output(target, "rev-parse", "HEAD").strip()
+            source = target / "src" / "candidate.txt"; source.parent.mkdir(); source.write_text("candidate\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", "src/candidate.txt"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "candidate"], check=True, capture_output=True)
+            sha = git_output(target, "rev-parse", "HEAD").strip()
+            store = self.state_store(target)
+            run.exclude_relay_files(target)
+            store.state.update(baseSha=base, phase="needs-user")
+            assignment = ContractTests().task()
+            assignment["validationCommands"] = ["legacy command"]
+            legacy_error = str(subprocess.CalledProcessError(1, "legacy command"))
+            task_state = {"phase": "needs-user", "mode": "task", "pushed": False, "merged": False, "worktree": str(target), "branch": "main", "error": legacy_error}
+            store.state["taskStates"][assignment["id"]] = task_state
+            store.state["worktrees"][assignment["id"]] = {"path": str(target), "root": str(target), "branch": "main", "baseSha": base}
+            store.state["validationCommandsStarted"][assignment["id"]] = 1
+            recovered = run.legacy_candidate(store, assignment)
+            self.assertEqual(recovered[1:], ("main", sha))
+            self.assertTrue(recovered[0].samefile(target))
+            dirty = target / "untracked.txt"; dirty.write_text("dirty\n", encoding="utf-8")
+            self.assertIsNone(run.legacy_candidate(store, assignment))
+            dirty.unlink()
+            task_state["pushed"] = True
+            self.assertIsNone(run.legacy_candidate(store, assignment))
+            task_state["pushed"] = False
+            def review(*args):
+                store.state["reviewSessions"][assignment["id"]] = {"reviewedSha": sha}
+                return True
+            with patch("run.validate_candidate", return_value=sha) as validate, patch("run.invoke_with_replacements") as worker, patch("run.publish_candidate", return_value={"number": 1}), patch("run.run_review", side_effect=review), patch("run.merge_assignment", return_value=True), patch("run.update_task_ledger"), patch("run.cleanup_worktree"), patch("run.stderr_event") as event:
+                self.assertTrue(run.process_assignment(store, threading.Semaphore(1), assignment, "task"))
+            worker.assert_not_called()
+            validate.assert_called_once()
+            event.assert_called_once_with("RECOVER", "assignment=TASK-0001 operation=candidate-validation version=2")
+            self.assertEqual(task_state["validationShellVersion"], 2)
+            task_state.update(phase="needs-user", error=legacy_error)
+            self.assertIsNone(run.legacy_candidate(store, assignment))
+
+    def test_failed_legacy_recovery_is_never_retried(self):
+        with tempfile.TemporaryDirectory() as root:
+            campaign = Path(root) / "relay-worktrees" / "test"; campaign.mkdir(parents=True)
+            target = make_git_repository(campaign)
+            temporary_root = patch("run.tempfile.gettempdir", return_value=root); temporary_root.start(); self.addCleanup(temporary_root.stop)
+            base = git_output(target, "rev-parse", "HEAD").strip()
+            source = target / "src" / "candidate.txt"; source.parent.mkdir(); source.write_text("candidate\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", "src/candidate.txt"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "candidate"], check=True, capture_output=True)
+            store = self.state_store(target)
+            run.exclude_relay_files(target)
+            assignment = ContractTests().task(); assignment["validationCommands"] = ["legacy command"]
+            task_state = {"phase": "needs-user", "mode": "task", "pushed": False, "merged": False, "worktree": str(target), "branch": "main", "error": str(subprocess.CalledProcessError(1, "legacy command"))}
+            store.state["taskStates"][assignment["id"]] = task_state
+            store.state["worktrees"][assignment["id"]] = {"path": str(target), "root": str(target), "branch": "main", "baseSha": base}
+            store.state["validationCommandsStarted"][assignment["id"]] = 1
+            with patch("run.validate_candidate", side_effect=RuntimeError("validation command 1 exited with code 1; log: new.log")), patch("run.invoke_with_replacements") as worker:
+                self.assertFalse(run.process_assignment(store, threading.Semaphore(1), assignment, "task"))
+            worker.assert_not_called()
+            self.assertEqual((task_state["phase"], task_state["validationShellVersion"], task_state["error"]), ("needs-user", 2, "validation command 1 exited with code 1; log: new.log"))
+            self.assertIsNone(run.legacy_candidate(store, assignment))
+
+    def test_multiple_legacy_recoveries_use_normal_parallel_scheduler(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignments = [ContractTests().task("TASK-0001"), ContractTests().task("TASK-0002")]
+            assignments[1]["allowedPaths"] = ["other"]
+            for assignment in assignments:
+                store.state["taskStates"][assignment["id"]] = {"phase": "needs-user"}
+            barrier, seen = threading.Barrier(2), []
+            def process(store, semaphore, assignment, mode):
+                seen.append(assignment["id"])
+                barrier.wait(timeout=2)
+            with patch("run.legacy_candidate", return_value=(Path(root), "branch", "sha")), patch("run.process_assignment", side_effect=process):
+                run.run_assignments(store, threading.Semaphore(2), assignments, "task")
+            self.assertEqual(sorted(seen), ["TASK-0001", "TASK-0002"])
 
     def test_detects_supported_provider_remotes_and_decodes_names(self):
         cases = {
@@ -449,21 +596,24 @@ class DeterministicCoreTests(unittest.TestCase):
             store.state["agentsBootstrap"].update(providerStatus="Azure DevOps operation exhausted attempts: AGENTS:pr-create", pushedSha="different")
             self.assertFalse(run.recover_legacy_agents_pr(store))
 
-    def test_stopped_reason_prefers_campaign_then_bootstrap_then_task(self):
+    def test_stopped_reports_every_blocked_assignment(self):
         state = {
             "phase": "needs-user", "error": "campaign\nfailed",
             "agentsBootstrap": {"phase": "needs-user", "providerStatus": "bootstrap failed"},
-            "taskStates": {"TASK-0001": {"phase": "needs-user", "error": "task failed"}},
+            "taskStates": {
+                "TASK-0002": {"phase": "waiting-provider", "providerStatus": "checks pending"},
+                "TASK-0001": {"phase": "needs-user", "error": "task\nfailed"},
+            },
         }
         with patch("run.stderr_event") as event:
             run.report_stopped(state)
-            event.assert_called_with("STOPPED", "phase=needs-user reason=campaign failed")
-            state.pop("error")
-            run.report_stopped(state)
-            event.assert_called_with("STOPPED", "phase=needs-user reason=AGENTS: bootstrap failed")
-            state["agentsBootstrap"]["phase"] = "complete"
-            run.report_stopped(state)
-            event.assert_called_with("STOPPED", "phase=needs-user reason=TASK-0001: task failed")
+        self.assertEqual(event.call_args_list, [
+            unittest.mock.call("STOPPED", "phase=needs-user assignments=4"),
+            unittest.mock.call("BLOCKED", "assignment=AGENTS reason=bootstrap failed"),
+            unittest.mock.call("BLOCKED", "assignment=CAMPAIGN reason=campaign failed"),
+            unittest.mock.call("BLOCKED", "assignment=TASK-0001 reason=task failed"),
+            unittest.mock.call("BLOCKED", "assignment=TASK-0002 reason=checks pending"),
+        ])
 
     def test_azure_policy_pass_failure_conflict_and_timeout(self):
         with tempfile.TemporaryDirectory() as root:
@@ -808,7 +958,7 @@ class FakeEndToEndTests(unittest.TestCase):
             fake_codex.write_text(FAKE_CODEX, encoding="utf-8"); fake_gh.write_text(FAKE_GH, encoding="utf-8")
             provider = root / "provider"; provider.mkdir()
             requirements = root / "requirements.md"; requirements.write_text("Create one file.", encoding="utf-8")
-            environment = os.environ | {"RELAY_CODEX": f"{sys.executable} {fake_codex}", "RELAY_GH": f"{sys.executable} {fake_gh}", "RELAY_ALLOW_FAKE_PROVIDER": "1", "FAKE_GH_STATE": str(provider)}
+            environment = os.environ | VALIDATION_ENV | {"RELAY_CODEX": f"{sys.executable} {fake_codex}", "RELAY_GH": f"{sys.executable} {fake_gh}", "RELAY_ALLOW_FAKE_PROVIDER": "1", "FAKE_GH_STATE": str(provider)}
             subprocess.run([sys.executable, str(Path(plan.__file__)), "--repo", str(module), "--requirements", str(requirements)], capture_output=True, text=True, env=environment, check=True)
             completed = subprocess.run([sys.executable, str(Path(run.__file__)), "--repo", str(module), "--agent-timeout", "10", "--validation-timeout", "10", "--provider-timeout", "10", "--provider-check-timeout", "10"], capture_output=True, text=True, env=environment, timeout=60)
             state = json.loads((module / ".relay" / "state.json").read_text(encoding="utf-8"))
@@ -835,7 +985,7 @@ class FakeEndToEndTests(unittest.TestCase):
             fake_codex.write_text(FAKE_CODEX, encoding="utf-8"); fake_az.write_text(FAKE_AZ, encoding="utf-8")
             provider = root / "provider"; provider.mkdir()
             requirements = root / "requirements.md"; requirements.write_text("Create one file.", encoding="utf-8")
-            environment = os.environ | {
+            environment = os.environ | VALIDATION_ENV | {
                 "RELAY_CODEX": f"{sys.executable} {fake_codex}", "RELAY_AZ": f"{sys.executable} {fake_az}",
                 "FAKE_AZ_STATE": str(provider), "FAKE_AZ_REMOTE": str(remote),
             }
@@ -854,7 +1004,7 @@ class FakeEndToEndTests(unittest.TestCase):
             fake_codex.write_text(FAKE_CODEX, encoding="utf-8"); fake_gh.write_text(FAKE_GH, encoding="utf-8")
             provider = root / "provider"; provider.mkdir()
             requirements = root / "requirements.md"; requirements.write_text("Create one file.", encoding="utf-8")
-            environment = os.environ | {"RELAY_CODEX": f"{sys.executable} {fake_codex}", "RELAY_GH": f"{sys.executable} {fake_gh}", "RELAY_ALLOW_FAKE_PROVIDER": "1", "FAKE_GH_STATE": str(provider), "FAKE_BOOTSTRAP_PENDING": "1"}
+            environment = os.environ | VALIDATION_ENV | {"RELAY_CODEX": f"{sys.executable} {fake_codex}", "RELAY_GH": f"{sys.executable} {fake_gh}", "RELAY_ALLOW_FAKE_PROVIDER": "1", "FAKE_GH_STATE": str(provider), "FAKE_BOOTSTRAP_PENDING": "1"}
             subprocess.run([sys.executable, str(Path(plan.__file__)), "--repo", str(target), "--requirements", str(requirements)], capture_output=True, text=True, env=environment, check=True)
             command = [sys.executable, str(Path(run.__file__)), "--repo", str(target), "--agent-timeout", "10", "--validation-timeout", "10", "--provider-timeout", "10", "--provider-check-timeout", "1"]
             first = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=30)
@@ -876,7 +1026,7 @@ class FakeEndToEndTests(unittest.TestCase):
             fake_codex.write_text(FAKE_CODEX, encoding="utf-8"); fake_az.write_text(FAKE_AZ, encoding="utf-8")
             provider = root / "provider"; provider.mkdir()
             requirements = root / "requirements.md"; requirements.write_text("Create one file.", encoding="utf-8")
-            environment = os.environ | {
+            environment = os.environ | VALIDATION_ENV | {
                 "RELAY_CODEX": f"{sys.executable} {fake_codex}", "RELAY_AZ": f"{sys.executable} {fake_az}",
                 "FAKE_AZ_STATE": str(provider), "FAKE_AZ_REMOTE": str(remote), "FAKE_AZ_FAIL_CREATE_ATTEMPTS": "3",
             }
@@ -891,7 +1041,7 @@ class FakeEndToEndTests(unittest.TestCase):
             self.assertEqual(state["providerAttemptCounters"]["AGENTS:pr-create"], 3)
             self.assertEqual(state["taskStates"], {})
             self.assertIn("STOPPED", first.stderr)
-            self.assertIn("phase=needs-user reason=AGENTS: Azure DevOps operation exhausted attempts: AGENTS:pr-create", first.stderr)
+            self.assertIn("assignment=AGENTS reason=Azure DevOps operation exhausted attempts: AGENTS:pr-create", first.stderr)
             self.assertNotIn("simulated legacy create failure", first.stderr)
             self.assertIn("simulated legacy create failure", (target / ".relay" / "logs" / "provider.log").read_text(encoding="utf-8"))
 
@@ -918,7 +1068,7 @@ class FakeEndToEndTests(unittest.TestCase):
             fake_codex.write_text(FAKE_CODEX, encoding="utf-8"); fake_az.write_text(FAKE_AZ, encoding="utf-8")
             provider = root / "provider"; provider.mkdir()
             requirements = root / "requirements.md"; requirements.write_text("Create one file.", encoding="utf-8")
-            environment = os.environ | {
+            environment = os.environ | VALIDATION_ENV | {
                 "RELAY_CODEX": f"{sys.executable} {fake_codex}", "RELAY_AZ": f"{sys.executable} {fake_az}",
                 "FAKE_AZ_STATE": str(provider), "FAKE_AZ_REMOTE": str(remote), "FAKE_AZ_FAIL_CREATE_ATTEMPTS": "6",
             }
@@ -935,7 +1085,7 @@ class FakeEndToEndTests(unittest.TestCase):
             self.assertEqual(state["taskStates"], {})
             self.assertEqual(second.stderr.count("RECOVER"), 1)
             self.assertNotIn("RECOVER", third.stderr)
-            self.assertIn("phase=needs-user reason=AGENTS: Azure DevOps operation exhausted attempts: AGENTS:pr-create-v2", third.stderr)
+            self.assertIn("assignment=AGENTS reason=Azure DevOps operation exhausted attempts: AGENTS:pr-create-v2", third.stderr)
 
     def test_parallel_workers_reviews_prs_merge_one_audit_and_complete(self):
         with tempfile.TemporaryDirectory() as root:
@@ -947,7 +1097,7 @@ class FakeEndToEndTests(unittest.TestCase):
             events, provider = root / "events.log", root / "provider"
             provider.mkdir()
             requirements = root / "requirements.md"; requirements.write_text("Create two independent files.", encoding="utf-8")
-            environment = os.environ | {
+            environment = os.environ | VALIDATION_ENV | {
                 "RELAY_CODEX": f"{sys.executable} {fake_codex}", "RELAY_GH": f"{sys.executable} {fake_gh}",
                 "RELAY_ALLOW_FAKE_PROVIDER": "1", "FAKE_EVENTS": str(events), "FAKE_GH_STATE": str(provider), "FAKE_AUDIT_SCOPE": "1", "FAKE_TWO_TASKS": "1", "FAKE_REQUIRE_TARGET_INSTRUCTIONS": "1",
             }
@@ -988,7 +1138,7 @@ class FakeEndToEndTests(unittest.TestCase):
             fake_codex.write_text(FAKE_CODEX, encoding="utf-8"); fake_gh.write_text(FAKE_GH, encoding="utf-8")
             provider = root / "provider"; provider.mkdir()
             requirements = root / "requirements.md"; requirements.write_text("Create one file and audit it.", encoding="utf-8")
-            environment = os.environ | {
+            environment = os.environ | VALIDATION_ENV | {
                 "RELAY_CODEX": f"{sys.executable} {fake_codex}", "RELAY_GH": f"{sys.executable} {fake_gh}",
                 "RELAY_ALLOW_FAKE_PROVIDER": "1", "FAKE_GH_STATE": str(provider), "FAKE_AUDIT_SCOPE": "1", "FAKE_AUDIT_BUG": "1",
             }
@@ -1013,7 +1163,7 @@ class FakeEndToEndTests(unittest.TestCase):
             task["allowedPaths"] = ["file.txt"]
             task["validationCommands"] = [f'{sys.executable} -c "from pathlib import Path; assert Path(\'file.txt\').is_file()"']
             text = plan.render_tasks([task], git_output(target, "rev-parse", "HEAD").strip(), "abc123")
-            environment = os.environ | {"RELAY_CODEX": f"{sys.executable} {fake_codex}", "RELAY_GH": f"{sys.executable} {fake_gh}", "RELAY_ALLOW_FAKE_PROVIDER": "1", "FAKE_GH_STATE": str(provider), "FAKE_ADVERSARIAL": "1"}
+            environment = os.environ | VALIDATION_ENV | {"RELAY_CODEX": f"{sys.executable} {fake_codex}", "RELAY_GH": f"{sys.executable} {fake_gh}", "RELAY_ALLOW_FAKE_PROVIDER": "1", "FAKE_GH_STATE": str(provider), "FAKE_ADVERSARIAL": "1"}
             completed = subprocess.run([sys.executable, str(Path(run.__file__)), "--repo", str(target), "--workers", "2", "--fix-loops", "2", "--agent-timeout", "10", "--validation-timeout", "10", "--provider-timeout", "10", "--provider-check-timeout", "1"], input=text, capture_output=True, text=True, env=environment, timeout=60)
             self.assertEqual(completed.returncode, 2, completed.stdout + completed.stderr)
             state = json.loads((target / ".relay" / "state.json").read_text(encoding="utf-8"))
