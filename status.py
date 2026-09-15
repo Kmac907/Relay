@@ -34,7 +34,8 @@ def main(argv: list[str] | None = None) -> int:
     _, ledger_bugs = parse_bugs((repo / "bugs.md").read_text(encoding="utf-8"))
     now = datetime.now().timestamp()
     task_states = state.get("taskStates", {})
-    integrated = {key for key, value in task_states.items() if value.get("phase") == "integrated"}
+    task_ids = {task["id"] for task in tasks}
+    integrated = {key for key, value in task_states.items() if key in task_ids and value.get("phase") == "integrated"}
     print(f"Overall: {len(integrated)}/{len(tasks)} integrated")
 
     operations = []
@@ -92,7 +93,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nAGENTS.md bootstrap\n  Phase: {bootstrap['phase']}\n  PR: {pr.get('url', pr.get('number', 'not-created'))}\n  Checks: {bootstrap.get('providerStatus', 'pending')}")
     ready = sum(task["status"] != "satisfied" and set(task["dependencies"]) <= integrated and task["id"] not in integrated and state.get("taskStates", {}).get(task["id"], {}).get("phase") not in {"needs-user", "waiting-provider"} for task in tasks)
     print(f"\nTasks\n  Total: {len(tasks)}\n  Ready: {ready}")
-    phases = Counter(value.get("phase", "unknown") for value in task_states.values())
+    phases = Counter(value.get("phase", "unknown") for key, value in task_states.items() if key in task_ids)
     for phase, count in sorted(phases.items()): print(f"  {phase}: {count}")
     if state.get("attemptCounters") or state.get("providerDeadlines"):
         print("\nBudgets and deadlines")

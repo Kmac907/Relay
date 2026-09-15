@@ -858,6 +858,18 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertIn("External/provider waits", shown)
             self.assertIn("TASK-0001: PR #25 status=pending", shown)
 
+    def test_status_does_not_count_integrated_audit_bugs_as_tasks(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            store.state["taskStates"].update({"TASK-0001": {"phase": "integrated"}, "BUG-0001": {"phase": "integrated"}})
+            store.save()
+            output = io.StringIO()
+            with patch("sys.stdout", output):
+                self.assertEqual(status.main(["--repo", root]), 0)
+            shown = output.getvalue()
+            self.assertTrue(shown.startswith("Overall: 1/1 integrated"))
+            self.assertIn("\n  integrated: 1\n", shown)
+
     def test_live_and_snapshot_status_name_approval_bypass_and_policy_wait(self):
         state = {
             "workerLimit": 2, "taskTotal": 2, "activeProcesses": {},
