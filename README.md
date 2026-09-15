@@ -132,7 +132,7 @@ The campaign becomes `complete` when no active audit bugs remain. A blocker need
 | Path | Owner | Lifetime |
 | --- | --- | --- |
 | `AGENTS.md` | Target | Preserved permanently; generated only when missing |
-| `PLAN.md` | User | Planning handoff preserved permanently |
+| Relay task plan files | Planner | Removed by confirmed cleanup |
 | `tasks.md` | Coordinator | Active task ledger; removed only by confirmed cleanup |
 | `bugs.md` | Coordinator | Audit/review evidence ledger; removed only by confirmed cleanup |
 | `.relay/state.json` | Coordinator | Resume authority, counters, phases, PRs, worktrees, and deadlines |
@@ -161,7 +161,7 @@ python run.py --repo C:\Code\Projects\Example --cleanup
 python run.py --repo C:\Code\Projects\Example --cleanup --confirm
 ```
 
-Cleanup is allowed only for a complete, inactive campaign with no worktrees or open Relay PRs. It removes `tasks.md`, `bugs.md`, and `.relay`; it preserves `PLAN.md`, `AGENTS.md`, source, and Git history.
+Cleanup is allowed only for a complete, inactive campaign with no worktrees or open Relay PRs. It removes `tasks.md`, `bugs.md`, Relay-format plan files in the repository root, and `.relay`; it preserves human-authored plans, `AGENTS.md`, source, and Git history.
 
 Run Relay's deterministic test gate with:
 

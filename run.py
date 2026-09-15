@@ -2327,13 +2327,24 @@ def permanent_cleanup(repo: Path, confirm: bool) -> int:
     bug_marker = f"<!-- relay: campaign={state['campaignId']} repository={hashlib.sha256(str(root).encode()).hexdigest()[:12]} -->"
     if not bugs.is_file() or bug_marker not in bugs.read_text(encoding="utf-8"):
         raise RuntimeError("bugs.md ownership mismatch")
-    targets = [safe_within(item, root) for item in (tasks, bugs, relay)]
+    plans = []
+    for item in root.iterdir():
+        if "plan" not in item.name.lower() or not item.is_file():
+            continue
+        try:
+            parse_tasks(item.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError):
+            continue
+        plans.append(item)
+    targets = [safe_within(item, root) for item in (tasks, bugs, *sorted(plans), relay)]
     for target in targets:
         print(f"{'REMOVE' if confirm else 'WOULD REMOVE'} {target}")
     if not confirm:
         return 0
     tasks.unlink()
     bugs.unlink()
+    for plan in plans:
+        plan.unlink()
     shutil.rmtree(relay)
     prefix = state.get("repositoryPrefix", "")
     found = git(root, "rev-parse", "--git-path", "info/exclude", check=False)
