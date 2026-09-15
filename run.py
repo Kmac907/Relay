@@ -1106,9 +1106,11 @@ def publish_candidate(store: StateStore, assignment: dict, worktree: Path, branc
     atomic_write(body, f"Relay assignment {assignment_id}\n\nCandidate: {sha}\n")
     try:
         matches = pr_discover(store, f"{assignment_id}:pr-list", branch)
-        if matches:
-            pr = matches[0]
-        else:
+        matching = [pr for pr in matches if pr["headRefOid"] == sha]
+        pr = next((pr for pr in matching if pr["state"] == "OPEN"), matching[0] if matching else None)
+        if pr is None and any(pr["state"] == "OPEN" for pr in matches):
+            raise RuntimeError("provider pull request source commit does not match candidate")
+        if pr is None:
             pr = pr_create(store, f"{assignment_id}:pr-create", branch, f"{assignment_id}: {assignment['title']}", body)
         if pr["headRefOid"] != sha:
             raise RuntimeError("provider pull request source commit does not match candidate")

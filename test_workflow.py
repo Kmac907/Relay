@@ -937,6 +937,27 @@ class DeterministicCoreTests(unittest.TestCase):
                 self.assertTrue(run.merge_assignment(store, __import__("threading").Semaphore(1), assignment, Path(root), "branch", pr, "sha"))
                 merge.assert_not_called()
 
+    def test_publish_ignores_historical_pr_for_reused_branch(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            store.state["taskStates"][assignment["id"]] = {"pushedSha": "new", "phase": "approved"}
+            old = {"number": 1, "state": "MERGED", "url": "old", "headRefOid": "old"}
+            new = {"number": 2, "state": "OPEN", "url": "new", "headRefOid": "new"}
+            with patch("run.pr_discover", return_value=[old]), patch("run.pr_create", return_value=new) as create:
+                self.assertEqual(run.publish_candidate(store, assignment, Path(root), "relay/TASK-0001", "new"), new)
+            create.assert_called_once()
+
+    def test_publish_rejects_open_pr_for_different_sha(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            store.state["taskStates"][assignment["id"]] = {"pushedSha": "new", "phase": "approved"}
+            stale = {"number": 1, "state": "OPEN", "url": "stale", "headRefOid": "old"}
+            with patch("run.pr_discover", return_value=[stale]), patch("run.pr_create") as create, self.assertRaisesRegex(RuntimeError, "source commit"):
+                run.publish_candidate(store, assignment, Path(root), "relay/TASK-0001", "new")
+            create.assert_not_called()
+
     def test_agent_and_provider_timeouts_consume_prelaunch_counters(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
