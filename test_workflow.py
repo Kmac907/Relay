@@ -96,11 +96,12 @@ class ContractTests(unittest.TestCase):
 
     def test_bug_ledger_round_trip(self):
         with tempfile.TemporaryDirectory() as root:
-            bug = {"id": "BUG-0001", "title": "Broken", "severity": "P1", "status": "active", "source": "audit", "location": "x.py:1", "failure": "fails", "reproduction": "python x.py", "requirement": "works", "evidence": "exit 1"}
+            bug = {"id": "BUG-0001", "title": "Broken", "severity": "P1", "status": "active", "source": "audit", "sourceFindingId": "AUDIT-F1", "location": "x.py:1", "failure": "fails", "reproduction": "python x.py", "requirement": "works", "evidence": "exit 1"}
             text = run.render_bugs("campaign", Path(root), [bug])
             metadata, bugs = run.parse_bugs(text)
             self.assertEqual(metadata["campaignId"], "campaign")
             self.assertEqual(bugs[0]["reproduction"], "python x.py")
+            self.assertEqual(bugs[0]["sourceFindingId"], "AUDIT-F1")
 
     def test_finding_line_ranges_are_not_part_of_allowed_path(self):
         with tempfile.TemporaryDirectory() as root:
@@ -720,6 +721,27 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(actions[0]["action"], "resume-review")
             self.assertEqual(store.state["reviewSessions"][assignment["id"]]["phase"], "repair-1")
             self.assertEqual(store.state["reviewSessions"][assignment["id"]]["repairAttemptsStarted"], 0)
+
+    def test_recovery_resumes_audit_bug_with_scope_commands_without_worker_attempt(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            command = "python -m unittest"
+            finding = {"id": "AUDIT-F1"}
+            bug = {"id": "BUG-0001", "title": "Broken", "severity": "P1", "status": "active", "source": "audit", "sourceFindingId": finding["id"], "location": "src/run.ps1:1", "failure": "fails", "reproduction": "Run the failing scenario.", "requirement": "works", "evidence": "failure", "allowedPaths": ["src/run.ps1"]}
+            Path(root, "bugs.md").write_text(run.render_bugs("test", Path(root), [bug]), encoding="utf-8")
+            store.state.update(phase="needs-user", auditScopes={"AUDIT-0001": {"commands": [command], "findings": [finding]}})
+            store.state["taskStates"][bug["id"]] = {"phase": "needs-user", "error": "validation command 1 exited with code 1; log: failed.log"}
+            record = {"branch": "relay/BUG-0001", "baseSha": "base"}
+            def recovery_git(repo_path, *args, **kwargs):
+                return subprocess.CompletedProcess([], 0, "head\n" if args[0] == "rev-parse" else "", "")
+            with patch("run.recovery_worktree", return_value=(Path(root), record)), patch("run.git", side_effect=recovery_git), patch("run.target_changes", return_value=["src/run.ps1"]):
+                actions = run.plan_recovery(store, [assignment], [], [])
+                run.apply_recovery(store, [assignment], actions)
+            self.assertEqual(actions, [{"action": "resume-audit-validation", "assignmentId": bug["id"], "headSha": "head", "commands": [command]}])
+            self.assertEqual(store.state["attemptCounters"].get(bug["id"], 0), 0)
+            self.assertEqual(store.state["auditBugValidationCommands"][bug["id"]], [command])
+            self.assertEqual(store.state["taskStates"][bug["id"]]["pendingWorkerSha"], "head")
 
     def test_recovery_adopts_only_matching_user_owned_deletions(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1600,9 +1622,9 @@ elif "Role: verification-reviewer" in prompt:
     result = {"assignmentId": assignment, "candidateSha": candidate, "status": "unresolved" if os.environ.get("FAKE_ADVERSARIAL") else "resolved"}
 elif "Role: audit-planner" in prompt:
     paths = ["audit_fix.txt"] if os.environ.get("FAKE_AUDIT_BUG") else ["README.md"]
-    result = {"scopes": [{"scopeId": "AUDIT-0001", "scope": "fixture", "requirements": ["fixture"], "paths": paths, "commands": [], "completionCondition": "scope inspected"}]} if os.environ.get("FAKE_AUDIT_SCOPE") else {"scopes": []}
+    result = {"scopes": [{"scopeId": "AUDIT-0001", "scope": "fixture", "requirements": ["fixture"], "paths": paths, "commands": ["python -c \"from pathlib import Path; assert Path('audit_fix.txt').is_file()\""] if os.environ.get("FAKE_AUDIT_BUG") else ["python -c \"print('audited')\""], "completionCondition": "scope inspected"}]} if os.environ.get("FAKE_AUDIT_SCOPE") else {"scopes": []}
 elif "Role: audit-worker" in prompt:
-    findings = [{"id": "audit-bug", "severity": "P1", "location": "audit_fix.txt:1", "failure": "audit fix is missing", "reproduction": "python -c \"from pathlib import Path; assert Path('audit_fix.txt').is_file()\"", "requirement": "audit fix exists", "evidence": "file absent", "candidateIntroduced": False}] if os.environ.get("FAKE_AUDIT_BUG") else []
+    findings = [{"id": "audit-bug", "severity": "P1", "location": "audit_fix.txt:1", "failure": "audit fix is missing", "reproduction": "Observe that audit_fix.txt is absent.", "requirement": "audit fix exists", "evidence": "file absent", "candidateIntroduced": False}] if os.environ.get("FAKE_AUDIT_BUG") else []
     result = {"scopeId": assignment, "findings": findings}
 else:
     raise SystemExit("unknown prompt")

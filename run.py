@@ -51,8 +51,8 @@ ROLE_PROMPTS = {
     "risk-reviewer": "Independently check only candidate correctness, regression, security/data-loss, changed error paths, and missing candidate tests. Finding severity must be exactly P0, P1, P2, or P3. Do not block on work explicitly owned by a later task.",
     "triage-pm": "Decide each supplied finding once: accept-blocker, backlog, discard, or needs-user. Unsupported, pre-existing, deferred, and out-of-scope findings cannot enter repair.",
     "verification-reviewer": "Verify only the accepted blocker and exact repair delta. Return resolved, unresolved, or invalid-result; do not reopen full review.",
-    "audit-planner": "Define one finite list of explicit audit scopes. Every scopeId must be AUDIT-NNNN, starting at AUDIT-0001. Never request an unrestricted search or another audit.",
-    "audit-worker": "Inspect only the assigned finite scope, read-only, and return evidence-backed findings with severity exactly P0, P1, P2, or P3. Do not create more work.",
+    "audit-planner": "Define one finite list of explicit audit scopes with nonempty executable validation commands. Every scopeId must be AUDIT-NNNN, starting at AUDIT-0001. Never request an unrestricted search or another audit.",
+    "audit-worker": "Inspect only the assigned finite scope, read-only, and return evidence-backed findings with severity exactly P0, P1, P2, or P3. Reproduction is human-readable evidence; Relay uses the audit scope commands for execution. Do not create more work.",
 }
 
 
@@ -336,6 +336,7 @@ def initial_state(repo: Path, metadata: dict, args: argparse.Namespace) -> dict:
         "providerAttemptLimit": args.provider_attempts, "mergeMethod": args.merge_method,
         "createdAt": datetime.now(timezone.utc).isoformat(), "heartbeat": datetime.now(timezone.utc).isoformat(),
         "activeProcesses": {}, "worktrees": {}, "candidateShas": {}, "attemptCounters": {}, "validationCommandsStarted": {}, "taskStates": {},
+        "auditBugValidationCommands": {},
         "reviewSessions": {}, "pullRequests": {}, "providerAttemptCounters": {}, "providerOperationsStarted": 0, "providerDeadlines": {},
         "auditPlanStarted": False, "auditPlanCompleted": False, "auditCallsStarted": 0,
         "auditCallLimit": 0, "auditScopes": {}, "pendingLedgerOperation": None,
@@ -593,7 +594,7 @@ def parse_bugs(text: str) -> tuple[dict, list[dict]]:
         bugs.append({
             "id": heading.group(1), "title": heading.group(2), "severity": values["Severity"], "status": values["Status"],
             "source": values["Source"], "location": values["Location"], "failure": values["Observable failure"],
-            "sourceFindingId": _field(block, "Source finding") if "- Source finding:" in block else heading.group(1),
+            "sourceFindingId": _field(block, "Source finding") if any(line.startswith("- Source finding:") for line in block) else heading.group(1),
             "allowedPaths": [finding_path(item) for item in _sublist(block, "Allowed paths")] if "- Allowed paths:" in block else [finding_path(values["Location"])],
             "reproduction": reproduction[1:-1] if reproduction.startswith("`") and reproduction.endswith("`") else reproduction,
             "requirement": values["Requirement"], "evidence": values["Evidence"], "branch": values["Branch"],
@@ -1649,7 +1650,7 @@ def validate_audit_scopes(value: dict) -> list[dict]:
     ids = []
     for scope in scopes:
         required = {"scopeId", "scope", "requirements", "paths", "commands", "completionCondition"}
-        if not isinstance(scope, dict) or required - scope.keys() or not re.fullmatch(r"AUDIT-\d{4}", scope.get("scopeId", "")) or not all(isinstance(scope[key], list) and all(isinstance(item, str) for item in scope[key]) for key in ("requirements", "paths", "commands")) or not isinstance(scope["scope"], str) or not isinstance(scope["completionCondition"], str) or any(not valid_relative_path(path) for path in scope["paths"]):
+        if not isinstance(scope, dict) or required - scope.keys() or not re.fullmatch(r"AUDIT-\d{4}", scope.get("scopeId", "")) or not all(isinstance(scope[key], list) and all(isinstance(item, str) for item in scope[key]) for key in ("requirements", "paths", "commands")) or not scope["commands"] or any(not command.strip() for command in scope["commands"]) or not isinstance(scope["scope"], str) or not isinstance(scope["completionCondition"], str) or any(not valid_relative_path(path) for path in scope["paths"]):
             raise ValueError("invalid audit scope")
         ids.append(scope["scopeId"])
     if len(ids) != len(set(ids)):
@@ -1707,6 +1708,7 @@ def run_audit(store: StateStore, semaphore: threading.Semaphore, tasks: list[dic
             return []
         actions = {item["findingId"]: item["action"] for item in triage["decisions"]}
         accepted = []
+        validation_commands = {}
         bugs = load_bugs(store)
         known = {(bug["source"], bug["sourceFindingId"]): bug for bug in bugs}
         for finding in findings:
@@ -1723,7 +1725,10 @@ def run_audit(store: StateStore, semaphore: threading.Semaphore, tasks: list[dic
                     bugs.append(bug)
                     known[("audit", finding["id"])] = bug
                 scope = next((item for item in store.state["auditScopes"].values() if finding in item.get("findings", [])), None)
+                if scope is None:
+                    raise ValueError(f"accepted audit finding has no scope: {finding['id']}")
                 bug["allowedPaths"] = (scope or {}).get("paths") or [finding["location"].replace("\\", "/").split(":", 1)[0]]
+                validation_commands[bug["id"]] = list(scope["commands"])
                 accepted.append(bug)
             elif action == "backlog" and finding["severity"] == "P2":
                 if ("audit", finding["id"]) not in known:
@@ -1731,13 +1736,23 @@ def run_audit(store: StateStore, semaphore: threading.Semaphore, tasks: list[dic
                     bugs.append(bug)
                     known[("audit", finding["id"])] = bug
         write_bugs(store, bugs)
-        store.update(lambda state: state.__setitem__("auditTriageCompleted", True))
+        store.update(lambda state: (state.setdefault("auditBugValidationCommands", {}).update(validation_commands), state.__setitem__("auditTriageCompleted", True)))
         return accepted
     return [bug for bug in load_bugs(store) if bug["source"] == "audit" and bug["status"] == "active"]
 
 
-def bug_assignment(bug: dict) -> dict:
-    return {"id": bug["id"], "title": bug["title"], "status": "ready", "priority": bug["severity"], "dependencies": [], "allowedPaths": bug["allowedPaths"], "acceptanceCriteria": [f"Resolve: {bug['failure']}", f"Meet requirement: {bug['requirement']}"], "validationCommands": [bug["reproduction"]]}
+def audit_bug_validation_commands(store: StateStore, bug: dict) -> list[str]:
+    commands = store.state.get("auditBugValidationCommands", {}).get(bug["id"])
+    if not commands:
+        scope = next((item for item in store.state.get("auditScopes", {}).values() if any(finding.get("id") == bug.get("sourceFindingId") for finding in item.get("findings", []))), None)
+        commands = (scope or {}).get("commands")
+    if not commands or any(not isinstance(command, str) or not command.strip() for command in commands):
+        raise ValueError(f"audit bug has no executable validation commands: {bug['id']}")
+    return list(commands)
+
+
+def bug_assignment(store: StateStore, bug: dict) -> dict:
+    return {"id": bug["id"], "title": bug["title"], "status": "ready", "priority": bug["severity"], "dependencies": [], "allowedPaths": bug["allowedPaths"], "acceptanceCriteria": [f"Resolve: {bug['failure']}", f"Meet requirement: {bug['requirement']}"], "validationCommands": audit_bug_validation_commands(store, bug)}
 
 
 def target_instructions(repo: Path, create: bool = False) -> tuple[str, bytes]:
@@ -1947,8 +1962,9 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str], gra
         return pending["actions"]
     if store.state.get("phase") != "needs-user" or store.state.get("activeProcesses"):
         raise RuntimeError("recovery requires an inactive needs-user campaign")
-    by_id = {task["id"]: task for task in tasks}
     bugs = {bug["id"]: bug for bug in load_bugs(store)}
+    bug_assignments = {bug_id: bug_assignment(store, bug) for bug_id, bug in bugs.items() if bug.get("source") == "audit" and bug.get("status") == "active"}
+    by_id = {task["id"]: task for task in tasks} | bug_assignments
     if len(deferred) != len(set(deferred)) or any(bug_id not in bugs or bugs[bug_id]["status"] != "active" for bug_id in deferred):
         raise ValueError("--defer-blocker requires unique active campaign bug IDs")
     if len(grants) != len(set(grants)) or any(task_id not in by_id for task_id in grants):
@@ -1970,6 +1986,18 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str], gra
             handled.add(assignment_id)
             continue
         error = str(task_state.get("error", ""))
+        if assignment_id in bug_assignments and error.startswith("validation command ") and assignment_id not in store.state.get("auditBugValidationCommands", {}):
+            worktree, record = recovery_worktree(store, assignment_id)
+            head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
+            dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout
+            ancestry = git(worktree, "merge-base", "--is-ancestor", record["baseSha"], head, timeout=store.state["validationTimeoutSeconds"], check=False)
+            changed = target_changes(store, worktree, record["baseSha"], head)
+            outside = sorted(path for path in changed if not allowed_change(path, assignment["allowedPaths"]))
+            if dirty or ancestry.returncode or outside or task_state.get("candidateSha"):
+                raise RuntimeError(f"cannot resume audit validation: {assignment_id}")
+            actions.append({"action": "resume-audit-validation", "assignmentId": assignment_id, "headSha": head, "commands": assignment["validationCommands"]})
+            handled.add(assignment_id)
+            continue
         if error == "provider pull request source commit does not match candidate" and task_state.get("candidateSha"):
             worktree, record = recovery_worktree(store, assignment_id)
             candidate = task_state["candidateSha"]
@@ -2039,11 +2067,11 @@ def print_recovery(actions: list[dict]) -> None:
 
 
 def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) -> None:
-    by_id = {task["id"]: task for task in tasks}
+    bugs = load_bugs(store)
+    by_id = {task["id"]: task for task in tasks} | {bug["id"]: bug_assignment(store, bug) for bug in bugs if bug.get("source") == "audit" and bug.get("status") == "active"}
     if not store.state.get("pendingRecovery"):
         store.update(lambda state: state.__setitem__("pendingRecovery", {"actions": actions, "completed": []}))
     completed = set(store.state["pendingRecovery"]["completed"])
-    bugs = load_bugs(store)
     for action in actions:
         assignment_id = action["assignmentId"]
         key = f"{action['action']}:{assignment_id}"
@@ -2072,6 +2100,15 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
                 raise RuntimeError(f"recovery worktree changed: {assignment_id}")
             store.state["reviewSessions"][assignment_id]["phase"] = f"repair-{action['repair']}"
             task_state.update(phase=f"repair-{action['repair']}")
+            task_state.pop("error", None)
+        elif action["action"] == "resume-audit-validation":
+            worktree, _ = recovery_worktree(store, assignment_id)
+            head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
+            dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout
+            if head != action["headSha"] or dirty or by_id[assignment_id]["validationCommands"] != action["commands"]:
+                raise RuntimeError(f"recovery worktree changed: {assignment_id}")
+            store.state.setdefault("auditBugValidationCommands", {})[assignment_id] = list(action["commands"])
+            task_state.update(phase="candidate-validation", pendingWorkerSha=head)
             task_state.pop("error", None)
         elif action["action"] == "adopt-user-deletions":
             worktree, _ = recovery_worktree(store, assignment_id)
@@ -2239,7 +2276,7 @@ def execute_campaign(store: StateStore, tasks: list[dict]) -> int:
         if store.state["phase"] == "needs-user":
             return 2
         if bugs:
-            run_assignments(store, semaphore, [bug_assignment(bug) for bug in bugs], "bug")
+            run_assignments(store, semaphore, [bug_assignment(store, bug) for bug in bugs], "bug")
         unresolved = [bug for bug in load_bugs(store) if bug["status"] == "active"]
         if unresolved:
             store.update(lambda state: state.__setitem__("phase", "needs-user"))
