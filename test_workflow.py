@@ -722,6 +722,40 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(store.state["agentsBootstrap"]["phase"], "pending")
             self.assertEqual(store.state["agentsBootstrap"]["contentHash"], repo.TARGET_AGENTS_SHA256)
 
+    def test_nested_bootstrap_reconcile_failure_recovers_merged_root_agents(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); target = make_git_repository(root)
+            module = target / "module"; module.mkdir(); (module / "README.md").write_text("# Module\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", "module/README.md"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "module"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(target), "push", "origin", "main"], check=True, capture_output=True)
+            args = run.parser().parse_args(["--repo", str(module)])
+            text = plan.render_tasks([ContractTests().task()], git_output(module, "rev-parse", "HEAD").strip(), "abc123")
+            store, _ = run.initialize_campaign(module, text, args)
+            (module / "AGENTS.md").unlink()
+            (target / "AGENTS.md").write_text(repo.TARGET_AGENTS, encoding="utf-8", newline="\n")
+            subprocess.run(["git", "-C", str(target), "add", "AGENTS.md"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "legacy bootstrap"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(target), "push", "origin", "main"], check=True, capture_output=True)
+            sha = git_output(target, "rev-parse", "HEAD").strip()
+            with self.assertRaisesRegex(ValueError, "outside target directory"):
+                run.target_changes(store, module, store.state["baseSha"], sha)
+            store.state.update(phase="needs-user", worktrees={})
+            store.state["agentsBootstrap"].update(
+                phase="needs-user", candidateSha=sha, pushedSha=sha,
+                pr={"number": 1, "state": "MERGED"},
+                providerStatus=f"[Errno 2] No such file or directory: '{module / 'AGENTS.md'}'",
+            )
+            store.save()
+            with patch("run.stderr_event") as event:
+                self.assertTrue(run.recover_legacy_nested_agents_reconcile(store))
+            event.assert_called_once_with("RECOVER", "assignment=AGENTS operation=reconcile version=2")
+            self.assertTrue(run.reconcile_agents_bootstrap(store))
+            self.assertEqual((store.state["phase"], store.state["agentsBootstrap"]["phase"]), ("build", "complete"))
+            self.assertEqual(store.state["providerAttemptCounters"]["AGENTS:reconcile-fetch-v2"], 1)
+            self.assertFalse((module / "AGENTS.md").exists())
+            self.assertEqual(store.state["targetInstructions"], repo.TARGET_AGENTS)
+
     def test_custom_agents_is_honored_without_bootstrap(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root); target = make_git_repository(root)
@@ -763,6 +797,33 @@ class DeterministicCoreTests(unittest.TestCase):
 
 
 class FakeEndToEndTests(unittest.TestCase):
+    def test_nested_target_keeps_bootstrap_and_worker_changes_in_subdirectory(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); target = make_git_repository(root)
+            module = target / "module"; module.mkdir(); (module / "README.md").write_text("# Module\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", "module/README.md"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "module"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(target), "push", "origin", "main"], check=True, capture_output=True)
+            fake_codex, fake_gh = root / "fake_codex.py", root / "fake_gh.py"
+            fake_codex.write_text(FAKE_CODEX, encoding="utf-8"); fake_gh.write_text(FAKE_GH, encoding="utf-8")
+            provider = root / "provider"; provider.mkdir()
+            requirements = root / "requirements.md"; requirements.write_text("Create one file.", encoding="utf-8")
+            environment = os.environ | {"RELAY_CODEX": f"{sys.executable} {fake_codex}", "RELAY_GH": f"{sys.executable} {fake_gh}", "RELAY_ALLOW_FAKE_PROVIDER": "1", "FAKE_GH_STATE": str(provider)}
+            subprocess.run([sys.executable, str(Path(plan.__file__)), "--repo", str(module), "--requirements", str(requirements)], capture_output=True, text=True, env=environment, check=True)
+            completed = subprocess.run([sys.executable, str(Path(run.__file__)), "--repo", str(module), "--agent-timeout", "10", "--validation-timeout", "10", "--provider-timeout", "10", "--provider-check-timeout", "10"], capture_output=True, text=True, env=environment, timeout=60)
+            state = json.loads((module / ".relay" / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr + json.dumps(state, indent=2))
+            self.assertEqual(state["repositoryPrefix"], "module")
+            self.assertEqual(state["worktrees"], {})
+            self.assertEqual(git_output(target, "show", "origin/main:module/AGENTS.md"), repo.TARGET_AGENTS)
+            task_branch = state["taskStates"]["TASK-0001"]["branch"]
+            self.assertEqual(git_output(target, "show", f"origin/{task_branch}:module/one.txt"), "TASK-0001\n")
+            self.assertNotIn("one.txt", git_output(target, "ls-tree", "--name-only", f"origin/{task_branch}"))
+            exclude = (target / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+            self.assertIn("module/.relay/", exclude)
+            self.assertEqual(run.permanent_cleanup(module, True), 0)
+            self.assertNotIn("module/.relay/", (target / ".git" / "info" / "exclude").read_text(encoding="utf-8"))
+
     def test_azure_campaign_bootstrap_pr_task_pr_and_complete(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root); target = make_git_repository(root)
