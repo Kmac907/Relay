@@ -33,6 +33,7 @@ WORKER_MODES = {"task", "bug", "repair"}
 TERMINAL_REVIEW_PHASES = {"approved", "needs-user"}
 CHILD_LOCK = threading.Lock()
 ACTIVE_CHILDREN: set[subprocess.Popen] = set()
+STATE_SCHEMA_VERSION = 2
 
 AGENT_SCHEMAS = {
     "worker": {"mode": str, "assignmentId": str, "status": str, "candidateSha": str, "changedPaths": list, "validation": list, "summary": str},
@@ -324,7 +325,7 @@ def paths_conflict(paths: list[str], active: set[str]) -> bool:
 
 def initial_state(repo: Path, metadata: dict, args: argparse.Namespace) -> dict:
     return {
-        "schemaVersion": 1, "campaignId": "", "repository": str(repo.resolve()), "phase": "build",
+        "schemaVersion": STATE_SCHEMA_VERSION, "campaignId": "", "repository": str(repo.resolve()), "phase": "build",
         "baseSha": metadata["baseSha"], "requirementsHash": metadata.get("requirementsHash", "000000"), "workerLimit": args.workers, "taskAttemptLimit": args.task_attempts,
         "fixLoopLimit": args.fix_loops, "formatRetryAllowance": args.format_retries,
         "agentTimeoutSeconds": args.agent_timeout, "validationTimeoutSeconds": args.validation_timeout,
@@ -1483,55 +1484,6 @@ def cleanup_worktree(store: StateStore, assignment_id: str) -> None:
         store.save()
 
 
-def legacy_candidate(store: StateStore, assignment: dict) -> tuple[Path, str, str] | None:
-    state, assignment_id = store.state, assignment["id"]
-    task = state.get("taskStates", {}).get(assignment_id, {})
-    record = state.get("worktrees", {}).get(assignment_id, {})
-    error = task.get("error")
-    if not isinstance(error, str):
-        return None
-    failures = [re.fullmatch(rf"Command '{re.escape(command)}' returned non-zero exit status [1-9]\d*\.", error) for command in assignment["validationCommands"]]
-    if not (
-        task.get("phase") == "needs-user"
-        and task.get("validationShellVersion", 1) == 1
-        and state.get("validationCommandsStarted", {}).get(assignment_id, 0) > 0
-        and sum(match is not None for match in failures) == 1
-        and not task.get("candidateSha") and not state.get("candidateShas", {}).get(assignment_id)
-        and not task.get("pushed") and not task.get("pushedSha")
-        and not task.get("pr") and not state.get("pullRequests", {}).get(assignment_id)
-        and not state.get("reviewSessions", {}).get(assignment_id)
-        and task.get("worktree") == record.get("path")
-        and task.get("branch") == record.get("branch")
-        and record.get("path") and record.get("branch") and record.get("baseSha")
-    ):
-        return None
-    try:
-        worktrees_root = Path(tempfile.gettempdir()).resolve() / "relay-worktrees"
-        campaign_root = safe_within(worktrees_root / state["campaignId"], worktrees_root)
-        root = safe_within(Path(record.get("root", record["path"])), campaign_root)
-        worktree = safe_within(Path(record["path"]), root)
-        branch, base = record["branch"], record["baseSha"]
-        if not worktree.is_dir():
-            return None
-        top = git(worktree, "rev-parse", "--show-toplevel", timeout=state["validationTimeoutSeconds"], check=False)
-        head = git(worktree, "rev-parse", "HEAD", timeout=state["validationTimeoutSeconds"], check=False)
-        branch_head = git(worktree, "rev-parse", branch, timeout=state["validationTimeoutSeconds"], check=False)
-        current_branch = git(worktree, "symbolic-ref", "--quiet", "--short", "HEAD", timeout=state["validationTimeoutSeconds"], check=False)
-        clean = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=state["validationTimeoutSeconds"], check=False)
-        ancestry = git(worktree, "merge-base", "--is-ancestor", base, head.stdout.strip(), timeout=state["validationTimeoutSeconds"], check=False)
-        if any(result.returncode for result in (top, head, branch_head, current_branch, clean, ancestry)) or Path(top.stdout.strip()).resolve() != root:
-            return None
-        sha = head.stdout.strip()
-        if sha == base or branch_head.stdout.strip() != sha or current_branch.stdout.strip() != branch or clean.stdout:
-            return None
-        changed = target_changes(store, worktree, base, sha)
-        if any(not allowed_change(path, assignment["allowedPaths"]) for path in changed):
-            return None
-        return worktree, branch, sha
-    except (RuntimeError, ValueError, OSError, subprocess.SubprocessError):
-        return None
-
-
 def process_assignment(store: StateStore, semaphore: threading.Semaphore, assignment: dict, mode: str) -> bool:
     assignment_id = assignment["id"]
     def initialize(state: dict) -> None:
@@ -1541,17 +1493,10 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
     if task_state["phase"] == "integrated":
         return True
     try:
-        recovery = legacy_candidate(store, assignment)
-        if recovery:
-            worktree, branch, candidate = recovery
-            store.update(lambda state: state["taskStates"][assignment_id].__setitem__("validationShellVersion", 2))
-            stderr_event("RECOVER", f"assignment={assignment_id} operation=candidate-validation version=2")
-            sha = validate_candidate(store, assignment, worktree, {"candidateSha": candidate, "changedPaths": target_changes(store, worktree, store.state["worktrees"][assignment_id]["baseSha"], candidate)})
-        else:
-            worktree, branch = create_worktree(store, assignment)
-            task_state.update(worktree=str(worktree), branch=branch)
-            store.save()
-            sha = task_state.get("candidateSha")
+        worktree, branch = create_worktree(store, assignment)
+        task_state.update(worktree=str(worktree), branch=branch)
+        store.save()
+        sha = task_state.get("candidateSha")
         while not sha and store.state["attemptCounters"].get(assignment_id, 0) < store.state["taskAttemptLimit"]:
             task_state["phase"] = "implementing"
             store.save()
@@ -1720,8 +1665,6 @@ def target_instructions(repo: Path, create: bool = False) -> tuple[str, bytes]:
 
 
 def provider_preflight(store: StateStore) -> None:
-    if not store.state.get("provider") and store.state.get("githubRepository"):
-        store.update(lambda state: state.__setitem__("provider", "github"))
     if store.state.get("preflightCompleted"):
         console("DONE", f"operation=provider-preflight provider={provider_name(store.state)} cached=true")
         if store.state.get("provider") == "azure-devops" and store.state["mergeMethod"] == "rebase":
@@ -1749,10 +1692,6 @@ def provider_preflight(store: StateStore) -> None:
     console("DONE", f"operation=provider-preflight provider={provider_name(store.state)}")
 
 
-# Kept for callers that imported the old internal name.
-github_preflight = provider_preflight
-
-
 def validate_agents_bootstrap(store: StateStore, worktree: Path, sha: str) -> None:
     bootstrap = store.state["agentsBootstrap"]
     base = bootstrap["baseSha"]
@@ -1774,67 +1713,14 @@ def _agents_bootstrap_needs_user(store: StateStore, status: str) -> bool:
     return False
 
 
-def recover_legacy_agents_pr(store: StateStore) -> bool:
-    state = store.state
-    bootstrap = state.get("agentsBootstrap") or {}
-    sha = bootstrap.get("candidateSha")
-    limit = state.get("providerAttemptLimit")
-    if not (
-        state.get("provider") == "azure-devops"
-        and state.get("phase") == bootstrap.get("phase") == "needs-user"
-        and not bootstrap.get("pr")
-        and not state.get("pullRequests", {}).get("AGENTS")
-        and isinstance(sha, str) and sha
-        and bootstrap.get("pushedSha") == sha
-        and bootstrap.get("prOperationVersion", 1) == 1
-        and isinstance(limit, int) and limit > 0
-        and state.get("providerAttemptCounters", {}).get("AGENTS:pr-create", 0) >= limit
-        and bootstrap.get("providerStatus") == "Azure DevOps operation exhausted attempts: AGENTS:pr-create"
-    ):
-        return False
-    store.update(lambda current: (current["agentsBootstrap"].update(phase="pull-request", providerStatus="recovering-pr-create", prOperationVersion=2), current.__setitem__("phase", "agents-bootstrap")))
-    stderr_event("RECOVER", "assignment=AGENTS operation=pr-create version=2")
-    return True
-
-
-def recover_legacy_nested_agents_reconcile(store: StateStore) -> bool:
-    state = store.state
-    bootstrap = state.get("agentsBootstrap") or {}
-    pr = bootstrap.get("pr") or {}
-    status = bootstrap.get("providerStatus")
-    repository = Path(state["repository"])
-    root, prefix = repository_layout(repository, state["providerTimeoutSeconds"])
-    if not (
-        state.get("phase") == bootstrap.get("phase") == "needs-user"
-        and prefix
-        and pr.get("state") == "MERGED"
-        and bootstrap.get("candidateSha") == bootstrap.get("pushedSha")
-        and bootstrap.get("candidateSha")
-        and bootstrap.get("reconcileOperationVersion", 1) == 1
-        and isinstance(status, str) and "No such file or directory" in status and "AGENTS.md" in status
-        and not (repository / "AGENTS.md").exists()
-        and (root / "AGENTS.md").is_file()
-        and (root / "AGENTS.md").read_bytes().replace(b"\r\n", b"\n") == TARGET_AGENTS.encode()
-    ):
-        return False
-    store.update(lambda current: (current["agentsBootstrap"].update(phase="reconciling", providerStatus="recovering-reconcile", reconcileOperationVersion=2), current.__setitem__("phase", "agents-bootstrap")))
-    stderr_event("RECOVER", "assignment=AGENTS operation=reconcile version=2")
-    return True
-
-
 def reconcile_agents_bootstrap(store: StateStore) -> bool:
     repository = Path(store.state["repository"])
-    root, prefix = repository_layout(repository, store.state["providerTimeoutSeconds"])
     agents = repository / "AGENTS.md"
     try:
-        suffix = "-v2" if store.state["agentsBootstrap"].get("reconcileOperationVersion", 1) == 2 else ""
-        git_provider_with_retries(store, f"AGENTS:reconcile-fetch{suffix}", repository, "fetch", "origin", "main")
+        git_provider_with_retries(store, "AGENTS:reconcile-fetch", repository, "fetch", "origin", "main")
         remote_sha = git(repository, "rev-parse", "origin/main", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
         relative_agents = repository_path(store.state, "AGENTS.md")
         shown = git(repository, "show", f"{remote_sha}:{relative_agents}", timeout=store.state["validationTimeoutSeconds"], check=False)
-        if shown.returncode and suffix and prefix:
-            agents, relative_agents = root / "AGENTS.md", "AGENTS.md"
-            shown = git(repository, "show", f"{remote_sha}:{relative_agents}", timeout=store.state["validationTimeoutSeconds"], check=False)
         if shown.returncode:
             raise RuntimeError("merged AGENTS.md is missing from target directory")
         remote_blob = shown.stdout.encode()
@@ -1922,15 +1808,14 @@ def bootstrap_agents(store: StateStore) -> bool:
             store.update(lambda state: state["agentsBootstrap"].update(phase="pull-request", pushedSha=sha))
         pr = bootstrap.get("pr")
         if not pr:
-            suffix = "-v2" if bootstrap.get("prOperationVersion", 1) == 2 else ""
-            matches = pr_discover(store, f"AGENTS:pr-list{suffix}", branch)
+            matches = pr_discover(store, "AGENTS:pr-list", branch)
             if matches:
                 pr = matches[0]
             else:
                 body = store.path.parent / ".AGENTS-pr.md"
                 atomic_write(body, f"Relay generated target instructions\n\nCandidate: {sha}\n")
                 try:
-                    pr = pr_create(store, f"AGENTS:pr-create{suffix}", branch, "Add Relay target instructions", body)
+                    pr = pr_create(store, "AGENTS:pr-create", branch, "Add Relay target instructions", body)
                 finally:
                     body.unlink(missing_ok=True)
             if pr.get("headRefOid") != sha:
@@ -2025,7 +1910,7 @@ def run_assignments(store: StateStore, semaphore: threading.Semaphore, assignmen
             for assignment in sorted(pending.values(), key=lambda item: (int(item["priority"][1]), item["id"])):
                 assignment_id = assignment["id"]
                 phase = store.state["taskStates"].get(assignment_id, {}).get("phase")
-                if phase in {"needs-user", "waiting-provider"} and not (phase == "needs-user" and legacy_candidate(store, assignment)):
+                if phase in {"needs-user", "waiting-provider"}:
                     pending.pop(assignment_id)
                     continue
                 if set(assignment.get("dependencies", [])) <= integrated and not paths_conflict(assignment["allowedPaths"], active_paths):
@@ -2046,8 +1931,6 @@ def run_assignments(store: StateStore, semaphore: threading.Semaphore, assignmen
 
 def execute_campaign(store: StateStore, tasks: list[dict]) -> int:
     semaphore = threading.Semaphore(store.state["workerLimit"])
-    recover_legacy_agents_pr(store)
-    recover_legacy_nested_agents_reconcile(store)
     if (store.state.get("agentsBootstrap") or {}).get("phase") == "needs-user":
         store.update(lambda state: state.__setitem__("phase", "needs-user"))
         return 2
@@ -2214,6 +2097,8 @@ def main(argv: list[str] | None = None) -> int:
             if stdin_text.strip() or args.plan:
                 raise RuntimeError("resume does not accept a new plan")
             state = json.loads(relay_state.read_text(encoding="utf-8"))
+            if state.get("schemaVersion") != STATE_SCHEMA_VERSION:
+                raise RuntimeError(f"unsupported campaign state schema {state.get('schemaVersion')!r}; create a reviewed plan and start a new campaign")
             if Path(state["repository"]).resolve() != repo:
                 raise RuntimeError("campaign repository mismatch")
             store, tasks = StateStore(relay_state, state), None
