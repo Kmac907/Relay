@@ -84,6 +84,23 @@ class ContractTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             repo.parser().parse_args(["--path", "x", "--provider-timeout", "0"])
 
+    def test_tool_commands_resolve_windows_shims(self):
+        builders = ((plan, plan.command), (run, run.tool_command), (repo, repo._command))
+        cases = (
+            ("codex", "nt", r"C:\Tools\codex.CMD", [r"C:\Tools\codex.CMD", "--flag"], True),
+            ("gh", "nt", r"C:\Tools\gh.CMD", [r"C:\Tools\gh.CMD", "--flag"], True),
+            ("az", "nt", r"C:\Tools\az.CMD", [r"C:\Tools\az.CMD", "--flag"], True),
+            ("git", "nt", r"C:\Tools\git.CMD", [r"C:\Tools\git.CMD", "--flag"], True),
+            ("missing", "nt", None, ["missing", "--flag"], True),
+            ("codex", "posix", r"C:\Tools\codex.CMD", ["codex", "--flag"], False),
+        )
+        for module, builder in builders:
+            for tool, platform, resolved, expected, looked_up in cases:
+                with self.subTest(builder=builder.__name__, tool=tool, platform=platform):
+                    with patch.object(module.os, "name", platform), patch.object(module.shutil, "which", return_value=resolved) as which, patch.dict(os.environ, {f"RELAY_{tool.upper()}": f"{tool} --flag"}):
+                        self.assertEqual(builder(tool), expected)
+                    self.assertEqual(which.called, looked_up)
+
 
 class RepositoryTests(unittest.TestCase):
     def completed(self, stdout=""):
