@@ -10,14 +10,13 @@ import re
 import shlex
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 import time
-from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import relay_console
 from repo import TARGET_AGENTS, create_exclusive
 
 TASK_ID = re.compile(r"TASK-\d{4}")
@@ -170,7 +169,7 @@ def git(repo: Path, *args: str) -> str:
 
 
 def progress(event: str, detail: str) -> None:
-    print(f"{datetime.now():%H:%M:%S}  {event:<10} {detail}", file=sys.stderr, flush=True)
+    relay_console.emit(event, detail)
 
 
 def inspect_repository(repo: Path) -> tuple[str, list[str], str]:
@@ -232,11 +231,7 @@ class CallBudget:
             return self.started
 
 
-def heartbeat_interval(timeout: int) -> int:
-    return min(30, max(1, timeout // 2))
-
-
-def invoke_agent(repo: Path, prompt: str, schema: dict, timeout: int, budget: CallBudget | None, wait_detail: str | None = None, started: float | None = None) -> object:
+def invoke_agent(repo: Path, prompt: str, schema: dict, timeout: int, budget: CallBudget | None, wait_detail: str | None = None) -> object:
     if budget is not None:
         budget.consume()
     with tempfile.TemporaryDirectory(prefix="relay-plan-") as temporary:
@@ -249,21 +244,9 @@ def invoke_agent(repo: Path, prompt: str, schema: dict, timeout: int, budget: Ca
             "--ephemeral", "--sandbox", "read-only", "--cd", str(repo),
             "--output-schema", str(schema_path), "--output-last-message", str(result_path), "-",
         ]
-        stop = threading.Event()
-        began = started or time.monotonic()
-        heartbeat = None
         if wait_detail:
-            def report_wait() -> None:
-                while not stop.wait(heartbeat_interval(timeout)):
-                    progress("WAIT", f"{wait_detail} elapsed={time.monotonic() - began:.1f}s")
-            heartbeat = threading.Thread(target=report_wait, daemon=True)
-            heartbeat.start()
-        try:
-            completed = subprocess.run(invocation, input=prompt, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout)
-        finally:
-            stop.set()
-            if heartbeat:
-                heartbeat.join()
+            relay_console.update(f"{wait_detail} | elapsed 0s / {timeout}s")
+        completed = subprocess.run(invocation, input=prompt, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout)
         if completed.returncode:
             raise RuntimeError(f"agent failed with exit code {completed.returncode}")
         if not result_path.is_file():
@@ -280,11 +263,11 @@ def invoke_validated(repo: Path, prompt: str, schema: dict, validator, timeout: 
         except RuntimeError as caught:
             error = caught
             break
-        detail = f"{identity} attempt={attempt}/{attempts} call={call}/{budget.limit} timeout={timeout}s"
+        detail = f"operation={identity.removeprefix('role=')} attempt={attempt}/{attempts} call={call}/{budget.limit} timeout={timeout}s"
         started = time.monotonic()
         progress("START", detail)
         try:
-            result = validator(invoke_agent(repo, prompt, schema, timeout, None, detail, started))
+            result = validator(invoke_agent(repo, prompt, schema, timeout, None, detail))
             progress("DONE", f"{detail} elapsed={time.monotonic() - started:.1f}s")
             return result
         except (ValueError, json.JSONDecodeError, RuntimeError, OSError, subprocess.TimeoutExpired) as caught:
@@ -333,32 +316,33 @@ def main(argv: list[str] | None = None) -> int:
         base, files, instructions = inspect_repository(repo)
         scopes = scout_scopes(files, args.workers)
         budget = CallBudget(len(scopes) + 1 + args.format_retries)
-        print("Relay Planner", file=sys.stderr)
-        print(f"Repository:   {repo}\nRequirements: {requirements_file}\nWorkers:      {args.workers} configured", file=sys.stderr)
+        progress("START", f"operation=plan name=Relay Planner workers={args.workers} calls={budget.limit}")
         evidence = []
         if scopes:
             with tempfile.TemporaryDirectory(prefix="relay-scouts-") as temporary, ThreadPoolExecutor(max_workers=args.workers) as pool:
                 futures = []
                 for slot, scope in enumerate(scopes, 1):
-                    progress("SCOUT", f"slot={slot} scope={scope}")
+                    relay_console.update(f"scout {slot}/{len(scopes)} | scope={scope} | calls={budget.started}/{budget.limit}")
                     snapshot = create_scout_snapshot(repo, files, scope, Path(temporary) / f"scope-{slot}")
                     prompt = scout_prompt(scope, requirements, instructions)
                     futures.append(pool.submit(invoke_validated, snapshot, prompt, scout_schema(scope), lambda value, expected=scope: validate_scout(value, expected), args.agent_timeout, budget, args.format_retries, f"role=scout slot={slot}"))
                 evidence = [future.result() for future in futures]
-        progress("SYNTHESIZE", "role=planning-pm")
+        relay_console.update(f"planning-pm synthesize | calls={budget.started}/{budget.limit}")
         tasks = invoke_validated(repo, planning_prompt(requirements, instructions, files, base, evidence), json_schema(TASK_SCHEMA, "tasks"), validate_tasks, args.agent_timeout, budget, args.format_retries, "role=planning-pm")
-        progress("VALIDATE", f"tasks={len(tasks)}")
+        progress("DONE", f"operation=validate-plan tasks={len(tasks)}")
         output = render_tasks(tasks, base, hashlib.sha256(requirements.encode()).hexdigest()[:12], args.task_attempts, args.fix_loops)
         output_path = (args.output or repo / "PLAN.md").resolve()
         if not create_exclusive(output_path, output):
             raise ValueError(f"refusing existing plan: {output_path}")
         create_exclusive(repo / "AGENTS.md", TARGET_AGENTS)
-        progress("OUTPUT", f"ready={sum(task['status'] == 'ready' for task in tasks)} blocked={sum(task['status'] == 'blocked' for task in tasks)}")
+        progress("COMPLETE", f"operation=plan tasks={len(tasks)} ready={sum(task['status'] == 'ready' for task in tasks)} blocked={sum(task['status'] == 'blocked' for task in tasks)}")
         print(output_path)
         return 0
     except (ValueError, RuntimeError, OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-        print(f"plan.py: {error}", file=sys.stderr)
+        progress("FAILED", f"operation=plan reason={str(error).splitlines()[0]}")
         return 1
+    finally:
+        relay_console.close()
 
 
 if __name__ == "__main__":

@@ -15,11 +15,13 @@ import sys
 import tempfile
 import threading
 import time
+from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
+import relay_console
 from repo import GENERATED_AGENTS_MARKER, TARGET_AGENTS, TARGET_AGENTS_SHA256, create_exclusive
 
 MARKER = re.compile(r"<!-- relay: planned-base=([0-9a-f]{7,64}) requirements=([0-9a-f]{6,64}) -->")
@@ -29,7 +31,6 @@ BUG_MARKER = re.compile(r"<!-- relay: campaign=([A-Za-z0-9._-]+) repository=([0-
 TASK_FIELDS = ("Status", "Priority", "Dependencies", "Allowed paths", "Acceptance criteria", "Validation", "Attempt", "Fix loop", "Branch", "Pull request", "Candidate")
 WORKER_MODES = {"task", "bug", "repair"}
 TERMINAL_REVIEW_PHASES = {"approved", "needs-user"}
-CONSOLE_LOCK = threading.Lock()
 CHILD_LOCK = threading.Lock()
 ACTIVE_CHILDREN: set[subprocess.Popen] = set()
 
@@ -84,13 +85,11 @@ ROLE_JSON_SCHEMAS = {
 
 
 def console(event: str, detail: str) -> None:
-    with CONSOLE_LOCK:
-        print(f"{datetime.now():%H:%M:%S}  {event:<10} {detail}", flush=True)
+    relay_console.emit(event, detail)
 
 
 def stderr_event(event: str, detail: str) -> None:
-    with CONSOLE_LOCK:
-        print(f"{datetime.now():%H:%M:%S}  {event:<10} {detail}", file=sys.stderr, flush=True)
+    relay_console.emit(event, detail)
 
 
 def bounded_run(command, *, timeout: int, cwd: Path | None = None, check: bool = True, input: str | None = None, shell: bool = False) -> subprocess.CompletedProcess:
@@ -367,6 +366,92 @@ class StateStore:
         with self.lock:
             change(self.state)
             self.save()
+
+
+OPERATION_FIELDS = ("operation", "operationStartedAt", "operationDeadline", "validationCommand", "validationPosition", "validationTotal")
+
+
+def _duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60}m{seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
+
+
+def _operation_target(state: dict, assignment_id: str) -> dict | None:
+    if assignment_id == "AGENTS":
+        return state.get("agentsBootstrap")
+    return state.get("taskStates", {}).get(assignment_id)
+
+
+def runtime_progress(state: dict, now: float | None = None) -> str:
+    now = time.time() if now is None else now
+    task_states = state.get("taskStates", {})
+    total = state.get("taskTotal", len([key for key in task_states if key.startswith("TASK-")]))
+    complete = sum(value.get("phase") == "integrated" for key, value in task_states.items() if key.startswith("TASK-"))
+    operations: list[tuple[str, str, dict]] = []
+    active_assignments = set()
+    for process_id, process in state.get("activeProcesses", {}).items():
+        assignment_id = process.get("assignmentId", "unknown")
+        target = _operation_target(state, assignment_id) or {}
+        operations.append((assignment_id, process.get("role", "worker"), target | process))
+        active_assignments.add(assignment_id)
+    bootstrap = state.get("agentsBootstrap")
+    if bootstrap and bootstrap.get("operation") and "AGENTS" not in active_assignments:
+        operations.append(("AGENTS", bootstrap["operation"], bootstrap))
+    for assignment_id, task in task_states.items():
+        if task.get("operation") and assignment_id not in active_assignments:
+            operations.append((assignment_id, task["operation"], task))
+    parts = [f"{complete}/{total} complete", f"active {len(operations)}/{state.get('workerLimit', 0)}"]
+    for assignment_id, operation, record in sorted(operations, key=lambda item: (item[0], item[1])):
+        detail = f"{assignment_id} {operation}"
+        started = record.get("operationStartedAt") or record.get("startedAt") or record.get("reservedAt")
+        if started:
+            detail += f" {_duration(now - datetime.fromisoformat(started).timestamp())}"
+        if operation == "worker":
+            detail += f" {state.get('attemptCounters', {}).get(assignment_id, 0)}/{state.get('taskAttemptLimit', 0)}"
+        elif operation == "validate" and record.get("validationPosition"):
+            detail += f" {record['validationPosition']}/{record.get('validationTotal', '?')}"
+        elif operation in {"review", "contract-reviewer", "risk-reviewer", "triage-pm", "verification-reviewer"}:
+            session = state.get("reviewSessions", {}).get(assignment_id, {})
+            detail += f" {session.get('reviewCallsStarted', 0)}/{session.get('reviewCallLimit', 0)}"
+        elif operation == "provider-checks":
+            pr = state.get("pullRequests", {}).get(assignment_id) or (record.get("pr") if assignment_id == "AGENTS" else {}) or {}
+            detail += f" PR #{pr.get('number', '?')}"
+            if record.get("providerStatus"):
+                detail += f" {record['providerStatus']}"
+            counts = record.get("providerPolicyCounts") or {}
+            if counts:
+                detail += " " + " ".join(f"{key} {value}" for key, value in sorted(counts.items()) if value)
+            if record.get("nextAction"):
+                detail += f" next={record['nextAction']}"
+        deadline = record.get("operationDeadline")
+        if deadline:
+            detail += f" / {_duration(deadline - now)} left"
+        parts.append(detail)
+    return " | ".join(parts)
+
+
+def start_operation(store: StateStore, assignment_id: str, operation: str, timeout: float, **fields: object) -> None:
+    began = datetime.now(timezone.utc)
+    started = began.isoformat()
+    deadline = began.timestamp() + timeout
+    def change(state: dict) -> None:
+        target = _operation_target(state, assignment_id)
+        if target is not None:
+            target.update(operation=operation, operationStartedAt=started, operationDeadline=deadline, **fields)
+            if operation == "provider-checks" and assignment_id != "AGENTS":
+                target["phase"] = "provider-checks"
+    store.update(change)
+    relay_console.update(runtime_progress(store.state, began.timestamp()))
+
+
+def clear_operation(store: StateStore, assignment_id: str, operation: str | None = None) -> None:
+    def change(state: dict) -> None:
+        target = _operation_target(state, assignment_id)
+        if target is not None and (operation is None or target.get("operation") == operation):
+            for field in OPERATION_FIELDS:
+                target.pop(field, None)
+    store.update(change)
+    relay_console.update(runtime_progress(store.state, datetime.now(timezone.utc).timestamp()))
 
 
 @contextlib.contextmanager
@@ -660,28 +745,37 @@ def invoke_agent(store: StateStore, semaphore: threading.Semaphore, repo: Path, 
         "--cd", str(repo), "--output-schema", str(schema), "--output-last-message", str(output), "-",
     ]
     prompt = f"Target repository instructions:\n{store.state.get('targetInstructions', '')}\n\n{prompt}"
+    operation = "worker" if role == "worker" else role
     try:
         with semaphore:
             store.update(lambda state: state["activeProcesses"][process_id].update(status="running", startedAt=datetime.now(timezone.utc).isoformat()))
-            console("START", f"role={role}" + (f" mode={mode}" if mode else "") + f" assignment={assignment_id} call={number}")
+            start_operation(store, assignment_id, operation, store.state["agentTimeoutSeconds"])
+            console("START", f"operation={operation}" + (f" mode={mode}" if mode else "") + f" assignment={assignment_id} call={number} deadline={store.state['agentTimeoutSeconds']}s")
             completed = bounded_run(command, input=prompt, timeout=store.state["agentTimeoutSeconds"])
         atomic_write(log, completed.stdout + ("\n--- stderr ---\n" + completed.stderr if completed.stderr else ""))
         if completed.returncode or not output.is_file():
-            raise RuntimeError(f"{role} failed with exit code {completed.returncode}")
+            raise RuntimeError(f"{role} failed with exit code {completed.returncode}; log: {log}")
         result = json.loads(output.read_text(encoding="utf-8"))
-        return validate_agent_result(role, result, assignment_id if role != "audit-planner" else None, mode)
+        try:
+            validated = validate_agent_result(role, result, assignment_id if role != "audit-planner" else None, mode)
+        except ValueError as error:
+            raise ValueError(f"{error}; log: {log}") from error
+        console("DONE", f"operation={operation} assignment={assignment_id} call={number} log={log}")
+        return validated
     except subprocess.TimeoutExpired as error:
         atomic_write(log, f"timed out after {store.state['agentTimeoutSeconds']} seconds\n")
-        raise RuntimeError(f"{role} timed out") from error
+        raise RuntimeError(f"{role} timed out; log: {log}") from error
     finally:
         schema.unlink(missing_ok=True)
         output.unlink(missing_ok=True)
         store.update(lambda state: state["activeProcesses"].pop(process_id, None))
+        clear_operation(store, assignment_id, operation)
 
 
 def invoke_with_replacements(store: StateStore, semaphore: threading.Semaphore, repo: Path, assignment_id: str, role: str, prompt: str, *, mode: str | None = None, review: bool = False, audit: bool = False, validator=None) -> dict:
     error = None
-    for _ in range(store.state["formatRetryAllowance"] + 1):
+    attempts = store.state["formatRetryAllowance"] + 1
+    for attempt in range(1, attempts + 1):
         try:
             result = invoke_agent(store, semaphore, repo, assignment_id, role, prompt, mode=mode, review=review, audit=audit)
             return validator(result) if validator else result
@@ -693,6 +787,8 @@ def invoke_with_replacements(store: StateStore, semaphore: threading.Semaphore, 
                     break
             elif audit and store.state["auditCallsStarted"] >= store.state["auditCallLimit"]:
                 break
+            console("RETRY", f"operation={role} assignment={assignment_id} attempt={attempt}/{attempts} reason={str(caught).splitlines()[0]}")
+    console("FAILED", f"operation={role} assignment={assignment_id} reason={str(error).splitlines()[0] if error else 'budget exhausted'}")
     raise RuntimeError(f"{role} exhausted structured-output budget: {error}") from error
 
 
@@ -745,7 +841,14 @@ def run_validations(store: StateStore, assignment: dict, worktree: Path) -> None
             count = state["validationCommandsStarted"].get(assignment["id"], 0) + 1
             state["validationCommandsStarted"][assignment["id"]] = count
             started["number"] = count
+            state["taskStates"][assignment["id"]].update(
+                operation="validate", operationStartedAt=datetime.now(timezone.utc).isoformat(),
+                operationDeadline=time.time() + state["validationTimeoutSeconds"], validationCommand=command,
+                validationPosition=command_number, validationTotal=len(assignment["validationCommands"]),
+            )
         store.update(consume)
+        relay_console.update(runtime_progress(store.state, datetime.now(timezone.utc).timestamp()))
+        console("START", f"operation=validate assignment={assignment['id']} command={command_number}/{len(assignment['validationCommands'])} attempt={started['number']} deadline={store.state['validationTimeoutSeconds']}s")
         shell = validation_command(command)
         log = store.path.parent / "logs" / f"{assignment['id']}-validation-{started['number']}.log"
         try:
@@ -754,10 +857,20 @@ def run_validations(store: StateStore, assignment: dict, worktree: Path) -> None
         except subprocess.TimeoutExpired as error:
             exit_code, stdout, stderr = "timeout", _output(error.stdout), _output(error.stderr)
             atomic_write(log, f"command: {command}\nshell: {json.dumps(shell)}\nexitCode: {exit_code}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}")
-            raise RuntimeError(f"validation command {command_number} timed out after {store.state['validationTimeoutSeconds']}s; log: {log}") from error
+            message = f"validation command {command_number} timed out after {store.state['validationTimeoutSeconds']}s; log: {log}"
+            store.update(lambda state: state["taskStates"][assignment["id"]].__setitem__("error", message))
+            console("FAILED", f"operation=validate assignment={assignment['id']} command={command_number}/{len(assignment['validationCommands'])} log={log}")
+            clear_operation(store, assignment["id"], "validate")
+            raise RuntimeError(message) from error
         atomic_write(log, f"command: {command}\nshell: {json.dumps(shell)}\nexitCode: {exit_code}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}")
         if completed.returncode:
-            raise RuntimeError(f"validation command {command_number} exited with code {completed.returncode}; log: {log}")
+            message = f"validation command {command_number} exited with code {completed.returncode}; log: {log}"
+            store.update(lambda state: state["taskStates"][assignment["id"]].__setitem__("error", message))
+            console("FAILED", f"operation=validate assignment={assignment['id']} command={command_number}/{len(assignment['validationCommands'])} exit={completed.returncode} log={log}")
+            clear_operation(store, assignment["id"], "validate")
+            raise RuntimeError(message)
+        console("DONE", f"operation=validate assignment={assignment['id']} command={command_number}/{len(assignment['validationCommands'])} log={log}")
+        clear_operation(store, assignment["id"], "validate")
 
 
 def validate_candidate(store: StateStore, assignment: dict, worktree: Path, result: dict) -> str:
@@ -778,7 +891,7 @@ def validate_candidate(store: StateStore, assignment: dict, worktree: Path, resu
         state["taskStates"][assignment["id"]].update(candidateSha=sha, phase="push-and-open-pr")
         state["taskStates"][assignment["id"]].pop("error", None)
     store.update(accepted)
-    console("CANDIDATE", f"assignment={assignment['id']} sha={sha[:12]} validation=passed")
+    console("DONE", f"operation=candidate assignment={assignment['id']} sha={sha[:12]} validation=passed")
     return sha
 
 
@@ -943,18 +1056,20 @@ def git_provider_with_retries(store: StateStore, key: str, repo: Path, *args: st
         log_provider(store, f"{key} exit={last.returncode} git={args}\n{last.stdout}{last.stderr}")
         if last.returncode == 0:
             return last
-    raise RuntimeError(f"Git provider operation exhausted attempts: {key}; {last.stderr if last else ''}")
+    raise RuntimeError(f"Git provider operation exhausted attempts: {key}; log: {store.path.parent / 'logs' / 'provider.log'}")
 
 
 def publish_candidate(store: StateStore, assignment: dict, worktree: Path, branch: str, sha: str) -> dict:
     assignment_id, task_state = assignment["id"], store.state["taskStates"][assignment["id"]]
+    start_operation(store, assignment_id, "publish", store.state["providerTimeoutSeconds"])
     if task_state.get("pushedSha") != sha:
         remote = git_provider_with_retries(store, f"{assignment_id}:ls-remote", worktree, "ls-remote", "--heads", "origin", f"refs/heads/{branch}")
         if not remote.stdout.startswith(sha):
             git_provider_with_retries(store, f"{assignment_id}:push:{sha}", worktree, "push", "--set-upstream", "origin", branch)
         store.update(lambda state: state["taskStates"][assignment_id].update(pushed=True, pushedSha=sha))
-        console("PUSHED", f"assignment={assignment_id} branch={branch}")
+        console("DONE", f"operation=publish assignment={assignment_id} branch={branch}")
     if task_state.get("pr"):
+        clear_operation(store, assignment_id, "publish")
         return task_state["pr"]
     body = store.path.parent / f".{assignment_id}-pr.md"
     atomic_write(body, f"Relay assignment {assignment_id}\n\nCandidate: {sha}\n")
@@ -967,7 +1082,8 @@ def publish_candidate(store: StateStore, assignment: dict, worktree: Path, branc
         if pr["headRefOid"] != sha:
             raise RuntimeError("provider pull request source commit does not match candidate")
         store.update(lambda state: (state["taskStates"][assignment_id].__setitem__("pr", pr), state["pullRequests"].__setitem__(assignment_id, pr)))
-        console("PR", f"assignment={assignment_id} number={pr.get('number')}")
+        console("DONE", f"operation=pull-request assignment={assignment_id} pr={pr.get('number')}")
+        clear_operation(store, assignment_id, "publish")
         return pr
     finally:
         body.unlink(missing_ok=True)
@@ -1058,7 +1174,7 @@ def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: di
                 transition_review(current, "repair-1" if accepted and state["fixLoopLimit"] else "needs-user" if accepted else "approved", state["fixLoopLimit"])
                 current["reviewedSha"] = sha if not accepted else ""
             store.update(triaged)
-            console("TRIAGE", f"assignment={assignment_id} blockers={len(accepted)}")
+            console("DONE", f"operation=internal-review assignment={assignment_id} blockers={len(accepted)}")
         while session["phase"].startswith("repair-"):
             number = int(session["phase"].split("-")[1])
             if session["repairAttemptsStarted"] >= store.state["fixLoopLimit"]:
@@ -1066,7 +1182,6 @@ def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: di
                 store.save()
                 return False
             store.update(lambda state: state["reviewSessions"][assignment_id].__setitem__("repairAttemptsStarted", state["reviewSessions"][assignment_id]["repairAttemptsStarted"] + 1))
-            console("REPAIR", f"role=worker mode=repair assignment={assignment_id} fix={number}/{store.state['fixLoopLimit']}")
             blockers = [bug for bug in load_bugs(store) if bug["id"] in session["acceptedBlockerIds"]]
             try:
                 repair = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt("repair", assignment, sha, blockers, store.state["taskStates"][assignment_id].get("error", "")), mode="repair", review=True)
@@ -1080,7 +1195,7 @@ def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: di
             transition_review(session, f"verify-{number}", store.state["fixLoopLimit"])
             store.save()
             verification = invoke_with_replacements(store, semaphore, worktree, assignment_id, "verification-reviewer", role_prompt("verification-reviewer", assignment, repaired_sha, {"blockers": blockers, "previousCandidate": sha, "repairDiff": f"{sha}..{repaired_sha}"}), review=True)
-            console("VERIFY", f"role=verification-reviewer assignment={assignment_id} fix={number}/{store.state['fixLoopLimit']}")
+            console("DONE", f"operation=repair assignment={assignment_id} fix={number}/{store.state['fixLoopLimit']} result={verification['status']}")
             if verification["candidateSha"] != repaired_sha:
                 raise ValueError("verification reviewer changed candidate SHA")
             sha = repaired_sha
@@ -1109,6 +1224,16 @@ def wait_for_checks(store: StateStore, assignment_id: str, pr: dict, reviewed_sh
     if assignment_id not in store.state["providerDeadlines"]:
         store.update(lambda state: state["providerDeadlines"].__setitem__(assignment_id, time.time() + state["providerCheckTimeoutSeconds"]))
     deadline = store.state["providerDeadlines"][assignment_id]
+    start_operation(store, assignment_id, "provider-checks", max(0, deadline - datetime.now(timezone.utc).timestamp()), nextAction="poll")
+
+    def progress(status: str, counts: dict[str, int] | None = None, next_action: str = "poll") -> None:
+        def change(state: dict) -> None:
+            target = _operation_target(state, assignment_id)
+            if target is not None:
+                target.update(providerStatus=status, providerPolicyCounts=counts or {}, nextAction=next_action)
+        store.update(change)
+        relay_console.update(runtime_progress(store.state, datetime.now(timezone.utc).timestamp()))
+
     first = True
     while first or time.time() < deadline:
         first = False
@@ -1125,22 +1250,27 @@ def wait_for_checks(store: StateStore, assignment_id: str, pr: dict, reviewed_sh
         except (RuntimeError, subprocess.TimeoutExpired):
             key = f"{assignment_id}:check-errors"
             store.update(lambda state: state["providerAttemptCounters"].__setitem__(key, state["providerAttemptCounters"].get(key, 0) + 1))
+            progress(f"provider-error {store.state['providerAttemptCounters'][key]}/{store.state['providerAttemptLimit']}")
             if store.state["providerAttemptCounters"][key] >= store.state["providerAttemptLimit"]:
                 return "waiting-provider"
             continue
         if view.returncode:
             key = f"{assignment_id}:check-errors"
             store.update(lambda state: state["providerAttemptCounters"].__setitem__(key, state["providerAttemptCounters"].get(key, 0) + 1))
+            progress(f"provider-error {store.state['providerAttemptCounters'][key]}/{store.state['providerAttemptLimit']}")
             if store.state["providerAttemptCounters"][key] >= store.state["providerAttemptLimit"]:
                 return "waiting-provider"
             continue
         data = _provider_json(view)
         current = normalize_pr(store.state, data) if store.state.get("provider") == "azure-devops" else data
         if current.get("headRefOid") != reviewed_sha:
+            progress("sha-drift", next_action="repair")
             return "sha-drift"
         if str(current.get("state", "")).upper() == "MERGED":
+            progress("merged", next_action="reconcile")
             return "merged"
         if str(current.get("state", "")).upper() == "CLOSED":
+            progress("closed", next_action="user")
             return "failed"
         if store.state.get("provider") == "azure-devops":
             merge_status = str(data.get("mergeStatus", "")).lower()
@@ -1171,30 +1301,42 @@ def wait_for_checks(store: StateStore, assignment_id: str, pr: dict, reviewed_sh
                     return "waiting-provider"
                 continue
             if set(blocking) & {"rejected", "broken"} or merge_status == "failure":
+                progress("failed", dict(Counter(blocking)), "repair")
                 return "failed"
             if set(blocking) & {"queued", "running"} or merge_status == "queued":
+                progress("pending", dict(Counter(blocking)), "poll")
                 time.sleep(min(10, max(0, deadline - time.time())))
                 continue
             if any(status not in {"approved", "notapplicable"} for status in blocking):
+                progress("failed", dict(Counter(blocking)), "user")
                 return "failed"
             if merge_status == "rejectedbypolicy":
+                progress("rejected-by-policy", dict(Counter(blocking)), "user")
                 return "waiting-provider"
+            progress("passed", dict(Counter(blocking)), "merge")
             return "passed"
         checks = data.get("statusCheckRollup") or []
         states = {str(item.get("conclusion") or item.get("state") or item.get("status", "")).upper() for item in checks}
         if states & {"FAILURE", "FAILED", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED"}:
+            progress("failed", dict(Counter(state.lower() for state in states)), "repair")
             return "failed"
         if states & {"PENDING", "QUEUED", "IN_PROGRESS", "EXPECTED"}:
+            progress("pending", dict(Counter(state.lower() for state in states)), "poll")
             time.sleep(min(10, max(0, deadline - time.time())))
             continue
         if data.get("mergeStateStatus") in {"BEHIND", "DIRTY"}:
+            progress(str(data.get("mergeStateStatus")).lower(), next_action="repair")
             return "repair-required"
         if data.get("mergeStateStatus") == "UNKNOWN":
+            progress("mergeability-unknown", next_action="poll")
             time.sleep(min(10, max(0, deadline - time.time())))
             continue
         if data.get("mergeStateStatus") == "BLOCKED":
+            progress("blocked", next_action="user")
             return "waiting-provider"
+        progress("passed", next_action="merge")
         return "passed"
+    progress("deadline-expired", next_action="resume")
     return "waiting-provider"
 
 
@@ -1205,6 +1347,8 @@ def merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignme
     while status in {"failed", "repair-required"}:
         if session["repairAttemptsStarted"] >= store.state["fixLoopLimit"] or session["reviewCallsStarted"] + 2 > session["reviewCallLimit"]:
             store.update(lambda state: state["taskStates"][assignment_id].update(phase="needs-user", providerStatus=status))
+            console("BLOCKED", f"operation=provider-checks assignment={assignment_id} reason={status} log={store.path.parent / 'logs' / 'provider.log'}")
+            clear_operation(store, assignment_id)
             return False
         store.update(lambda state: state["reviewSessions"][assignment_id].__setitem__("repairAttemptsStarted", state["reviewSessions"][assignment_id]["repairAttemptsStarted"] + 1))
         blocker = [{"id": f"PROVIDER-{session['repairAttemptsStarted']}", "failure": status, "evidence": f"{provider_name(store.state)} checks or merge readiness failed"}]
@@ -1224,12 +1368,14 @@ def merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignme
             store.update(lambda state: state["taskStates"][assignment_id].update(error=str(error)))
             if session["repairAttemptsStarted"] >= store.state["fixLoopLimit"] or session["reviewCallsStarted"] >= session["reviewCallLimit"]:
                 store.update(lambda state: state["taskStates"][assignment_id].update(phase="needs-user", providerStatus=status))
+                clear_operation(store, assignment_id)
                 return False
             status = "failed"
             continue
         if verification["status"] != "resolved":
             if session["repairAttemptsStarted"] >= store.state["fixLoopLimit"]:
                 store.update(lambda state: state["taskStates"][assignment_id].update(phase="needs-user", providerStatus=status))
+                clear_operation(store, assignment_id)
                 return False
             status = "failed"
             continue
@@ -1240,13 +1386,20 @@ def merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignme
         status = wait_for_checks(store, assignment_id, pr, reviewed_sha)
     if status == "merged":
         store.update(lambda state: (state["taskStates"][assignment_id].update(phase="integrated", merged=True, providerStatus="passed"), state["pullRequests"][assignment_id].update(state="MERGED")))
+        console("DONE", f"operation=merge assignment={assignment_id} pr={pr['number']} source=provider")
+        clear_operation(store, assignment_id)
         return True
     if status != "passed":
         store.update(lambda state: state["taskStates"][assignment_id].update(phase="needs-user" if status in {"failed", "sha-drift"} else "waiting-provider", providerStatus=status))
+        console("BLOCKED", f"operation=provider-checks assignment={assignment_id} pr={pr['number']} reason={status} log={store.path.parent / 'logs' / 'provider.log'}")
+        clear_operation(store, assignment_id)
         return False
+    start_operation(store, assignment_id, "merge", store.state["providerTimeoutSeconds"])
+    console("START", f"operation=merge assignment={assignment_id} pr={pr['number']} deadline={store.state['providerTimeoutSeconds']}s")
     pr_merge(store, f"{assignment_id}:merge", pr["number"])
     store.update(lambda state: (state["taskStates"][assignment_id].update(phase="integrated", merged=True, providerStatus="passed"), state["pullRequests"][assignment_id].update(state="MERGED")))
-    console("MERGED", f"assignment={assignment_id} pr={pr['number']}")
+    console("DONE", f"operation=merge assignment={assignment_id} pr={pr['number']}")
+    clear_operation(store, assignment_id, "merge")
     return True
 
 
@@ -1350,6 +1503,8 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
         if not sha:
             task_state["phase"] = "needs-user"
             store.save()
+            console("BLOCKED", f"operation=worker assignment={assignment_id} reason={task_state.get('error', 'attempt budget exhausted')}")
+            clear_operation(store, assignment_id)
             return False
         pr = publish_candidate(store, assignment, worktree, branch, sha)
         task_state["phase"] = "initial-review"
@@ -1357,10 +1512,13 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
         if not run_review(store, semaphore, assignment, worktree, sha):
             task_state["phase"] = "needs-user"
             store.save()
+            console("BLOCKED", f"operation=internal-review assignment={assignment_id} reason={task_state.get('error', 'review requires user')}")
+            clear_operation(store, assignment_id)
             return False
         session = store.state["reviewSessions"][assignment_id]
         task_state["phase"] = "approved"
         store.save()
+        console("DONE", f"operation=approve assignment={assignment_id} sha={session['reviewedSha'][:12]}")
         if not merge_assignment(store, semaphore, assignment, worktree, branch, pr, session["reviewedSha"]):
             return False
         if mode == "task":
@@ -1378,6 +1536,9 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
     except (RuntimeError, ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
         task_state.update(phase="needs-user", error=str(error))
         store.save()
+        log = re.search(r"log:\s*([^\r\n]+)", str(error))
+        console("FAILED", f"operation={task_state.get('operation', 'assignment')} assignment={assignment_id} reason={str(error).splitlines()[0]}" + (f" log={log.group(1)}" if log else ""))
+        clear_operation(store, assignment_id)
         return False
 
 
@@ -1496,7 +1657,7 @@ def provider_preflight(store: StateStore) -> None:
     if not store.state.get("provider") and store.state.get("githubRepository"):
         store.update(lambda state: state.__setitem__("provider", "github"))
     if store.state.get("preflightCompleted"):
-        console("PROVIDER", provider_name(store.state))
+        console("DONE", f"operation=provider-preflight provider={provider_name(store.state)} cached=true")
         if store.state.get("provider") == "azure-devops" and store.state["mergeMethod"] == "rebase":
             raise RuntimeError("Azure DevOps does not support Relay's rebase merge method; use squash or merge")
         return
@@ -1509,7 +1670,7 @@ def provider_preflight(store: StateStore) -> None:
             raise
         identity = {"provider": "github", "githubRepository": "fake/relay"}
     store.update(lambda state: state.update(identity))
-    console("PROVIDER", provider_name(store.state))
+    console("START", f"operation=provider-preflight provider={provider_name(store.state)}")
     if identity["provider"] == "azure-devops":
         if store.state["mergeMethod"] == "rebase":
             raise RuntimeError("Azure DevOps does not support Relay's rebase merge method; use squash or merge")
@@ -1519,6 +1680,7 @@ def provider_preflight(store: StateStore) -> None:
         provider_with_retries(store, "preflight:auth", "auth", "status")
         provider_with_retries(store, "preflight:repo", "repo", "view", identity["githubRepository"])
     store.update(lambda state: state.__setitem__("preflightCompleted", True))
+    console("DONE", f"operation=provider-preflight provider={provider_name(store.state)}")
 
 
 # Kept for callers that imported the old internal name.
@@ -1541,6 +1703,8 @@ def _agents_bootstrap_needs_user(store: StateStore, status: str) -> bool:
         state["agentsBootstrap"].update(phase="needs-user", providerStatus=status)
         state["phase"] = "needs-user"
     store.update(update)
+    console("BLOCKED", f"operation={store.state['agentsBootstrap'].get('operation', 'bootstrap')} assignment=AGENTS reason={status} log={store.path.parent / 'logs' / 'provider.log'}")
+    clear_operation(store, "AGENTS")
     return False
 
 
@@ -1629,6 +1793,8 @@ def reconcile_agents_bootstrap(store: StateStore) -> bool:
             raise RuntimeError("working AGENTS.md does not match generated content")
         cleanup_worktree(store, "AGENTS")
         store.update(lambda state: (state["agentsBootstrap"].update(phase="complete", providerStatus="passed"), state.update(phase="build", targetInstructions=content.decode("utf-8"))))
+        console("DONE", "operation=merge assignment=AGENTS")
+        clear_operation(store, "AGENTS")
         return True
     except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
         return _agents_bootstrap_needs_user(store, str(error))
@@ -1739,6 +1905,11 @@ def reconcile(store: StateStore) -> None:
     for task_state in store.state.get("taskStates", {}).values():
         if task_state.get("phase") == "waiting-provider":
             task_state["phase"] = "resume-provider"
+        for field in OPERATION_FIELDS:
+            task_state.pop(field, None)
+    if store.state.get("agentsBootstrap"):
+        for field in OPERATION_FIELDS:
+            store.state["agentsBootstrap"].pop(field, None)
     store.save()
     for task in load_tasks(store):
         task_state = store.state.get("taskStates", {}).get(task["id"], {})
@@ -1764,15 +1935,22 @@ def reconcile(store: StateStore) -> None:
 
 
 def heartbeat_loop(store: StateStore, stop: threading.Event) -> None:
-    while not stop.wait(min(30, max(1, store.state["agentTimeoutSeconds"] // 2))):
-        store.save()
-        running = sum(process.get("status", "running") == "running" for process in store.state["activeProcesses"].values())
-        console("ACTIVE", f"processes={running}/{store.state['workerLimit']} phase={store.state['phase']}")
+    save_interval = min(30, max(1, store.state["agentTimeoutSeconds"] // 2))
+    last_save = time.monotonic()
+    relay_console.update(runtime_progress(store.state))
+    while not stop.wait(1):
+        if relay_console.interactive():
+            relay_console.update(runtime_progress(store.state))
+        if time.monotonic() - last_save >= save_interval:
+            store.save()
+            last_save = time.monotonic()
 
 
 def run_assignments(store: StateStore, semaphore: threading.Semaphore, assignments: list[dict], mode: str) -> None:
     pending = {item["id"]: item for item in assignments if item["status"] != "satisfied"}
     satisfied = {item["id"] for item in assignments if item["status"] == "satisfied"}
+    if pending:
+        store.update(lambda state: state.__setitem__("phase", "build"))
     running, active_paths = {}, set()
     with ThreadPoolExecutor(max_workers=max(1, len(pending))) as pool:
         while pending or running:
@@ -1856,7 +2034,10 @@ def report_stopped(state: dict) -> None:
     blocked = blocked_assignments(state)
     stderr_event("STOPPED", f"phase={state.get('phase', 'unknown')} assignments={len(blocked)}")
     for assignment_id, reason in blocked:
-        stderr_event("BLOCKED", f"assignment={assignment_id} reason={' '.join(reason.splitlines())}")
+        compact = " ".join(reason.splitlines())
+        match = re.search(r"log:\s*([^\r\n]+)", reason)
+        log = match.group(1) if match else "not-recorded"
+        stderr_event("BLOCKED", f"assignment={assignment_id} reason={compact} log={log}")
 
 
 def permanent_cleanup(repo: Path, confirm: bool) -> int:
@@ -1910,6 +2091,7 @@ def initialize_campaign(repo: Path, text: str, args: argparse.Namespace) -> tupl
     relay.mkdir(parents=True, exist_ok=False)
     (relay / "logs").mkdir()
     state = initial_state(repo, metadata, args)
+    state["taskTotal"] = len(tasks)
     repository_root, prefix = repository_layout(repo, args.provider_timeout)
     state.update(repositoryRoot=str(repository_root), repositoryPrefix=prefix)
     state["campaignId"] = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -1947,7 +2129,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             return permanent_cleanup(repo, args.confirm)
         except (RuntimeError, ValueError, OSError, json.JSONDecodeError) as error:
-            print(f"run.py: {error}", file=sys.stderr)
+            relay_console.emit("FAILED", operation="cleanup", reason=str(error).splitlines()[0])
+            relay_console.close()
             return 1
     stdin_text = sys.stdin.read() if not sys.stdin.isatty() else ""
     relay_state = repo / ".relay" / "state.json"
@@ -1982,7 +2165,7 @@ def main(argv: list[str] | None = None) -> int:
             parse_tasks(text)
             store, tasks = initialize_campaign(repo, text, args)
             resuming = False
-        print(f"Relay\nRepository:   {repo}\nWorkers:      {store.state['workerLimit']} configured\nFix loops:    {store.state['fixLoopLimit']}\nReview calls: {review_call_limit(store.state['fixLoopLimit'], store.state['formatRetryAllowance'])} maximum per candidate")
+        stderr_event("START", f"operation=campaign campaign={store.state['campaignId']} workers={store.state['workerLimit']} tasks={store.state.get('taskTotal', len(tasks or []))}")
         with coordinator_lock(store.path.parent):
             if resuming:
                 reconcile(store)
@@ -1995,18 +2178,23 @@ def main(argv: list[str] | None = None) -> int:
                     result = execute_campaign(store, tasks)
                     if result:
                         report_stopped(store.state)
+                    else:
+                        stderr_event("COMPLETE", f"operation=campaign integrated={store.state.get('taskTotal', len(tasks))}/{store.state.get('taskTotal', len(tasks))}")
                     return result
                 except KeyboardInterrupt:
                     terminate_children()
                     for process in store.state["activeProcesses"].values():
                         process["interrupted"] = True
                     store.update(lambda state: state.update(phase="interrupted", interruptedAt=datetime.now(timezone.utc).isoformat()))
+                    stderr_event("STOPPED", "operation=campaign reason=interrupted")
                     return 130
             finally:
                 stop.set()
                 heartbeat.join()
+                relay_console.close()
     except (RuntimeError, ValueError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
-        print(f"run.py: {error}", file=sys.stderr)
+        relay_console.emit("FAILED", operation="campaign", reason=str(error).splitlines()[0])
+        relay_console.close()
         return 1
 
 
