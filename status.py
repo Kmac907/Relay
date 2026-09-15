@@ -106,6 +106,8 @@ def main(argv: list[str] | None = None) -> int:
         print("\nRecovery")
         for assignment_id, count in sorted(state.get("recoveryAttemptGrants", {}).items()):
             print(f"  {assignment_id}: grants={count} started={state.get('recoveryAttemptsStarted', {}).get(assignment_id, 0)}")
+        for assignment_id, paths in sorted(state.get("recoveryAllowedPaths", {}).items()):
+            print(f"  {assignment_id}: adopted user deletions={','.join(paths)}")
         pending = state.get("pendingRecovery") or {}
         for action in pending.get("actions", []):
             key = f"{action['action']}:{action['assignmentId']}"

@@ -849,8 +849,12 @@ def allowed_change(path: str, allowed: list[str]) -> bool:
     return any(normalized == item.replace("\\", "/").strip("/") or normalized.startswith(item.replace("\\", "/").strip("/") + "/") for item in allowed)
 
 
-def target_changes(store: StateStore, worktree: Path, base: str, sha: str) -> list[str]:
-    changed = [item for item in git(worktree, "diff", "--name-only", f"{base}..{sha}", timeout=store.state["validationTimeoutSeconds"]).stdout.splitlines() if item]
+def assignment_paths(store: StateStore, assignment: dict) -> list[str]:
+    return assignment["allowedPaths"] + store.state.get("recoveryAllowedPaths", {}).get(assignment["id"], [])
+
+
+def target_git_paths(store: StateStore, worktree: Path, *args: str) -> list[str]:
+    changed = [item for item in git(worktree, *args, timeout=store.state["validationTimeoutSeconds"]).stdout.splitlines() if item]
     prefix = store.state.get("repositoryPrefix", "")
     if not prefix:
         return changed
@@ -858,6 +862,10 @@ def target_changes(store: StateStore, worktree: Path, base: str, sha: str) -> li
     if any(not item.startswith(marker) for item in changed):
         raise ValueError("candidate changed paths outside target directory")
     return [item[len(marker):] for item in changed]
+
+
+def target_changes(store: StateStore, worktree: Path, base: str, sha: str) -> list[str]:
+    return target_git_paths(store, worktree, "diff", "--name-only", f"{base}..{sha}")
 
 
 def _output(value: str | bytes | None) -> str:
@@ -915,7 +923,7 @@ def validate_candidate(store: StateStore, assignment: dict, worktree: Path, resu
     if ancestry.returncode:
         raise ValueError("candidate does not descend from expected base")
     changed = target_changes(store, worktree, assignment_base, sha)
-    outside = sorted(item for item in changed if not allowed_change(item, assignment["allowedPaths"]))
+    outside = sorted(item for item in changed if not allowed_change(item, assignment_paths(store, assignment)))
     if outside:
         raise ValueError(f"candidate changed paths outside assignment scope: {', '.join(outside)}")
     store.update(lambda state: state["taskStates"][assignment["id"]].__setitem__("validationShellVersion", 2))
@@ -1257,7 +1265,7 @@ def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: di
             number = int(session["phase"].split("-")[1])
             blockers = [bug for bug in load_bugs(store) if bug["id"] in session["acceptedBlockerIds"]]
             if session["phase"].startswith("repair-"):
-                outside = sorted({path for bug in blockers for path in bug.get("allowedPaths", []) if not allowed_change(path, assignment["allowedPaths"])})
+                outside = sorted({path for bug in blockers for path in bug.get("allowedPaths", []) if not allowed_change(path, assignment_paths(store, assignment))})
                 if outside:
                     store.state["taskStates"][assignment_id]["error"] = f"accepted blocker requires paths outside assignment scope: {', '.join(outside)}"
                     transition_review(session, "needs-user", store.state["fixLoopLimit"])
@@ -1973,6 +1981,18 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str], gra
             actions.append({"action": "resume-publish", "assignmentId": assignment_id, "candidateSha": candidate})
             handled.add(assignment_id)
             continue
+        if error.startswith("candidate changed paths outside assignment scope:"):
+            worktree, record = recovery_worktree(store, assignment_id)
+            head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
+            dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout
+            changed = target_changes(store, worktree, record["baseSha"], head)
+            outside = sorted(path for path in changed if not allowed_change(path, assignment_paths(store, assignment)))
+            candidate_deletions = set(target_git_paths(store, worktree, "diff", "--name-only", "--diff-filter=D", f"{record['baseSha']}..{head}"))
+            user_deletions = set(target_git_paths(store, Path(store.state["repository"]), "diff", "--name-only", "--diff-filter=D"))
+            if not dirty and outside and set(outside) <= candidate_deletions & user_deletions:
+                actions.append({"action": "adopt-user-deletions", "assignmentId": assignment_id, "headSha": head, "paths": outside})
+                handled.add(assignment_id)
+                continue
         session = store.state.get("reviewSessions", {}).get(assignment_id)
         if not session:
             continue
@@ -2053,6 +2073,16 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
             store.state["reviewSessions"][assignment_id]["phase"] = f"repair-{action['repair']}"
             task_state.update(phase=f"repair-{action['repair']}")
             task_state.pop("error", None)
+        elif action["action"] == "adopt-user-deletions":
+            worktree, _ = recovery_worktree(store, assignment_id)
+            head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
+            dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout
+            user_deletions = set(target_git_paths(store, Path(store.state["repository"]), "diff", "--name-only", "--diff-filter=D"))
+            if head != action["headSha"] or dirty or not set(action["paths"]) <= user_deletions:
+                raise RuntimeError(f"user-owned deletion changed during recovery: {assignment_id}")
+            allowed = store.state.setdefault("recoveryAllowedPaths", {}).setdefault(assignment_id, [])
+            allowed.extend(path for path in action["paths"] if path not in allowed)
+            validate_candidate(store, by_id[assignment_id], worktree, {"candidateSha": head})
         elif action["action"] == "defer-review":
             worktree, record = recovery_worktree(store, assignment_id)
             head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()

@@ -721,6 +721,27 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(store.state["reviewSessions"][assignment["id"]]["phase"], "repair-1")
             self.assertEqual(store.state["reviewSessions"][assignment["id"]]["repairAttemptsStarted"], 0)
 
+    def test_recovery_adopts_only_matching_user_owned_deletions(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            store.state.update(phase="needs-user")
+            store.state["taskStates"][assignment["id"]] = {"phase": "needs-user", "error": "candidate changed paths outside assignment scope: removed.txt"}
+            record = {"branch": "branch", "baseSha": "base"}
+            def recovery_git(repo_path, *args, **kwargs):
+                return subprocess.CompletedProcess([], 0, "head\n" if args[0] == "rev-parse" else "", "")
+            def paths(store_value, repo_path, *args):
+                return ["src/ok.txt", "removed.txt"] if "--diff-filter=D" not in args else ["removed.txt"]
+            with patch("run.recovery_worktree", return_value=(Path(root), record)), patch("run.git", side_effect=recovery_git), patch("run.target_git_paths", side_effect=paths), patch("run.target_changes", return_value=["src/ok.txt", "removed.txt"]):
+                actions = run.plan_recovery(store, [assignment], [], [])
+            self.assertEqual(actions, [{"action": "adopt-user-deletions", "assignmentId": assignment["id"], "headSha": "head", "paths": ["removed.txt"]}])
+            def validate(store_value, assignment_value, worktree, result):
+                self.assertEqual(run.assignment_paths(store_value, assignment_value), ["src", "removed.txt"])
+                return "head"
+            with patch("run.recovery_worktree", return_value=(Path(root), record)), patch("run.git", side_effect=recovery_git), patch("run.target_git_paths", return_value=["removed.txt"]), patch("run.validate_candidate", side_effect=validate):
+                run.apply_recovery(store, [assignment], actions)
+            self.assertEqual(store.state["recoveryAllowedPaths"][assignment["id"]], ["removed.txt"])
+
     def test_detects_supported_provider_remotes_and_decodes_names(self):
         cases = {
             "https://github.com/owner/repo.git": ("github", "owner/repo"),
