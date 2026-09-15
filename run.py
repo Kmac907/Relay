@@ -421,10 +421,26 @@ def safe_within(path: Path, root: Path) -> Path:
     return resolved
 
 
+def repository_layout(repo: Path, timeout: int = 300) -> tuple[Path, str]:
+    target = repo.resolve()
+    root = Path(git(target, "rev-parse", "--show-toplevel", timeout=timeout).stdout.strip()).resolve()
+    if target != root and root not in target.parents:
+        raise ValueError("repository path is outside its Git worktree")
+    relative = target.relative_to(root)
+    return root, "" if relative == Path(".") else relative.as_posix()
+
+
+def repository_path(state: dict, name: str) -> str:
+    prefix = state.get("repositoryPrefix", "")
+    return f"{prefix}/{name}" if prefix else name
+
+
 def exclude_relay_files(repo: Path) -> None:
-    exclude = repo / ".git" / "info" / "exclude"
+    _, prefix = repository_layout(repo)
+    value = Path(git(repo, "rev-parse", "--git-path", "info/exclude").stdout.strip())
+    exclude = value if value.is_absolute() else repo.resolve() / value
     existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
-    entries = ["tasks.md", "bugs.md", ".relay/"]
+    entries = [f"{prefix}/{name}" if prefix else name for name in ("tasks.md", "bugs.md", ".relay/")]
     missing = [entry for entry in entries if entry not in existing.splitlines()]
     if missing:
         atomic_write(exclude, existing + ("" if not existing or existing.endswith("\n") else "\n") + "\n".join(missing) + "\n")
@@ -665,15 +681,17 @@ def create_worktree(store: StateStore, assignment: dict) -> tuple[Path, str]:
         if existing:
             return Path(existing["path"]), existing["branch"]
         campaign_root = Path(tempfile.gettempdir()).resolve() / "relay-worktrees" / store.state["campaignId"]
-        path = safe_within(campaign_root / assignment_id, campaign_root)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        root = safe_within(campaign_root / assignment_id, campaign_root)
+        path = safe_within(root / Path(store.state.get("repositoryPrefix", "")), root)
+        root.parent.mkdir(parents=True, exist_ok=True)
         branch = f"relay/{assignment_id}"
         repository = Path(store.state["repository"])
         git_provider_with_retries(store, f"{assignment_id}:fetch", repository, "fetch", "origin", "main")
         remote_base = git(repository, "rev-parse", "origin/main", timeout=store.state["providerTimeoutSeconds"], check=False)
         assignment_base = remote_base.stdout.strip() if remote_base.returncode == 0 else store.state["baseSha"]
-        git(repository, "worktree", "add", "-b", branch, str(path), assignment_base, timeout=store.state["providerTimeoutSeconds"])
-        store.state["worktrees"][assignment_id] = {"path": str(path), "branch": branch, "baseSha": assignment_base}
+        git(repository, "worktree", "add", "-b", branch, str(root), assignment_base, timeout=store.state["providerTimeoutSeconds"])
+        path.mkdir(parents=True, exist_ok=True)
+        store.state["worktrees"][assignment_id] = {"path": str(path), "root": str(root), "branch": branch, "baseSha": assignment_base}
         store.save()
         return path, branch
 
@@ -681,6 +699,17 @@ def create_worktree(store: StateStore, assignment: dict) -> tuple[Path, str]:
 def allowed_change(path: str, allowed: list[str]) -> bool:
     normalized = path.replace("\\", "/").strip("/")
     return any(normalized == item.replace("\\", "/").strip("/") or normalized.startswith(item.replace("\\", "/").strip("/") + "/") for item in allowed)
+
+
+def target_changes(store: StateStore, worktree: Path, base: str, sha: str) -> list[str]:
+    changed = [item for item in git(worktree, "diff", "--name-only", f"{base}..{sha}", timeout=store.state["validationTimeoutSeconds"]).stdout.splitlines() if item]
+    prefix = store.state.get("repositoryPrefix", "")
+    if not prefix:
+        return changed
+    marker = prefix + "/"
+    if any(not item.startswith(marker) for item in changed):
+        raise ValueError("candidate changed paths outside target directory")
+    return [item[len(marker):] for item in changed]
 
 
 def validate_candidate(store: StateStore, assignment: dict, worktree: Path, result: dict) -> str:
@@ -691,7 +720,7 @@ def validate_candidate(store: StateStore, assignment: dict, worktree: Path, resu
     ancestry = git(worktree, "merge-base", "--is-ancestor", assignment_base, sha, timeout=store.state["validationTimeoutSeconds"], check=False)
     if ancestry.returncode:
         raise ValueError("candidate does not descend from expected base")
-    changed = [item for item in git(worktree, "diff", "--name-only", f"{assignment_base}..{sha}", timeout=store.state["validationTimeoutSeconds"]).stdout.splitlines() if item]
+    changed = target_changes(store, worktree, assignment_base, sha)
     if sorted(changed) != sorted(result["changedPaths"]) or any(not allowed_change(item, assignment["allowedPaths"]) for item in changed):
         raise ValueError("candidate changed paths outside assignment scope")
     for command in assignment["validationCommands"]:
@@ -1166,7 +1195,7 @@ def cleanup_worktree(store: StateStore, assignment_id: str) -> None:
         if not record:
             return
         root = Path(tempfile.gettempdir()).resolve() / "relay-worktrees" / store.state["campaignId"]
-        path = safe_within(Path(record["path"]), root)
+        path = safe_within(Path(record.get("root", record["path"])), root)
         repository = Path(store.state["repository"])
         git(repository, "worktree", "remove", "--force", str(path), timeout=store.state["providerTimeoutSeconds"], check=False)
         git(repository, "branch", "-D", record["branch"], timeout=store.state["providerTimeoutSeconds"], check=False)
@@ -1382,8 +1411,8 @@ def validate_agents_bootstrap(store: StateStore, worktree: Path, sha: str) -> No
     base = bootstrap["baseSha"]
     if git(worktree, "merge-base", "--is-ancestor", base, sha, timeout=store.state["validationTimeoutSeconds"], check=False).returncode:
         raise RuntimeError("AGENTS.md bootstrap does not descend from its base")
-    changed = [line for line in git(worktree, "diff", "--name-only", f"{base}..{sha}", timeout=store.state["validationTimeoutSeconds"]).stdout.splitlines() if line]
-    blob = git(worktree, "show", f"{sha}:AGENTS.md", timeout=store.state["validationTimeoutSeconds"]).stdout.encode()
+    changed = target_changes(store, worktree, base, sha)
+    blob = git(worktree, "show", f"{sha}:{repository_path(store.state, 'AGENTS.md')}", timeout=store.state["validationTimeoutSeconds"]).stdout.encode()
     if changed != ["AGENTS.md"] or hashlib.sha256(blob).hexdigest() != bootstrap["contentHash"] or blob != TARGET_AGENTS.encode():
         raise RuntimeError("AGENTS.md bootstrap candidate is not the exact generated file")
 
@@ -1419,13 +1448,47 @@ def recover_legacy_agents_pr(store: StateStore) -> bool:
     return True
 
 
+def recover_legacy_nested_agents_reconcile(store: StateStore) -> bool:
+    state = store.state
+    bootstrap = state.get("agentsBootstrap") or {}
+    pr = bootstrap.get("pr") or {}
+    status = bootstrap.get("providerStatus")
+    repository = Path(state["repository"])
+    root, prefix = repository_layout(repository, state["providerTimeoutSeconds"])
+    if not (
+        state.get("phase") == bootstrap.get("phase") == "needs-user"
+        and prefix
+        and pr.get("state") == "MERGED"
+        and bootstrap.get("candidateSha") == bootstrap.get("pushedSha")
+        and bootstrap.get("candidateSha")
+        and bootstrap.get("reconcileOperationVersion", 1) == 1
+        and isinstance(status, str) and "No such file or directory" in status and "AGENTS.md" in status
+        and not (repository / "AGENTS.md").exists()
+        and (root / "AGENTS.md").is_file()
+        and (root / "AGENTS.md").read_bytes().replace(b"\r\n", b"\n") == TARGET_AGENTS.encode()
+    ):
+        return False
+    store.update(lambda current: (current["agentsBootstrap"].update(phase="reconciling", providerStatus="recovering-reconcile", reconcileOperationVersion=2), current.__setitem__("phase", "agents-bootstrap")))
+    stderr_event("RECOVER", "assignment=AGENTS operation=reconcile version=2")
+    return True
+
+
 def reconcile_agents_bootstrap(store: StateStore) -> bool:
     repository = Path(store.state["repository"])
+    root, prefix = repository_layout(repository, store.state["providerTimeoutSeconds"])
     agents = repository / "AGENTS.md"
     try:
-        git_provider_with_retries(store, "AGENTS:reconcile-fetch", repository, "fetch", "origin", "main")
+        suffix = "-v2" if store.state["agentsBootstrap"].get("reconcileOperationVersion", 1) == 2 else ""
+        git_provider_with_retries(store, f"AGENTS:reconcile-fetch{suffix}", repository, "fetch", "origin", "main")
         remote_sha = git(repository, "rev-parse", "origin/main", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
-        remote_blob = git(repository, "show", f"{remote_sha}:AGENTS.md", timeout=store.state["validationTimeoutSeconds"]).stdout.encode()
+        relative_agents = repository_path(store.state, "AGENTS.md")
+        shown = git(repository, "show", f"{remote_sha}:{relative_agents}", timeout=store.state["validationTimeoutSeconds"], check=False)
+        if shown.returncode and suffix and prefix:
+            agents, relative_agents = root / "AGENTS.md", "AGENTS.md"
+            shown = git(repository, "show", f"{remote_sha}:{relative_agents}", timeout=store.state["validationTimeoutSeconds"], check=False)
+        if shown.returncode:
+            raise RuntimeError("merged AGENTS.md is missing from target directory")
+        remote_blob = shown.stdout.encode()
         if remote_blob != TARGET_AGENTS.encode():
             raise RuntimeError("merged AGENTS.md does not match generated content")
         head = git(repository, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
@@ -1442,11 +1505,11 @@ def reconcile_agents_bootstrap(store: StateStore) -> bool:
             git(repository, "restore", "--source", "origin/main", "--", "AGENTS.md", timeout=store.state["validationTimeoutSeconds"])
         if agents.read_bytes().replace(b"\r\n", b"\n") == TARGET_AGENTS.encode():
             agents.write_bytes(TARGET_AGENTS.encode())
-        _, content = target_instructions(repository)
+        content = agents.read_bytes()
         if content != TARGET_AGENTS.encode():
             raise RuntimeError("working AGENTS.md does not match generated content")
         cleanup_worktree(store, "AGENTS")
-        store.update(lambda state: (state["agentsBootstrap"].update(phase="complete", providerStatus="passed"), state.update(phase="build", targetInstructions=TARGET_AGENTS)))
+        store.update(lambda state: (state["agentsBootstrap"].update(phase="complete", providerStatus="passed"), state.update(phase="build", targetInstructions=content.decode("utf-8"))))
         return True
     except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
         return _agents_bootstrap_needs_user(store, str(error))
@@ -1468,19 +1531,21 @@ def bootstrap_agents(store: StateStore) -> bool:
     store.update(lambda state: state.update(phase="agents-bootstrap"))
     try:
         worktree = Path(bootstrap["worktree"])
+        worktree_root = Path(bootstrap.get("worktreeRoot", worktree))
         branch = bootstrap["branch"]
         if not bootstrap.get("candidateSha"):
-            if not worktree.exists():
-                worktree.parent.mkdir(parents=True, exist_ok=True)
+            if not worktree_root.exists():
+                worktree_root.parent.mkdir(parents=True, exist_ok=True)
                 branch_exists = git(repository, "show-ref", "--verify", f"refs/heads/{branch}", timeout=store.state["providerTimeoutSeconds"], check=False).returncode == 0
                 if branch_exists:
-                    git(repository, "worktree", "add", str(worktree), branch, timeout=store.state["providerTimeoutSeconds"])
+                    git(repository, "worktree", "add", str(worktree_root), branch, timeout=store.state["providerTimeoutSeconds"])
                 else:
-                    git(repository, "worktree", "add", "-b", branch, str(worktree), bootstrap["baseSha"], timeout=store.state["providerTimeoutSeconds"])
-            top = git(worktree, "rev-parse", "--show-toplevel", timeout=store.state["providerTimeoutSeconds"]).stdout.strip()
-            if Path(top).resolve() != worktree.resolve():
+                    git(repository, "worktree", "add", "-b", branch, str(worktree_root), bootstrap["baseSha"], timeout=store.state["providerTimeoutSeconds"])
+            top = git(worktree_root, "rev-parse", "--show-toplevel", timeout=store.state["providerTimeoutSeconds"]).stdout.strip()
+            if Path(top).resolve() != worktree_root.resolve():
                 raise RuntimeError("AGENTS.md bootstrap worktree mismatch")
-            store.update(lambda state: state["worktrees"].__setitem__("AGENTS", {"path": str(worktree), "branch": branch, "baseSha": bootstrap["baseSha"]}))
+            worktree.mkdir(parents=True, exist_ok=True)
+            store.update(lambda state: state["worktrees"].__setitem__("AGENTS", {"path": str(worktree), "root": str(worktree_root), "branch": branch, "baseSha": bootstrap["baseSha"]}))
             worktree_agents = worktree / "AGENTS.md"
             if os.path.lexists(worktree_agents):
                 if not worktree_agents.is_file() or worktree_agents.read_bytes() != TARGET_AGENTS.encode():
@@ -1535,6 +1600,13 @@ def bootstrap_agents(store: StateStore) -> bool:
 
 
 def reconcile(store: StateStore) -> None:
+    repository = Path(store.state["repository"])
+    if git(repository, "rev-parse", "--show-toplevel", timeout=store.state["providerTimeoutSeconds"], check=False).returncode == 0:
+        root, prefix = repository_layout(repository, store.state["providerTimeoutSeconds"])
+        if store.state.get("repositoryRoot") != str(root) or store.state.get("repositoryPrefix") != prefix:
+            store.state.update(repositoryRoot=str(root), repositoryPrefix=prefix)
+            store.save()
+        exclude_relay_files(repository)
     metadata, _ = parse_tasks((Path(store.state["repository"]) / "tasks.md").read_text(encoding="utf-8"), runtime=True)
     store.state.setdefault("requirementsHash", metadata["requirementsHash"])
     recover_pending_ledger(store)
@@ -1612,6 +1684,7 @@ def run_assignments(store: StateStore, semaphore: threading.Semaphore, assignmen
 def execute_campaign(store: StateStore, tasks: list[dict]) -> int:
     semaphore = threading.Semaphore(store.state["workerLimit"])
     recover_legacy_agents_pr(store)
+    recover_legacy_nested_agents_reconcile(store)
     if (store.state.get("agentsBootstrap") or {}).get("phase") == "needs-user":
         store.update(lambda state: state.__setitem__("phase", "needs-user"))
         return 2
@@ -1688,9 +1761,13 @@ def permanent_cleanup(repo: Path, confirm: bool) -> int:
     tasks.unlink()
     bugs.unlink()
     shutil.rmtree(relay)
-    exclude = root / ".git" / "info" / "exclude"
+    prefix = state.get("repositoryPrefix", "")
+    found = git(root, "rev-parse", "--git-path", "info/exclude", check=False)
+    value = Path(found.stdout.strip()) if found.returncode == 0 else Path(".git/info/exclude")
+    exclude = value if value.is_absolute() else root / value
     if exclude.is_file():
-        lines = [line for line in exclude.read_text(encoding="utf-8").splitlines() if line not in {"tasks.md", "bugs.md", ".relay/"}]
+        entries = {f"{prefix}/{name}" if prefix else name for name in ("tasks.md", "bugs.md", ".relay/")}
+        lines = [line for line in exclude.read_text(encoding="utf-8").splitlines() if line not in entries]
         atomic_write(exclude, "\n".join(lines) + ("\n" if lines else ""))
     return 0
 
@@ -1711,9 +1788,11 @@ def initialize_campaign(repo: Path, text: str, args: argparse.Namespace) -> tupl
     relay.mkdir(parents=True, exist_ok=False)
     (relay / "logs").mkdir()
     state = initial_state(repo, metadata, args)
+    repository_root, prefix = repository_layout(repo, args.provider_timeout)
+    state.update(repositoryRoot=str(repository_root), repositoryPrefix=prefix)
     state["campaignId"] = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     state["targetInstructions"] = instructions
-    tracked_agents = git(repo, "cat-file", "-e", f"{metadata['baseSha']}:AGENTS.md", timeout=args.provider_timeout, check=False).returncode == 0
+    tracked_agents = git(repo, "cat-file", "-e", f"{metadata['baseSha']}:{repository_path(state, 'AGENTS.md')}", timeout=args.provider_timeout, check=False).returncode == 0
     generated = agents_content == TARGET_AGENTS.encode()
     marked = agents_content.startswith(GENERATED_AGENTS_MARKER.encode())
     if marked and not generated:
@@ -1721,10 +1800,12 @@ def initialize_campaign(repo: Path, text: str, args: argparse.Namespace) -> tupl
         state["agentsBootstrap"] = {"phase": "needs-user", "contentHash": TARGET_AGENTS_SHA256, "providerStatus": "generated-file-modified", "terminalCondition": "exact generated AGENTS.md merged into main"}
     elif generated and not tracked_agents:
         branch = f"relay/agents-bootstrap-{state['campaignId']}"
-        worktree = safe_within(Path(tempfile.gettempdir()).resolve() / "relay-worktrees" / state["campaignId"] / "AGENTS", Path(tempfile.gettempdir()).resolve() / "relay-worktrees" / state["campaignId"])
+        campaign_root = Path(tempfile.gettempdir()).resolve() / "relay-worktrees" / state["campaignId"]
+        worktree_root = safe_within(campaign_root / "AGENTS", campaign_root)
+        worktree = safe_within(worktree_root / Path(prefix), worktree_root)
         state["agentsBootstrap"] = {
             "phase": "pending", "contentHash": TARGET_AGENTS_SHA256, "baseSha": metadata["baseSha"],
-            "branch": branch, "worktree": str(worktree), "candidateSha": "", "pushedSha": "", "pr": None,
+            "branch": branch, "worktree": str(worktree), "worktreeRoot": str(worktree_root), "candidateSha": "", "pushedSha": "", "pr": None,
             "providerStatus": "pending", "terminalCondition": "exact generated AGENTS.md merged into main",
         }
     store = StateStore(relay / "state.json", state)
