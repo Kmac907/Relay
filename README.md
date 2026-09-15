@@ -86,6 +86,8 @@ For an existing repository, skip `repo.py` and run `plan.py` against its selecte
 
 `plan.py` reads the requirements, tracked tree, selected base SHA, and target instructions. For a nontrivial repository it runs fixed, read-only scout scopes concurrently, then a read-only Planning PM produces a bounded task graph. Relay validates the structured result before it writes anything.
 
+Planner attempts report `START`, `WAIT`, `DONE`, `RETRY`, and `FAILED` lifecycle events on stderr. Agent stdout and stderr remain captured separately.
+
 On success, planning exclusively creates `PLAN.md`, then exclusively creates `AGENTS.md` if it is still missing. Existing files or other filesystem entries are preserved. When `AGENTS.md` was initially missing, scouts and the Planning PM receive the same generic rules in memory.
 
 `PLAN.md` records each task's dependencies, allowed paths, acceptance criteria, validation commands, attempt limit, and shared fix-loop limit. Relay refuses to start a new campaign if the planned base no longer matches `HEAD`.
