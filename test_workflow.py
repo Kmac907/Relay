@@ -414,12 +414,56 @@ class DeterministicCoreTests(unittest.TestCase):
     def test_azure_pr_create_uses_description_and_validates_sha(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.azure_store(root)
-            body = Path(root) / "body.md"; body.write_text("Candidate: abc\n", encoding="utf-8")
+            body = Path(root) / "body.md"; body.write_text("Relay assignment\r\n\r\nCandidate: abc\r\n", encoding="utf-8")
             completed = subprocess.CompletedProcess([], 0, json.dumps(self.azure_pr()), "")
             with patch("run.provider_with_retries", return_value=completed) as provider:
                 pr = run.pr_create(store, "create", "relay/TASK-0001", "title", body)
             self.assertEqual(pr["headRefOid"], "abc")
-            self.assertIn("Candidate: abc\n", provider.call_args.args)
+            description = provider.call_args.args[provider.call_args.args.index("--description") + 1]
+            self.assertNotRegex(description, r"[\r\n]")
+            self.assertIn("Candidate: abc", description)
+
+    def test_only_exhausted_legacy_azure_bootstrap_pr_is_recovered_once(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.azure_store(root)
+            store.state.update(phase="needs-user", agentsBootstrap={
+                "phase": "needs-user", "candidateSha": "abc", "pushedSha": "abc", "pr": None,
+                "providerStatus": "Azure DevOps operation exhausted attempts: AGENTS:pr-create",
+            })
+            store.state["providerAttemptCounters"]["AGENTS:pr-create"] = store.state["providerAttemptLimit"]
+            with patch("run.stderr_event") as event:
+                self.assertTrue(run.recover_legacy_agents_pr(store))
+            self.assertEqual((store.state["phase"], store.state["agentsBootstrap"]["phase"], store.state["agentsBootstrap"]["prOperationVersion"]), ("agents-bootstrap", "pull-request", 2))
+            event.assert_called_once_with("RECOVER", "assignment=AGENTS operation=pr-create version=2")
+
+            store.state.update(phase="needs-user")
+            store.state["agentsBootstrap"].update(phase="needs-user", providerStatus="Azure DevOps operation exhausted attempts: AGENTS:pr-create-v2")
+            store.state["providerAttemptCounters"]["AGENTS:pr-create-v2"] = store.state["providerAttemptLimit"]
+            self.assertFalse(run.recover_legacy_agents_pr(store))
+            self.assertEqual(store.state["agentsBootstrap"]["prOperationVersion"], 2)
+
+            store.state["agentsBootstrap"].pop("prOperationVersion")
+            store.state["agentsBootstrap"]["providerStatus"] = "generated-file-modified"
+            self.assertFalse(run.recover_legacy_agents_pr(store))
+
+            store.state["agentsBootstrap"].update(providerStatus="Azure DevOps operation exhausted attempts: AGENTS:pr-create", pushedSha="different")
+            self.assertFalse(run.recover_legacy_agents_pr(store))
+
+    def test_stopped_reason_prefers_campaign_then_bootstrap_then_task(self):
+        state = {
+            "phase": "needs-user", "error": "campaign\nfailed",
+            "agentsBootstrap": {"phase": "needs-user", "providerStatus": "bootstrap failed"},
+            "taskStates": {"TASK-0001": {"phase": "needs-user", "error": "task failed"}},
+        }
+        with patch("run.stderr_event") as event:
+            run.report_stopped(state)
+            event.assert_called_with("STOPPED", "phase=needs-user reason=campaign failed")
+            state.pop("error")
+            run.report_stopped(state)
+            event.assert_called_with("STOPPED", "phase=needs-user reason=AGENTS: bootstrap failed")
+            state["agentsBootstrap"]["phase"] = "complete"
+            run.report_stopped(state)
+            event.assert_called_with("STOPPED", "phase=needs-user reason=TASK-0001: task failed")
 
     def test_azure_policy_pass_failure_conflict_and_timeout(self):
         with tempfile.TemporaryDirectory() as root:
@@ -760,6 +804,78 @@ class FakeEndToEndTests(unittest.TestCase):
             self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr + json.dumps(state, indent=2))
             self.assertEqual(state["providerAttemptCounters"]["AGENTS:pr-create"], 1)
 
+    def test_exhausted_legacy_azure_bootstrap_pr_recovers_with_v2_budget(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); target = make_git_repository(root)
+            azure_url = "https://dev.azure.com/org/project/_git/repo"
+            remote = root / "remote.git"
+            subprocess.run(["git", "-C", str(target), "remote", "set-url", "origin", azure_url], check=True)
+            subprocess.run(["git", "-C", str(target), "config", f"url.{remote}.insteadOf", azure_url], check=True)
+            fake_codex, fake_az = root / "fake_codex.py", root / "fake_az.py"
+            fake_codex.write_text(FAKE_CODEX, encoding="utf-8"); fake_az.write_text(FAKE_AZ, encoding="utf-8")
+            provider = root / "provider"; provider.mkdir()
+            requirements = root / "requirements.md"; requirements.write_text("Create one file.", encoding="utf-8")
+            environment = os.environ | {
+                "RELAY_CODEX": f"{sys.executable} {fake_codex}", "RELAY_AZ": f"{sys.executable} {fake_az}",
+                "FAKE_AZ_STATE": str(provider), "FAKE_AZ_REMOTE": str(remote), "FAKE_AZ_FAIL_CREATE_ATTEMPTS": "3",
+            }
+            subprocess.run([sys.executable, str(Path(plan.__file__)), "--repo", str(target), "--requirements", str(requirements)], capture_output=True, text=True, env=environment, check=True)
+            command = [sys.executable, str(Path(run.__file__)), "--repo", str(target), "--agent-timeout", "10", "--validation-timeout", "10", "--provider-timeout", "10", "--provider-check-timeout", "10"]
+
+            first = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=30)
+            state = json.loads((target / ".relay" / "state.json").read_text(encoding="utf-8"))
+            sha = state["agentsBootstrap"]["candidateSha"]
+            self.assertEqual((first.returncode, state["phase"], state["agentsBootstrap"]["phase"]), (2, "needs-user", "needs-user"))
+            self.assertEqual(state["agentsBootstrap"]["pushedSha"], sha)
+            self.assertEqual(state["providerAttemptCounters"]["AGENTS:pr-create"], 3)
+            self.assertEqual(state["taskStates"], {})
+            self.assertIn("STOPPED", first.stderr)
+            self.assertIn("phase=needs-user reason=AGENTS: Azure DevOps operation exhausted attempts: AGENTS:pr-create", first.stderr)
+            self.assertNotIn("simulated legacy create failure", first.stderr)
+            self.assertIn("simulated legacy create failure", (target / ".relay" / "logs" / "provider.log").read_text(encoding="utf-8"))
+
+            resumed = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=60)
+            state = json.loads((target / ".relay" / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr + json.dumps(state, indent=2))
+            self.assertEqual((state["phase"], state["agentsBootstrap"]["phase"], state["agentsBootstrap"]["prOperationVersion"]), ("complete", "complete", 2))
+            self.assertEqual(state["providerAttemptCounters"]["AGENTS:pr-create"], 3)
+            self.assertEqual((state["providerAttemptCounters"]["AGENTS:pr-list-v2"], state["providerAttemptCounters"]["AGENTS:pr-create-v2"]), (1, 1))
+            self.assertEqual((state["providerAttemptCounters"][f"AGENTS:push:{sha}"], state["attemptCounters"]["TASK-0001"]), (1, 1))
+            self.assertEqual(len(list(provider.glob("*.json"))), 2)
+            self.assertEqual(int(git_output(target, "rev-list", "--count", "origin/main")), 2)
+            self.assertEqual(resumed.stderr.count("RECOVER"), 1)
+            self.assertNotIn("STOPPED", resumed.stderr)
+
+    def test_exhausted_v2_azure_bootstrap_pr_stays_terminal(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); target = make_git_repository(root)
+            azure_url = "https://dev.azure.com/org/project/_git/repo"
+            remote = root / "remote.git"
+            subprocess.run(["git", "-C", str(target), "remote", "set-url", "origin", azure_url], check=True)
+            subprocess.run(["git", "-C", str(target), "config", f"url.{remote}.insteadOf", azure_url], check=True)
+            fake_codex, fake_az = root / "fake_codex.py", root / "fake_az.py"
+            fake_codex.write_text(FAKE_CODEX, encoding="utf-8"); fake_az.write_text(FAKE_AZ, encoding="utf-8")
+            provider = root / "provider"; provider.mkdir()
+            requirements = root / "requirements.md"; requirements.write_text("Create one file.", encoding="utf-8")
+            environment = os.environ | {
+                "RELAY_CODEX": f"{sys.executable} {fake_codex}", "RELAY_AZ": f"{sys.executable} {fake_az}",
+                "FAKE_AZ_STATE": str(provider), "FAKE_AZ_REMOTE": str(remote), "FAKE_AZ_FAIL_CREATE_ATTEMPTS": "6",
+            }
+            subprocess.run([sys.executable, str(Path(plan.__file__)), "--repo", str(target), "--requirements", str(requirements)], capture_output=True, text=True, env=environment, check=True)
+            command = [sys.executable, str(Path(run.__file__)), "--repo", str(target), "--agent-timeout", "10", "--validation-timeout", "10", "--provider-timeout", "10", "--provider-check-timeout", "10"]
+            first = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=30)
+            second = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=30)
+            third = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=30)
+            state = json.loads((target / ".relay" / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual((first.returncode, second.returncode, third.returncode), (2, 2, 2))
+            self.assertEqual((state["phase"], state["agentsBootstrap"]["phase"], state["agentsBootstrap"]["prOperationVersion"]), ("needs-user", "needs-user", 2))
+            self.assertEqual((state["providerAttemptCounters"]["AGENTS:pr-create"], state["providerAttemptCounters"]["AGENTS:pr-create-v2"]), (3, 3))
+            self.assertEqual((provider / ".create-attempts").read_text(), "6")
+            self.assertEqual(state["taskStates"], {})
+            self.assertEqual(second.stderr.count("RECOVER"), 1)
+            self.assertNotIn("RECOVER", third.stderr)
+            self.assertIn("phase=needs-user reason=AGENTS: Azure DevOps operation exhausted attempts: AGENTS:pr-create-v2", third.stderr)
+
     def test_parallel_workers_reviews_prs_merge_one_audit_and_complete(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
@@ -986,6 +1102,12 @@ if args[:3] == ["repos", "pr", "list"]:
 if args[:3] == ["repos", "pr", "create"]:
     branch = args[args.index("--source-branch") + 1]
     description = args[args.index("--description") + 1]
+    if "\r" in description or "\n" in description: raise SystemExit("multiline Azure description")
+    attempts = root / ".create-attempts"
+    attempt = int(attempts.read_text()) + 1 if attempts.exists() else 1
+    attempts.write_text(str(attempt))
+    if attempt <= int(os.environ.get("FAKE_AZ_FAIL_CREATE_ATTEMPTS", "0")):
+        print("simulated legacy create failure", file=sys.stderr); raise SystemExit(1)
     sha = re.search(r"Candidate: ([0-9a-f]+)", description).group(1)
     number = int(re.search(r"(\d+)$", branch).group(1))
     record = {"pullRequestId": number, "status": "active", "mergeStatus": "succeeded", "lastMergeSourceCommit": {"commitId": sha}, "branch": branch}
