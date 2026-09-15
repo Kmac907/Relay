@@ -88,6 +88,11 @@ def console(event: str, detail: str) -> None:
         print(f"{datetime.now():%H:%M:%S}  {event:<10} {detail}", flush=True)
 
 
+def stderr_event(event: str, detail: str) -> None:
+    with CONSOLE_LOCK:
+        print(f"{datetime.now():%H:%M:%S}  {event:<10} {detail}", file=sys.stderr, flush=True)
+
+
 def bounded_run(command, *, timeout: int, cwd: Path | None = None, check: bool = True, input: str | None = None, shell: bool = False) -> subprocess.CompletedProcess:
     process = subprocess.Popen(command, cwd=cwd, shell=shell, stdin=subprocess.PIPE if input is not None else None, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", errors="replace", text=True)
     with CHILD_LOCK:
@@ -835,7 +840,7 @@ def pr_inspect(store: StateStore, key: str, identifier: str | int) -> dict:
 
 def pr_create(store: StateStore, key: str, branch: str, title: str, body: Path) -> dict:
     if store.state.get("provider") == "azure-devops":
-        args = ["repos", "pr", "create", "--source-branch", branch, "--target-branch", "main", "--title", title, "--description", body.read_text(encoding="utf-8"), *_azure_context(store.state), "--output", "json"]
+        args = ["repos", "pr", "create", "--source-branch", branch, "--target-branch", "main", "--title", title, "--description", " ".join(body.read_text(encoding="utf-8").splitlines()), *_azure_context(store.state), "--output", "json"]
         return normalize_pr(store.state, _provider_json(provider_with_retries(store, key, *args)))
     provider_with_retries(store, key, "pr", "create", "--base", "main", "--head", branch, "--title", title, "--body-file", str(body), "--repo", store.state.get("githubRepository", "fake/relay"))
     return pr_inspect(store, key.replace("pr-create", "pr-view"), branch)
@@ -1391,6 +1396,29 @@ def _agents_bootstrap_needs_user(store: StateStore, status: str) -> bool:
     return False
 
 
+def recover_legacy_agents_pr(store: StateStore) -> bool:
+    state = store.state
+    bootstrap = state.get("agentsBootstrap") or {}
+    sha = bootstrap.get("candidateSha")
+    limit = state.get("providerAttemptLimit")
+    if not (
+        state.get("provider") == "azure-devops"
+        and state.get("phase") == bootstrap.get("phase") == "needs-user"
+        and not bootstrap.get("pr")
+        and not state.get("pullRequests", {}).get("AGENTS")
+        and isinstance(sha, str) and sha
+        and bootstrap.get("pushedSha") == sha
+        and bootstrap.get("prOperationVersion", 1) == 1
+        and isinstance(limit, int) and limit > 0
+        and state.get("providerAttemptCounters", {}).get("AGENTS:pr-create", 0) >= limit
+        and bootstrap.get("providerStatus") == "Azure DevOps operation exhausted attempts: AGENTS:pr-create"
+    ):
+        return False
+    store.update(lambda current: (current["agentsBootstrap"].update(phase="pull-request", providerStatus="recovering-pr-create", prOperationVersion=2), current.__setitem__("phase", "agents-bootstrap")))
+    stderr_event("RECOVER", "assignment=AGENTS operation=pr-create version=2")
+    return True
+
+
 def reconcile_agents_bootstrap(store: StateStore) -> bool:
     repository = Path(store.state["repository"])
     agents = repository / "AGENTS.md"
@@ -1478,14 +1506,15 @@ def bootstrap_agents(store: StateStore) -> bool:
             store.update(lambda state: state["agentsBootstrap"].update(phase="pull-request", pushedSha=sha))
         pr = bootstrap.get("pr")
         if not pr:
-            matches = pr_discover(store, "AGENTS:pr-list", branch)
+            suffix = "-v2" if bootstrap.get("prOperationVersion", 1) == 2 else ""
+            matches = pr_discover(store, f"AGENTS:pr-list{suffix}", branch)
             if matches:
                 pr = matches[0]
             else:
                 body = store.path.parent / ".AGENTS-pr.md"
                 atomic_write(body, f"Relay generated target instructions\n\nCandidate: {sha}\n")
                 try:
-                    pr = pr_create(store, "AGENTS:pr-create", branch, "Add Relay target instructions", body)
+                    pr = pr_create(store, f"AGENTS:pr-create{suffix}", branch, "Add Relay target instructions", body)
                 finally:
                     body.unlink(missing_ok=True)
             if pr.get("headRefOid") != sha:
@@ -1582,6 +1611,7 @@ def run_assignments(store: StateStore, semaphore: threading.Semaphore, assignmen
 
 def execute_campaign(store: StateStore, tasks: list[dict]) -> int:
     semaphore = threading.Semaphore(store.state["workerLimit"])
+    recover_legacy_agents_pr(store)
     if (store.state.get("agentsBootstrap") or {}).get("phase") == "needs-user":
         store.update(lambda state: state.__setitem__("phase", "needs-user"))
         return 2
@@ -1614,6 +1644,24 @@ def execute_campaign(store: StateStore, tasks: list[dict]) -> int:
     except (RuntimeError, ValueError, subprocess.SubprocessError, json.JSONDecodeError) as error:
         store.update(lambda state: state.update(phase="needs-user", error=str(error)))
         return 2
+
+
+def campaign_stop_reason(state: dict) -> str:
+    if state.get("error"):
+        return str(state["error"])
+    bootstrap = state.get("agentsBootstrap") or {}
+    if bootstrap.get("phase") != "complete" and bootstrap.get("providerStatus"):
+        return f"AGENTS: {bootstrap['providerStatus']}"
+    for assignment_id, task in sorted(state.get("taskStates", {}).items()):
+        if task.get("phase") in {"needs-user", "waiting-provider"}:
+            reason = task.get("error") or task.get("providerStatus") or task["phase"]
+            return f"{assignment_id}: {reason}"
+    return "action required"
+
+
+def report_stopped(state: dict) -> None:
+    reason = " ".join(campaign_stop_reason(state).splitlines())
+    stderr_event("STOPPED", f"phase={state.get('phase', 'unknown')} reason={reason}")
 
 
 def permanent_cleanup(repo: Path, confirm: bool) -> int:
@@ -1741,7 +1789,10 @@ def main(argv: list[str] | None = None) -> int:
             heartbeat.start()
             try:
                 try:
-                    return execute_campaign(store, tasks)
+                    result = execute_campaign(store, tasks)
+                    if result:
+                        report_stopped(store.state)
+                    return result
                 except KeyboardInterrupt:
                     terminate_children()
                     for process in store.state["activeProcesses"].values():
