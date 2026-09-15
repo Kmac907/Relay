@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -104,12 +105,21 @@ def validate_tasks(value: object) -> list[dict]:
 
 
 def validate_scout(value: object, expected_scope: str) -> dict:
-    result = validate_dict(value, SCOUT_SCHEMA, "scout result")
-    if result["scope"] != expected_scope or any(not isinstance(item, str) for key in SCOUT_SCHEMA if key != "scope" for item in result[key]):
-        raise ValueError("scout widened scope or returned invalid evidence")
+    try:
+        result = validate_dict(value, SCOUT_SCHEMA, "scout result")
+    except ValueError as error:
+        raise ValueError(f"scout invalid field: {error}") from error
+    if result["scope"] != expected_scope:
+        raise ValueError(f"scout scope mismatch: expected {expected_scope!r}, got {result['scope']!r}")
+    for key in SCOUT_SCHEMA:
+        if key == "scope":
+            continue
+        if any(not isinstance(item, str) for item in result[key]):
+            raise ValueError(f"scout invalid field: {key} must contain only strings")
     areas = {item.strip() for item in expected_scope.split(",")}
-    if any(not valid_relative_path(path) or path.replace("\\", "/").split("/", 1)[0] not in areas for path in result["relevantPaths"]):
-        raise ValueError("scout returned a path outside its filesystem view")
+    for path in result["relevantPaths"]:
+        if not valid_relative_path(path) or path.replace("\\", "/").split("/", 1)[0] not in areas:
+            raise ValueError(f"scout out-of-scope path: {path!r}")
     return result
 
 
@@ -140,6 +150,12 @@ def json_schema(properties: dict[str, type], array_name: str | None = None) -> d
         return {"type": "array", "items": {"type": "string"}} if kind is list else {"type": "string"}
     item = {"type": "object", "properties": {k: prop(v) for k, v in properties.items()}, "required": list(properties), "additionalProperties": False}
     return {"type": "object", "properties": {array_name: {"type": "array", "items": item}}, "required": [array_name], "additionalProperties": False} if array_name else item
+
+
+def scout_schema(scope: str) -> dict:
+    schema = json_schema(SCOUT_SCHEMA)
+    schema["properties"]["scope"]["enum"] = [scope]
+    return schema
 
 
 def command(tool: str) -> list[str]:
@@ -216,8 +232,13 @@ class CallBudget:
             return self.started
 
 
-def invoke_agent(repo: Path, prompt: str, schema: dict, timeout: int, budget: CallBudget) -> object:
-    budget.consume()
+def heartbeat_interval(timeout: int) -> int:
+    return min(30, max(1, timeout // 2))
+
+
+def invoke_agent(repo: Path, prompt: str, schema: dict, timeout: int, budget: CallBudget | None, wait_detail: str | None = None, started: float | None = None) -> object:
+    if budget is not None:
+        budget.consume()
     with tempfile.TemporaryDirectory(prefix="relay-plan-") as temporary:
         root = Path(temporary)
         schema_path, result_path = root / "schema.json", root / "result.json"
@@ -228,20 +249,50 @@ def invoke_agent(repo: Path, prompt: str, schema: dict, timeout: int, budget: Ca
             "--ephemeral", "--sandbox", "read-only", "--cd", str(repo),
             "--output-schema", str(schema_path), "--output-last-message", str(result_path), "-",
         ]
-        completed = subprocess.run(invocation, input=prompt, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout)
-        if completed.returncode or not result_path.is_file():
-            raise RuntimeError(f"agent failed ({completed.returncode}): {completed.stderr[-500:]}")
+        stop = threading.Event()
+        began = started or time.monotonic()
+        heartbeat = None
+        if wait_detail:
+            def report_wait() -> None:
+                while not stop.wait(heartbeat_interval(timeout)):
+                    progress("WAIT", f"{wait_detail} elapsed={time.monotonic() - began:.1f}s")
+            heartbeat = threading.Thread(target=report_wait, daemon=True)
+            heartbeat.start()
+        try:
+            completed = subprocess.run(invocation, input=prompt, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout)
+        finally:
+            stop.set()
+            if heartbeat:
+                heartbeat.join()
+        if completed.returncode:
+            raise RuntimeError(f"agent failed with exit code {completed.returncode}")
+        if not result_path.is_file():
+            raise RuntimeError("agent returned no result")
         return json.loads(result_path.read_text(encoding="utf-8"))
 
 
-def invoke_validated(repo: Path, prompt: str, schema: dict, validator, timeout: int, budget: CallBudget, retries: int):
+def invoke_validated(repo: Path, prompt: str, schema: dict, validator, timeout: int, budget: CallBudget, retries: int, identity: str = "role=agent"):
     error = None
-    for _ in range(retries + 1):
+    attempts = retries + 1
+    for attempt in range(1, attempts + 1):
         try:
-            return validator(invoke_agent(repo, prompt, schema, timeout, budget))
-        except (ValueError, json.JSONDecodeError, RuntimeError, subprocess.TimeoutExpired) as caught:
+            call = budget.consume()
+        except RuntimeError as caught:
             error = caught
-            if budget.started >= budget.limit:
+            break
+        detail = f"{identity} attempt={attempt}/{attempts} call={call}/{budget.limit} timeout={timeout}s"
+        started = time.monotonic()
+        progress("START", detail)
+        try:
+            result = validator(invoke_agent(repo, prompt, schema, timeout, None, detail, started))
+            progress("DONE", f"{detail} elapsed={time.monotonic() - started:.1f}s")
+            return result
+        except (ValueError, json.JSONDecodeError, RuntimeError, OSError, subprocess.TimeoutExpired) as caught:
+            error = caught
+            reason = "invalid JSON result" if isinstance(caught, json.JSONDecodeError) else "agent timed out" if isinstance(caught, subprocess.TimeoutExpired) else str(caught).splitlines()[0]
+            event = "RETRY" if attempt < attempts and budget.started < budget.limit else "FAILED"
+            progress(event, f"{detail} reason={reason} elapsed={time.monotonic() - started:.1f}s")
+            if event == "FAILED":
                 break
     raise RuntimeError(f"agent did not return valid structured output: {error}") from error
 
@@ -249,6 +300,7 @@ def invoke_validated(repo: Path, prompt: str, schema: dict, validator, timeout: 
 def scout_prompt(scope: str, requirements: str, instructions: str) -> str:
     return f"""Role: Repository Scout (read-only).
 Inspect only this fixed scope: {scope}
+The returned JSON scope value must equal exactly this assigned scope string: {scope}
 Do not edit, spawn agents, widen scope, or propose a task graph.
 Target instructions:\n{instructions}
 Requirements:\n{requirements}
@@ -291,10 +343,10 @@ def main(argv: list[str] | None = None) -> int:
                     progress("SCOUT", f"slot={slot} scope={scope}")
                     snapshot = create_scout_snapshot(repo, files, scope, Path(temporary) / f"scope-{slot}")
                     prompt = scout_prompt(scope, requirements, instructions)
-                    futures.append(pool.submit(invoke_validated, snapshot, prompt, json_schema(SCOUT_SCHEMA), lambda value, expected=scope: validate_scout(value, expected), args.agent_timeout, budget, args.format_retries))
+                    futures.append(pool.submit(invoke_validated, snapshot, prompt, scout_schema(scope), lambda value, expected=scope: validate_scout(value, expected), args.agent_timeout, budget, args.format_retries, f"role=scout slot={slot}"))
                 evidence = [future.result() for future in futures]
         progress("SYNTHESIZE", "role=planning-pm")
-        tasks = invoke_validated(repo, planning_prompt(requirements, instructions, files, base, evidence), json_schema(TASK_SCHEMA, "tasks"), validate_tasks, args.agent_timeout, budget, args.format_retries)
+        tasks = invoke_validated(repo, planning_prompt(requirements, instructions, files, base, evidence), json_schema(TASK_SCHEMA, "tasks"), validate_tasks, args.agent_timeout, budget, args.format_retries, "role=planning-pm")
         progress("VALIDATE", f"tasks={len(tasks)}")
         output = render_tasks(tasks, base, hashlib.sha256(requirements.encode()).hexdigest()[:12], args.task_attempts, args.fix_loops)
         output_path = (args.output or repo / "PLAN.md").resolve()

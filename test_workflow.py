@@ -4,6 +4,8 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -207,11 +209,54 @@ class PlanningTests(unittest.TestCase):
 
     def test_scout_cannot_widen_fixed_scope(self):
         value = {"scope": "elsewhere", "implemented": [], "missing": [], "conflicts": [], "relevantPaths": [], "validationCommands": [], "evidence": []}
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "scout scope mismatch"):
             plan.validate_scout(value, "src")
+        value["scope"], value["evidence"] = "src", [1]
+        with self.assertRaisesRegex(ValueError, "scout invalid field: evidence"):
+            plan.validate_scout(value, "src")
+        value["evidence"], value["relevantPaths"] = [], ["src/file.py"]
+        self.assertIs(plan.validate_scout(value, "src"), value)
         value["scope"], value["relevantPaths"] = "src", ["tests/test_other.py"]
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "scout out-of-scope path"):
             plan.validate_scout(value, "src")
+
+    def test_scout_schema_fixes_assigned_scope(self):
+        self.assertEqual(plan.scout_schema("src, tests")["properties"]["scope"]["enum"], ["src, tests"])
+
+    def test_validated_attempt_events_and_budget_are_bounded(self):
+        valid = {"scope": "src", "implemented": [], "missing": [], "conflicts": [], "relevantPaths": [], "validationCommands": [], "evidence": []}
+        invalid = valid | {"scope": "elsewhere"}
+        events = []
+        budget = plan.CallBudget(2)
+        with patch("plan.invoke_agent", side_effect=[invalid, valid]), patch("plan.progress", side_effect=lambda event, detail: events.append((event, detail))):
+            result = plan.invoke_validated(Path("."), "prompt", plan.scout_schema("src"), lambda value: plan.validate_scout(value, "src"), 10, budget, 1, "role=scout slot=2")
+        self.assertIs(result, valid)
+        self.assertEqual([event for event, _ in events], ["START", "RETRY", "START", "DONE"])
+        self.assertIn("attempt=1/2 call=1/2 timeout=10s", events[0][1])
+        self.assertIn("attempt=2/2 call=2/2 timeout=10s", events[2][1])
+        self.assertEqual(budget.started, 2)
+
+    def test_delayed_agent_emits_wait_while_concurrent_agent_completes(self):
+        result = {"scope": "src", "implemented": [], "missing": [], "conflicts": [], "relevantPaths": [], "validationCommands": [], "evidence": []}
+        events, lock = [], threading.Lock()
+
+        def fake_run(invocation, *, input, **kwargs):
+            time.sleep(.05 if input == "slow" else .002)
+            Path(invocation[invocation.index("--output-last-message") + 1]).write_text(json.dumps(result), encoding="utf-8")
+            return subprocess.CompletedProcess(invocation, 0, "raw stdout", "raw stderr")
+
+        def record(event, detail):
+            with lock:
+                events.append((event, detail))
+
+        budget = plan.CallBudget(2)
+        with tempfile.TemporaryDirectory() as root, patch("plan.subprocess.run", side_effect=fake_run), patch("plan.heartbeat_interval", return_value=.01), patch("plan.progress", side_effect=record):
+            with plan.ThreadPoolExecutor(max_workers=2) as pool:
+                slow = pool.submit(plan.invoke_validated, Path(root), "slow", plan.scout_schema("src"), lambda value: plan.validate_scout(value, "src"), 10, budget, 0, "role=scout slot=1")
+                fast = pool.submit(plan.invoke_validated, Path(root), "fast", plan.scout_schema("src"), lambda value: plan.validate_scout(value, "src"), 10, budget, 0, "role=scout slot=2")
+                self.assertEqual((slow.result(), fast.result()), (result, result))
+        self.assertTrue(any(event == "WAIT" and "slot=1" in detail for event, detail in events))
+        self.assertTrue(any(event == "DONE" and "slot=2" in detail for event, detail in events))
 
     def test_hung_planning_call_consumes_budget(self):
         with tempfile.TemporaryDirectory() as root, patch("plan.subprocess.run", side_effect=subprocess.TimeoutExpired("codex", .01)):
@@ -832,6 +877,8 @@ candidate = re.search(r"Candidate SHA: ([0-9a-f]+)", prompt)
 candidate = candidate.group(1) if candidate else ""
 if prompt.startswith("Role: Repository Scout"):
     scope = re.search(r"Inspect only this fixed scope: (.+)", prompt).group(1)
+    schema = json.load(open(args[args.index("--output-schema") + 1], encoding="utf-8"))
+    if schema["properties"]["scope"].get("enum") != [scope]: raise SystemExit("scout scope schema is not fixed")
     key = str(abs(hash(scope)))
     events = os.environ.get("FAKE_SCOUT_EVENTS")
     if events:
