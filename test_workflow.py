@@ -300,6 +300,48 @@ class PlanningTests(unittest.TestCase):
         self.assertIn("attempt=2/2 call=2/2 timeout=10s", events[2][1])
         self.assertEqual(budget.started, 2)
 
+    def test_plan_review_accepts_after_one_review_and_one_audit(self):
+        tasks = [ContractTests().task()]
+        digest = plan.plan_digest(tasks)
+        results = [
+            {"assignmentId": "PLAN", "candidateSha": digest, "findings": []},
+            {"assignmentId": "PLAN", "candidateSha": digest, "findings": []},
+        ]
+        with patch("plan.invoke_validated", side_effect=results) as invoke:
+            self.assertIs(plan.reviewed_plan(Path("."), "requirements", "instructions", [], "base", tasks, 10, plan.CallBudget(7), 2), tasks)
+        self.assertEqual(invoke.call_count, 2)
+        self.assertIn("Role: contract-reviewer", invoke.call_args_list[0].args[1])
+        self.assertIn("Role: risk-reviewer", invoke.call_args_list[1].args[1])
+
+    def test_plan_findings_get_one_repair_and_scoped_verification(self):
+        tasks = [ContractTests().task()]
+        revised = [tasks[0] | {"validationCommands": ["fixed command"]}]
+        finding = {"id": "plan-command", "severity": "P1", "location": "TASK-0001 Validation", "failure": "command is invalid", "reproduction": "bad command", "requirement": "validation must run", "evidence": "unsupported syntax", "candidateIntroduced": True}
+        results = [
+            {"assignmentId": "PLAN", "candidateSha": plan.plan_digest(tasks), "findings": [finding]},
+            {"assignmentId": "PLAN", "candidateSha": plan.plan_digest(tasks), "findings": []},
+            revised,
+            {"assignmentId": "PLAN", "candidateSha": plan.plan_digest(revised), "status": "resolved"},
+        ]
+        with patch("plan.invoke_validated", side_effect=results) as invoke:
+            self.assertEqual(plan.reviewed_plan(Path("."), "requirements", "instructions", [], "base", tasks, 10, plan.CallBudget(7), 2), revised)
+        self.assertEqual(invoke.call_count, 4)
+        self.assertIn("Repair only the supplied findings", invoke.call_args_list[2].args[1])
+        self.assertIn("Verify only that every supplied finding", invoke.call_args_list[3].args[1])
+
+    def test_unresolved_plan_repair_stops_without_another_loop(self):
+        tasks = [ContractTests().task()]
+        finding = {"id": "plan-command", "severity": "P1", "location": "TASK-0001 Validation", "failure": "command is invalid", "reproduction": "bad command", "requirement": "validation must run", "evidence": "unsupported syntax", "candidateIntroduced": True}
+        results = [
+            {"assignmentId": "PLAN", "candidateSha": plan.plan_digest(tasks), "findings": [finding]},
+            {"assignmentId": "PLAN", "candidateSha": plan.plan_digest(tasks), "findings": []},
+            tasks,
+            {"assignmentId": "PLAN", "candidateSha": plan.plan_digest(tasks), "status": "unresolved"},
+        ]
+        with patch("plan.invoke_validated", side_effect=results) as invoke, self.assertRaisesRegex(RuntimeError, "verification unresolved"):
+            plan.reviewed_plan(Path("."), "requirements", "instructions", [], "base", tasks, 10, plan.CallBudget(7), 2)
+        self.assertEqual(invoke.call_count, 4)
+
     def test_delayed_agent_keeps_wait_live_while_concurrent_agent_completes(self):
         result = {"scope": "src", "implemented": [], "missing": [], "conflicts": [], "relevantPaths": [], "validationCommands": [], "evidence": []}
         events, lock = [], threading.Lock()
@@ -507,84 +549,6 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual((worker.call_count, session["repairAttemptsStarted"], session["phase"]), (2, 2, "needs-user"))
             self.assertEqual(store.state["taskStates"][assignment["id"]]["error"], "last validation")
 
-    def test_legacy_candidate_recovery_reuses_head_once_without_worker(self):
-        with tempfile.TemporaryDirectory() as root:
-            campaign = Path(root) / "relay-worktrees" / "test"; campaign.mkdir(parents=True)
-            target = make_git_repository(campaign)
-            temporary_root = patch("run.tempfile.gettempdir", return_value=root); temporary_root.start(); self.addCleanup(temporary_root.stop)
-            base = git_output(target, "rev-parse", "HEAD").strip()
-            source = target / "src" / "candidate.txt"; source.parent.mkdir(); source.write_text("candidate\n", encoding="utf-8")
-            subprocess.run(["git", "-C", str(target), "add", "src/candidate.txt"], check=True)
-            subprocess.run(["git", "-C", str(target), "commit", "-m", "candidate"], check=True, capture_output=True)
-            sha = git_output(target, "rev-parse", "HEAD").strip()
-            store = self.state_store(target)
-            run.exclude_relay_files(target)
-            store.state.update(baseSha=base, phase="needs-user")
-            assignment = ContractTests().task()
-            assignment["validationCommands"] = ["legacy 'command'"]
-            legacy_error = str(subprocess.CalledProcessError(1, "legacy 'command'"))
-            task_state = {"phase": "needs-user", "mode": "task", "pushed": False, "merged": False, "worktree": str(target), "branch": "main", "error": legacy_error}
-            store.state["taskStates"][assignment["id"]] = task_state
-            store.state["worktrees"][assignment["id"]] = {"path": str(target), "root": str(target), "branch": "main", "baseSha": base}
-            store.state["validationCommandsStarted"][assignment["id"]] = 1
-            recovered = run.legacy_candidate(store, assignment)
-            self.assertEqual(recovered[1:], ("main", sha))
-            self.assertTrue(recovered[0].samefile(target))
-            dirty = target / "untracked.txt"; dirty.write_text("dirty\n", encoding="utf-8")
-            self.assertIsNone(run.legacy_candidate(store, assignment))
-            dirty.unlink()
-            task_state["pushed"] = True
-            self.assertIsNone(run.legacy_candidate(store, assignment))
-            task_state["pushed"] = False
-            def review(*args):
-                store.state["reviewSessions"][assignment["id"]] = {"reviewedSha": sha}
-                return True
-            with patch("run.validate_candidate", return_value=sha) as validate, patch("run.invoke_with_replacements") as worker, patch("run.publish_candidate", return_value={"number": 1}), patch("run.run_review", side_effect=review), patch("run.merge_assignment", return_value=True), patch("run.update_task_ledger"), patch("run.cleanup_worktree"), patch("run.stderr_event") as event:
-                self.assertTrue(run.process_assignment(store, threading.Semaphore(1), assignment, "task"))
-            worker.assert_not_called()
-            validate.assert_called_once()
-            event.assert_called_once_with("RECOVER", "assignment=TASK-0001 operation=candidate-validation version=2")
-            self.assertEqual(task_state["validationShellVersion"], 2)
-            task_state.update(phase="needs-user", error=legacy_error)
-            self.assertIsNone(run.legacy_candidate(store, assignment))
-
-    def test_failed_legacy_recovery_is_never_retried(self):
-        with tempfile.TemporaryDirectory() as root:
-            campaign = Path(root) / "relay-worktrees" / "test"; campaign.mkdir(parents=True)
-            target = make_git_repository(campaign)
-            temporary_root = patch("run.tempfile.gettempdir", return_value=root); temporary_root.start(); self.addCleanup(temporary_root.stop)
-            base = git_output(target, "rev-parse", "HEAD").strip()
-            source = target / "src" / "candidate.txt"; source.parent.mkdir(); source.write_text("candidate\n", encoding="utf-8")
-            subprocess.run(["git", "-C", str(target), "add", "src/candidate.txt"], check=True)
-            subprocess.run(["git", "-C", str(target), "commit", "-m", "candidate"], check=True, capture_output=True)
-            store = self.state_store(target)
-            run.exclude_relay_files(target)
-            assignment = ContractTests().task(); assignment["validationCommands"] = ["legacy 'command'"]
-            task_state = {"phase": "needs-user", "mode": "task", "pushed": False, "merged": False, "worktree": str(target), "branch": "main", "error": str(subprocess.CalledProcessError(1, "legacy 'command'"))}
-            store.state["taskStates"][assignment["id"]] = task_state
-            store.state["worktrees"][assignment["id"]] = {"path": str(target), "root": str(target), "branch": "main", "baseSha": base}
-            store.state["validationCommandsStarted"][assignment["id"]] = 1
-            with patch("run.validate_candidate", side_effect=RuntimeError("validation command 1 exited with code 1; log: new.log")), patch("run.invoke_with_replacements") as worker:
-                self.assertFalse(run.process_assignment(store, threading.Semaphore(1), assignment, "task"))
-            worker.assert_not_called()
-            self.assertEqual((task_state["phase"], task_state["validationShellVersion"], task_state["error"]), ("needs-user", 2, "validation command 1 exited with code 1; log: new.log"))
-            self.assertIsNone(run.legacy_candidate(store, assignment))
-
-    def test_multiple_legacy_recoveries_use_normal_parallel_scheduler(self):
-        with tempfile.TemporaryDirectory() as root:
-            store = self.state_store(root)
-            assignments = [ContractTests().task("TASK-0001"), ContractTests().task("TASK-0002")]
-            assignments[1]["allowedPaths"] = ["other"]
-            for assignment in assignments:
-                store.state["taskStates"][assignment["id"]] = {"phase": "needs-user"}
-            barrier, seen = threading.Barrier(2), []
-            def process(store, semaphore, assignment, mode):
-                seen.append(assignment["id"])
-                barrier.wait(timeout=2)
-            with patch("run.legacy_candidate", return_value=(Path(root), "branch", "sha")), patch("run.process_assignment", side_effect=process):
-                run.run_assignments(store, threading.Semaphore(2), assignments, "task")
-            self.assertEqual(sorted(seen), ["TASK-0001", "TASK-0002"])
-
     def test_detects_supported_provider_remotes_and_decodes_names(self):
         cases = {
             "https://github.com/owner/repo.git": ("github", "owner/repo"),
@@ -603,16 +567,6 @@ class DeterministicCoreTests(unittest.TestCase):
             run.detect_provider("https://github.com.evil.invalid/owner/repo")
         with self.assertRaises(ValueError):
             run.detect_provider("file://github.com/owner/repo")
-
-    def test_old_github_state_is_inferred_on_resume(self):
-        with tempfile.TemporaryDirectory() as root:
-            store = self.state_store(root)
-            store.state.update(githubRepository="owner/repo", preflightCompleted=True)
-            with patch("run.git") as git, patch("run.provider_with_retries") as provider:
-                run.provider_preflight(store)
-            self.assertEqual(store.state["provider"], "github")
-            git.assert_not_called()
-            provider.assert_not_called()
 
     def test_azure_pr_discovery_is_normalized(self):
         with tempfile.TemporaryDirectory() as root:
@@ -635,32 +589,6 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertNotRegex(description, r"[\r\n]")
             self.assertIn("Candidate: abc", description)
 
-    def test_only_exhausted_legacy_azure_bootstrap_pr_is_recovered_once(self):
-        with tempfile.TemporaryDirectory() as root:
-            store = self.azure_store(root)
-            store.state.update(phase="needs-user", agentsBootstrap={
-                "phase": "needs-user", "candidateSha": "abc", "pushedSha": "abc", "pr": None,
-                "providerStatus": "Azure DevOps operation exhausted attempts: AGENTS:pr-create",
-            })
-            store.state["providerAttemptCounters"]["AGENTS:pr-create"] = store.state["providerAttemptLimit"]
-            with patch("run.stderr_event") as event:
-                self.assertTrue(run.recover_legacy_agents_pr(store))
-            self.assertEqual((store.state["phase"], store.state["agentsBootstrap"]["phase"], store.state["agentsBootstrap"]["prOperationVersion"]), ("agents-bootstrap", "pull-request", 2))
-            event.assert_called_once_with("RECOVER", "assignment=AGENTS operation=pr-create version=2")
-
-            store.state.update(phase="needs-user")
-            store.state["agentsBootstrap"].update(phase="needs-user", providerStatus="Azure DevOps operation exhausted attempts: AGENTS:pr-create-v2")
-            store.state["providerAttemptCounters"]["AGENTS:pr-create-v2"] = store.state["providerAttemptLimit"]
-            self.assertFalse(run.recover_legacy_agents_pr(store))
-            self.assertEqual(store.state["agentsBootstrap"]["prOperationVersion"], 2)
-
-            store.state["agentsBootstrap"].pop("prOperationVersion")
-            store.state["agentsBootstrap"]["providerStatus"] = "generated-file-modified"
-            self.assertFalse(run.recover_legacy_agents_pr(store))
-
-            store.state["agentsBootstrap"].update(providerStatus="Azure DevOps operation exhausted attempts: AGENTS:pr-create", pushedSha="different")
-            self.assertFalse(run.recover_legacy_agents_pr(store))
-
     def test_stopped_reports_every_blocked_assignment(self):
         state = {
             "phase": "needs-user", "error": "campaign\nfailed",
@@ -680,7 +608,7 @@ class DeterministicCoreTests(unittest.TestCase):
             unittest.mock.call("BLOCKED", "assignment=TASK-0002 reason=checks pending log=not-recorded"),
         ])
 
-    def test_old_campaign_without_operation_fields_has_progress(self):
+    def test_sparse_campaign_without_operation_fields_has_progress(self):
         state = {"workerLimit": 3, "taskTotal": 1, "taskStates": {"TASK-0001": {"phase": "ready"}}, "activeProcesses": {}}
         self.assertEqual(run.runtime_progress(state, 0), "0/1 complete | active 0/3")
 
@@ -1108,40 +1036,18 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual((target / "AGENTS.md").read_bytes(), repo.TARGET_AGENTS.encode())
             self.assertEqual(store.state["agentsBootstrap"]["phase"], "pending")
             self.assertEqual(store.state["agentsBootstrap"]["contentHash"], repo.TARGET_AGENTS_SHA256)
+            self.assertEqual(store.state["schemaVersion"], run.STATE_SCHEMA_VERSION)
 
-    def test_nested_bootstrap_reconcile_failure_recovers_merged_root_agents(self):
+    def test_old_campaign_state_is_rejected_instead_of_recovered(self):
         with tempfile.TemporaryDirectory() as root:
-            root = Path(root); target = make_git_repository(root)
-            module = target / "module"; module.mkdir(); (module / "README.md").write_text("# Module\n", encoding="utf-8")
-            subprocess.run(["git", "-C", str(target), "add", "module/README.md"], check=True)
-            subprocess.run(["git", "-C", str(target), "commit", "-m", "module"], check=True, capture_output=True)
-            subprocess.run(["git", "-C", str(target), "push", "origin", "main"], check=True, capture_output=True)
-            args = run.parser().parse_args(["--repo", str(module)])
-            text = plan.render_tasks([ContractTests().task()], git_output(module, "rev-parse", "HEAD").strip(), "abc123")
-            store, _ = run.initialize_campaign(module, text, args)
-            (module / "AGENTS.md").unlink()
-            (target / "AGENTS.md").write_text(repo.TARGET_AGENTS, encoding="utf-8", newline="\n")
-            subprocess.run(["git", "-C", str(target), "add", "AGENTS.md"], check=True)
-            subprocess.run(["git", "-C", str(target), "commit", "-m", "legacy bootstrap"], check=True, capture_output=True)
-            subprocess.run(["git", "-C", str(target), "push", "origin", "main"], check=True, capture_output=True)
-            sha = git_output(target, "rev-parse", "HEAD").strip()
-            with self.assertRaisesRegex(ValueError, "outside target directory"):
-                run.target_changes(store, module, store.state["baseSha"], sha)
-            store.state.update(phase="needs-user", worktrees={})
-            store.state["agentsBootstrap"].update(
-                phase="needs-user", candidateSha=sha, pushedSha=sha,
-                pr={"number": 1, "state": "MERGED"},
-                providerStatus=f"[Errno 2] No such file or directory: '{module / 'AGENTS.md'}'",
-            )
-            store.save()
-            with patch("run.stderr_event") as event:
-                self.assertTrue(run.recover_legacy_nested_agents_reconcile(store))
-            event.assert_called_once_with("RECOVER", "assignment=AGENTS operation=reconcile version=2")
-            self.assertTrue(run.reconcile_agents_bootstrap(store))
-            self.assertEqual((store.state["phase"], store.state["agentsBootstrap"]["phase"]), ("build", "complete"))
-            self.assertEqual(store.state["providerAttemptCounters"]["AGENTS:reconcile-fetch-v2"], 1)
-            self.assertFalse((module / "AGENTS.md").exists())
-            self.assertEqual(store.state["targetInstructions"], repo.TARGET_AGENTS)
+            target = make_git_repository(Path(root))
+            relay = target / ".relay"; relay.mkdir()
+            state = {"schemaVersion": 1, "repository": str(target)}
+            (relay / "state.json").write_text(json.dumps(state), encoding="utf-8")
+            completed = subprocess.run([sys.executable, str(Path(run.__file__)), "--repo", str(target)], capture_output=True, text=True)
+            self.assertEqual(completed.returncode, 1)
+            self.assertIn("unsupported campaign state schema 1", completed.stderr)
+            self.assertEqual(json.loads((relay / "state.json").read_text()), state)
 
     def test_custom_agents_is_honored_without_bootstrap(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1177,7 +1083,7 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(store.state["phase"], "needs-user")
             self.assertEqual(store.state["agentsBootstrap"]["providerStatus"], "generated-file-modified")
             self.assertEqual((target / "AGENTS.md").read_text(encoding="utf-8"), content)
-            with patch("run.github_preflight") as preflight, patch("run.run_assignments") as workers:
+            with patch("run.provider_preflight") as preflight, patch("run.run_assignments") as workers:
                 self.assertEqual(run.execute_campaign(store, tasks), 2)
             preflight.assert_not_called()
             workers.assert_not_called()
@@ -1255,49 +1161,7 @@ class FakeEndToEndTests(unittest.TestCase):
             self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr + json.dumps(state, indent=2))
             self.assertEqual(state["providerAttemptCounters"]["AGENTS:pr-create"], 1)
 
-    def test_exhausted_legacy_azure_bootstrap_pr_recovers_with_v2_budget(self):
-        with tempfile.TemporaryDirectory() as root:
-            root = Path(root); target = make_git_repository(root)
-            azure_url = "https://dev.azure.com/org/project/_git/repo"
-            remote = root / "remote.git"
-            subprocess.run(["git", "-C", str(target), "remote", "set-url", "origin", azure_url], check=True)
-            subprocess.run(["git", "-C", str(target), "config", f"url.{remote}.insteadOf", azure_url], check=True)
-            fake_codex, fake_az = root / "fake_codex.py", root / "fake_az.py"
-            fake_codex.write_text(FAKE_CODEX, encoding="utf-8"); fake_az.write_text(FAKE_AZ, encoding="utf-8")
-            provider = root / "provider"; provider.mkdir()
-            requirements = root / "requirements.md"; requirements.write_text("Create one file.", encoding="utf-8")
-            environment = os.environ | VALIDATION_ENV | {
-                "RELAY_CODEX": f"{sys.executable} {fake_codex}", "RELAY_AZ": f"{sys.executable} {fake_az}",
-                "FAKE_AZ_STATE": str(provider), "FAKE_AZ_REMOTE": str(remote), "FAKE_AZ_FAIL_CREATE_ATTEMPTS": "3",
-            }
-            subprocess.run([sys.executable, str(Path(plan.__file__)), "--repo", str(target), "--requirements", str(requirements)], capture_output=True, text=True, env=environment, check=True)
-            command = [sys.executable, str(Path(run.__file__)), "--repo", str(target), "--agent-timeout", "10", "--validation-timeout", "10", "--provider-timeout", "10", "--provider-check-timeout", "10"]
-
-            first = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=30)
-            state = json.loads((target / ".relay" / "state.json").read_text(encoding="utf-8"))
-            sha = state["agentsBootstrap"]["candidateSha"]
-            self.assertEqual((first.returncode, state["phase"], state["agentsBootstrap"]["phase"]), (2, "needs-user", "needs-user"))
-            self.assertEqual(state["agentsBootstrap"]["pushedSha"], sha)
-            self.assertEqual(state["providerAttemptCounters"]["AGENTS:pr-create"], 3)
-            self.assertEqual(state["taskStates"], {})
-            self.assertIn("STOPPED", first.stderr)
-            self.assertIn("assignment=AGENTS reason=Azure DevOps operation exhausted attempts: AGENTS:pr-create", first.stderr)
-            self.assertNotIn("simulated legacy create failure", first.stderr)
-            self.assertIn("simulated legacy create failure", (target / ".relay" / "logs" / "provider.log").read_text(encoding="utf-8"))
-
-            resumed = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=60)
-            state = json.loads((target / ".relay" / "state.json").read_text(encoding="utf-8"))
-            self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr + json.dumps(state, indent=2))
-            self.assertEqual((state["phase"], state["agentsBootstrap"]["phase"], state["agentsBootstrap"]["prOperationVersion"]), ("complete", "complete", 2))
-            self.assertEqual(state["providerAttemptCounters"]["AGENTS:pr-create"], 3)
-            self.assertEqual((state["providerAttemptCounters"]["AGENTS:pr-list-v2"], state["providerAttemptCounters"]["AGENTS:pr-create-v2"]), (1, 1))
-            self.assertEqual((state["providerAttemptCounters"][f"AGENTS:push:{sha}"], state["attemptCounters"]["TASK-0001"]), (1, 1))
-            self.assertEqual(len(list(provider.glob("*.json"))), 2)
-            self.assertEqual(int(git_output(target, "rev-list", "--count", "origin/main")), 2)
-            self.assertEqual(resumed.stderr.count("RECOVER"), 1)
-            self.assertNotIn("STOPPED", resumed.stderr)
-
-    def test_exhausted_v2_azure_bootstrap_pr_stays_terminal(self):
+    def test_exhausted_azure_bootstrap_pr_stays_terminal(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root); target = make_git_repository(root)
             azure_url = "https://dev.azure.com/org/project/_git/repo"
@@ -1316,16 +1180,14 @@ class FakeEndToEndTests(unittest.TestCase):
             command = [sys.executable, str(Path(run.__file__)), "--repo", str(target), "--agent-timeout", "10", "--validation-timeout", "10", "--provider-timeout", "10", "--provider-check-timeout", "10"]
             first = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=30)
             second = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=30)
-            third = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=30)
             state = json.loads((target / ".relay" / "state.json").read_text(encoding="utf-8"))
-            self.assertEqual((first.returncode, second.returncode, third.returncode), (2, 2, 2))
-            self.assertEqual((state["phase"], state["agentsBootstrap"]["phase"], state["agentsBootstrap"]["prOperationVersion"]), ("needs-user", "needs-user", 2))
-            self.assertEqual((state["providerAttemptCounters"]["AGENTS:pr-create"], state["providerAttemptCounters"]["AGENTS:pr-create-v2"]), (3, 3))
-            self.assertEqual((provider / ".create-attempts").read_text(), "6")
+            self.assertEqual((first.returncode, second.returncode), (2, 2))
+            self.assertEqual((state["phase"], state["agentsBootstrap"]["phase"]), ("needs-user", "needs-user"))
+            self.assertEqual(state["providerAttemptCounters"]["AGENTS:pr-create"], 3)
+            self.assertEqual((provider / ".create-attempts").read_text(), "3")
             self.assertEqual(state["taskStates"], {})
-            self.assertEqual(second.stderr.count("RECOVER"), 1)
-            self.assertNotIn("RECOVER", third.stderr)
-            self.assertIn("assignment=AGENTS reason=Azure DevOps operation exhausted attempts: AGENTS:pr-create-v2", third.stderr)
+            self.assertNotIn("RECOVER", second.stderr)
+            self.assertIn("assignment=AGENTS reason=Azure DevOps operation exhausted attempts: AGENTS:pr-create", second.stderr)
 
     def test_parallel_workers_reviews_prs_merge_one_audit_and_complete(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1565,7 +1427,7 @@ if args[:3] == ["repos", "pr", "create"]:
     attempt = int(attempts.read_text()) + 1 if attempts.exists() else 1
     attempts.write_text(str(attempt))
     if attempt <= int(os.environ.get("FAKE_AZ_FAIL_CREATE_ATTEMPTS", "0")):
-        print("simulated legacy create failure", file=sys.stderr); raise SystemExit(1)
+        print("simulated create failure", file=sys.stderr); raise SystemExit(1)
     sha = re.search(r"Candidate: ([0-9a-f]+)", description).group(1)
     number = int(re.search(r"(\d+)$", branch).group(1))
     record = {"pullRequestId": number, "status": "active", "mergeStatus": "succeeded", "lastMergeSourceCommit": {"commitId": sha}, "branch": branch}

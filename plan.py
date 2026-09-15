@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import relay_console
+import run
 from repo import TARGET_AGENTS, create_exclusive
 
 TASK_ID = re.compile(r"TASK-\d{4}")
@@ -304,6 +305,89 @@ Requirements:\n{requirements}
 Return only {{\"tasks\": [...]}} matching the supplied schema."""
 
 
+def plan_digest(tasks: list[dict]) -> str:
+    return hashlib.sha256(json.dumps(tasks, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def plan_review_prompt(role: str, requirements: str, instructions: str, tasks: list[dict], digest: str) -> str:
+    focus = (
+        "Check requirement coverage, task boundaries, dependencies, allowed paths, acceptance criteria, and consistency."
+        if role == "contract-reviewer" else
+        "Audit technical feasibility against the repository, especially exact validation command syntax, target-platform behavior, and paths needed to satisfy each task."
+    )
+    return f"""Role: {role} (read-only plan review).
+Assignment ID: PLAN
+Candidate SHA: {digest}
+{focus}
+The draft below is the exact contract used to create both PLAN.md and tasks.md.
+Return only execution-blocking, evidence-backed plan defects; do not report style preferences,
+edit files, widen requirements, spawn agents, or request another review.
+Target instructions:\n{instructions}
+Requirements:\n{requirements}
+Draft tasks:\n{json.dumps(tasks)}
+Return only the supplied JSON schema."""
+
+
+def plan_repair_prompt(requirements: str, instructions: str, files: list[str], base: str, tasks: list[dict], findings: list[dict]) -> str:
+    return f"""Role: Planning Project Manager (repair, read-only).
+Repair only the supplied findings and return the complete revised task graph.
+Do not edit files, spawn agents, widen requirements, create another review, or omit unaffected tasks.
+Every validation command must use syntax supported by the target environment and every task must allow all paths required by its acceptance criteria.
+Base SHA: {base}
+Target instructions:\n{instructions}
+Tracked tree:\n{chr(10).join(files)}
+Requirements:\n{requirements}
+Draft tasks:\n{json.dumps(tasks)}
+Plan findings:\n{json.dumps(findings)}
+Return only {{"tasks": [...]}} matching the supplied schema."""
+
+
+def plan_verification_prompt(requirements: str, original: list[dict], revised: list[dict], findings: list[dict], digest: str) -> str:
+    return f"""Role: verification-reviewer (read-only plan verification).
+Assignment ID: PLAN
+Candidate SHA: {digest}
+Verify only that every supplied finding is resolved in the revised plan. Do not reopen full review,
+find new issues, edit files, spawn agents, or request another pass.
+Requirements:\n{requirements}
+Original tasks:\n{json.dumps(original)}
+Revised tasks:\n{json.dumps(revised)}
+Findings:\n{json.dumps(findings)}
+Return resolved, unresolved, or invalid-result using the supplied JSON schema."""
+
+
+def reviewed_plan(repo: Path, requirements: str, instructions: str, files: list[str], base: str, tasks: list[dict], timeout: int, budget: CallBudget, retries: int) -> list[dict]:
+    digest = plan_digest(tasks)
+    findings = []
+    for role in ("contract-reviewer", "risk-reviewer"):
+        operation = "plan-review" if role == "contract-reviewer" else "plan-audit"
+        result = invoke_validated(
+            repo, plan_review_prompt(role, requirements, instructions, tasks, digest), run.ROLE_JSON_SCHEMAS[role],
+            lambda value, expected=role: run.validate_agent_result(expected, value, "PLAN"), timeout, budget, retries, f"role={operation}",
+        )
+        if result["candidateSha"] != digest:
+            raise ValueError(f"{role} changed plan digest")
+        findings.extend(result["findings"])
+    if not findings:
+        progress("DONE", "operation=plan-audit result=approved")
+        return tasks
+    progress("START", f"operation=plan-repair findings={len(findings)}")
+    revised = invoke_validated(
+        repo, plan_repair_prompt(requirements, instructions, files, base, tasks, findings), json_schema(TASK_SCHEMA, "tasks"),
+        validate_tasks, timeout, budget, retries, "role=planning-pm-repair",
+    )
+    revised_digest = plan_digest(revised)
+    verification = invoke_validated(
+        repo, plan_verification_prompt(requirements, tasks, revised, findings, revised_digest), run.ROLE_JSON_SCHEMAS["verification-reviewer"],
+        lambda value: run.validate_agent_result("verification-reviewer", value, "PLAN"), timeout, budget, retries, "role=verification-reviewer",
+    )
+    if verification["candidateSha"] != revised_digest:
+        raise ValueError("verification reviewer changed plan digest")
+    if verification["status"] != "resolved":
+        raise RuntimeError(f"plan repair verification {verification['status']}")
+    progress("DONE", f"operation=plan-repair result=verified findings={len(findings)}")
+    return revised
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     repo, requirements_file = args.repo.resolve(), args.requirements.resolve()
@@ -315,7 +399,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         base, files, instructions = inspect_repository(repo)
         scopes = scout_scopes(files, args.workers)
-        budget = CallBudget(len(scopes) + 1 + args.format_retries)
+        budget = CallBudget(len(scopes) + 5 + args.format_retries)
         progress("START", f"operation=plan name=Relay Planner workers={args.workers} calls={budget.limit}")
         evidence = []
         if scopes:
@@ -329,6 +413,7 @@ def main(argv: list[str] | None = None) -> int:
                 evidence = [future.result() for future in futures]
         relay_console.update(f"planning-pm synthesize | calls={budget.started}/{budget.limit}")
         tasks = invoke_validated(repo, planning_prompt(requirements, instructions, files, base, evidence), json_schema(TASK_SCHEMA, "tasks"), validate_tasks, args.agent_timeout, budget, args.format_retries, "role=planning-pm")
+        tasks = reviewed_plan(repo, requirements, instructions, files, base, tasks, args.agent_timeout, budget, args.format_retries)
         progress("DONE", f"operation=validate-plan tasks={len(tasks)}")
         output = render_tasks(tasks, base, hashlib.sha256(requirements.encode()).hexdigest()[:12], args.task_attempts, args.fix_loops)
         output_path = (args.output or repo / "PLAN.md").resolve()

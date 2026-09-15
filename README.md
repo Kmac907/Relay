@@ -6,7 +6,7 @@ Relay is a bounded, resumable coordinator that turns requirements into isolated 
 requirements
     |
     v
-plan.py -> PLAN.md + missing AGENTS.md
+plan.py -> plan review -> technical audit -> optional repair verification -> PLAN.md + missing AGENTS.md
     |
     v
 run.py -> AGENTS.md bootstrap PR (when needed)
@@ -84,7 +84,9 @@ For an existing repository, skip `repo.py` and run `plan.py` against its selecte
 
 ### 2. Planning
 
-`plan.py` reads the requirements, tracked tree, selected base SHA, and target instructions. For a nontrivial repository it runs fixed, read-only scout scopes concurrently, then a read-only Planning PM produces a bounded task graph. Relay validates the structured result before it writes anything.
+`plan.py` reads the requirements, tracked tree, selected base SHA, and target instructions. For a nontrivial repository it runs fixed, read-only scout scopes concurrently, then a read-only Planning PM produces a bounded task graph. A contract reviewer checks requirement and task consistency, then a technical risk reviewer checks feasibility, exact validation commands, target-platform behavior, and required paths against the repository. Relay validates every structured result before it writes anything.
+
+If either review finds an execution-blocking defect, the Planning PM gets one repair pass and a verification reviewer checks only those findings. An unresolved verification fails planning without creating `PLAN.md`; there is no recursive review loop. A clean draft skips repair and verification.
 
 Planner attempts report `START`, `WAIT`, `DONE`, `RETRY`, and `FAILED` lifecycle events on stderr. Agent stdout and stderr remain captured separately.
 
@@ -115,9 +117,7 @@ Relay then pushes the branch, opens or recovers one PR, and runs two independent
 
 Approved candidates must retain the reviewed SHA and pass the selected provider's required checks and approvals before Relay merges them. For Azure, blocking branch-policy evaluations are authoritative: approved and not-applicable pass, queued and running wait within the persisted deadline, and rejected or broken fail. Conflicts enter the shared repair budget, and Relay never bypasses policies. Azure supports Relay's `squash` and standard no-fast-forward `merge` completion modes; `rebase` is rejected during preflight. Completed worktrees and local branches are removed.
 
-`run.py` detects canonical GitHub and Azure HTTPS/SSH origins, including legacy `visualstudio.com` Azure URLs, then persists the provider identity. Azure PR descriptions are passed as a single line for Windows `az.cmd` compatibility; GitHub continues to receive the body file. When `--repo` names a subdirectory of a Git repository, Relay preserves that prefix in bootstrap and Worker worktrees and rejects changes outside it. Resume uses the persisted provider identity and normalized PR number, URL, source SHA, and state; older campaigns containing `githubRepository` continue as GitHub campaigns. Use the same `run.py --repo ...` command after provider action or interruption. Push, PR creation, policy polling, merge, reconciliation, and the no-AI-review `AGENTS.md` bootstrap all resume without intentionally duplicating completed operations. A legacy Azure bootstrap stopped specifically after exhausting `AGENTS:pr-create` is recovered once with separate bounded v2 list/create counters, reusing its existing commit, branch, push, and worktree.
-
-A legacy candidate stranded in `needs-user` by the old implicit Windows shell is revalidated once when its branch and clean worktree still contain only an unpublished, in-scope descendant of the recorded base. Relay reuses that exact commit without another Worker attempt and marks the task with validation shell version 2 before running commands, so failure or interruption cannot trigger another automatic recovery.
+`run.py` detects canonical GitHub and Azure HTTPS/SSH origins, including `visualstudio.com` Azure URLs, then persists the provider identity. Azure PR descriptions are passed as a single line for Windows `az.cmd` compatibility; GitHub continues to receive the body file. When `--repo` names a subdirectory of a Git repository, Relay preserves that prefix in bootstrap and Worker worktrees and rejects changes outside it. Resume uses the persisted provider identity and normalized PR number, URL, source SHA, and state. Use the same `run.py --repo ...` command after provider action or interruption. Push, PR creation, policy polling, merge, reconciliation, and the no-AI-review `AGENTS.md` bootstrap all resume without intentionally duplicating completed operations. Campaign state is versioned strictly; unsupported state must be replaced with a newly reviewed plan rather than recovered heuristically.
 
 ### 5. Finite audit
 
