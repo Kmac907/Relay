@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import subprocess
@@ -7,15 +8,76 @@ import textwrap
 import threading
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 import plan
+import relay_console
 import repo
 import run
 import status
 
 VALIDATION_ENV = {"RELAY_PWSH": "powershell.exe"} if os.name == "nt" else {}
+
+
+class TTYBuffer(io.StringIO):
+    def isatty(self):
+        return True
+
+
+class ConsoleTests(unittest.TestCase):
+    def test_tty_rewrites_one_truncated_line_without_wait_events(self):
+        stream = TTYBuffer()
+        console = relay_console.Console(stream, interval=3600, width=lambda: 20)
+        console.update("assignment worker with a long description")
+        console.update("assignment validate")
+        console.close()
+        output = stream.getvalue()
+        self.assertIn("\r", output)
+        self.assertNotIn("WAIT", output)
+        self.assertTrue(all(len(part) <= 19 for part in output.split("\r") if part.strip()))
+
+    def test_redirected_waits_are_plain_and_rate_limited(self):
+        stream, clock = io.StringIO(), [0.0]
+        console = relay_console.Console(stream, interval=3600, monotonic=lambda: clock[0])
+        console.update("TASK-0001 worker")
+        console.update("TASK-0001 worker")
+        clock[0] = 299
+        console.update("TASK-0001 worker")
+        clock[0] = 300
+        console.update("TASK-0001 worker")
+        console.close()
+        output = stream.getvalue()
+        self.assertEqual(output.count("WAIT"), 2)
+        self.assertNotIn("\r", output)
+        self.assertNotRegex(output, r"WAIT\s+[|/\\-]\s")
+
+    def test_concurrent_events_clear_and_redraw_without_interleaving(self):
+        stream = TTYBuffer()
+        console = relay_console.Console(stream, interval=3600, width=lambda: 80)
+        console.update("TASK-0001 worker")
+        threads = [threading.Thread(target=console.emit, args=("DONE",), kwargs={"operation": f"step-{number}"}) for number in range(8)]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join()
+        console.close()
+        output = stream.getvalue()
+        for number in range(8):
+            self.assertEqual(output.count(f"operation=step-{number}"), 1)
+        self.assertEqual(output.count("DONE"), 8)
+
+    def test_close_cleans_live_line_after_failures_and_interrupts(self):
+        for failure in (RuntimeError("failure"), KeyboardInterrupt()):
+            stream = TTYBuffer()
+            console = relay_console.Console(stream, interval=3600)
+            try:
+                console.update("working")
+                raise failure
+            except (RuntimeError, KeyboardInterrupt):
+                pass
+            finally:
+                console.close()
+            self.assertRegex(stream.getvalue(), r"\r +\r$")
 
 
 class ContractTests(unittest.TestCase):
@@ -238,7 +300,7 @@ class PlanningTests(unittest.TestCase):
         self.assertIn("attempt=2/2 call=2/2 timeout=10s", events[2][1])
         self.assertEqual(budget.started, 2)
 
-    def test_delayed_agent_emits_wait_while_concurrent_agent_completes(self):
+    def test_delayed_agent_keeps_wait_live_while_concurrent_agent_completes(self):
         result = {"scope": "src", "implemented": [], "missing": [], "conflicts": [], "relevantPaths": [], "validationCommands": [], "evidence": []}
         events, lock = [], threading.Lock()
 
@@ -252,12 +314,12 @@ class PlanningTests(unittest.TestCase):
                 events.append((event, detail))
 
         budget = plan.CallBudget(2)
-        with tempfile.TemporaryDirectory() as root, patch("plan.subprocess.run", side_effect=fake_run), patch("plan.heartbeat_interval", return_value=.01), patch("plan.progress", side_effect=record):
+        with tempfile.TemporaryDirectory() as root, patch("plan.subprocess.run", side_effect=fake_run), patch("plan.progress", side_effect=record):
             with plan.ThreadPoolExecutor(max_workers=2) as pool:
                 slow = pool.submit(plan.invoke_validated, Path(root), "slow", plan.scout_schema("src"), lambda value: plan.validate_scout(value, "src"), 10, budget, 0, "role=scout slot=1")
                 fast = pool.submit(plan.invoke_validated, Path(root), "fast", plan.scout_schema("src"), lambda value: plan.validate_scout(value, "src"), 10, budget, 0, "role=scout slot=2")
                 self.assertEqual((slow.result(), fast.result()), (result, result))
-        self.assertTrue(any(event == "WAIT" and "slot=1" in detail for event, detail in events))
+        self.assertFalse(any(event == "WAIT" for event, _ in events))
         self.assertTrue(any(event == "DONE" and "slot=2" in detail for event, detail in events))
 
     def test_hung_planning_call_consumes_budget(self):
@@ -394,7 +456,10 @@ class DeterministicCoreTests(unittest.TestCase):
             store.state["taskStates"][assignment["id"]] = {"phase": "candidate-validation"}
             completed = subprocess.CompletedProcess([], 7, "standard output\n", "standard error\n")
             def failed(*args, **kwargs):
-                self.assertEqual(store.state["validationCommandsStarted"][assignment["id"]], 1)
+                persisted = json.loads(store.path.read_text(encoding="utf-8"))
+                self.assertEqual(persisted["validationCommandsStarted"][assignment["id"]], 1)
+                self.assertEqual(persisted["taskStates"][assignment["id"]]["operation"], "validate")
+                self.assertEqual(persisted["taskStates"][assignment["id"]]["validationCommand"], assignment["validationCommands"][0])
                 return completed
             with patch("run.validation_command", return_value=["explicit-shell", assignment["validationCommands"][0]]), patch("run.bounded_run", side_effect=failed) as command, self.assertRaisesRegex(RuntimeError, r"command 1 exited with code 7; log:"):
                 run.run_validations(store, assignment, Path(root))
@@ -609,11 +674,46 @@ class DeterministicCoreTests(unittest.TestCase):
             run.report_stopped(state)
         self.assertEqual(event.call_args_list, [
             unittest.mock.call("STOPPED", "phase=needs-user assignments=4"),
-            unittest.mock.call("BLOCKED", "assignment=AGENTS reason=bootstrap failed"),
-            unittest.mock.call("BLOCKED", "assignment=CAMPAIGN reason=campaign failed"),
-            unittest.mock.call("BLOCKED", "assignment=TASK-0001 reason=task failed"),
-            unittest.mock.call("BLOCKED", "assignment=TASK-0002 reason=checks pending"),
+            unittest.mock.call("BLOCKED", "assignment=AGENTS reason=bootstrap failed log=not-recorded"),
+            unittest.mock.call("BLOCKED", "assignment=CAMPAIGN reason=campaign failed log=not-recorded"),
+            unittest.mock.call("BLOCKED", "assignment=TASK-0001 reason=task failed log=not-recorded"),
+            unittest.mock.call("BLOCKED", "assignment=TASK-0002 reason=checks pending log=not-recorded"),
         ])
+
+    def test_old_campaign_without_operation_fields_has_progress(self):
+        state = {"workerLimit": 3, "taskTotal": 1, "taskStates": {"TASK-0001": {"phase": "ready"}}, "activeProcesses": {}}
+        self.assertEqual(run.runtime_progress(state, 0), "0/1 complete | active 0/3")
+
+    def test_provider_progress_names_actual_pr_policy_and_deadline(self):
+        state = {
+            "workerLimit": 3, "taskTotal": 1, "activeProcesses": {},
+            "pullRequests": {"TASK-0001": {"number": 25}},
+            "taskStates": {"TASK-0001": {
+                "phase": "provider-checks", "operation": "provider-checks",
+                "operationStartedAt": datetime.fromtimestamp(100, timezone.utc).isoformat(),
+                "operationDeadline": 3700, "providerPolicyCounts": {"queued": 2}, "nextAction": "poll",
+            }},
+        }
+        line = run.runtime_progress(state, 970)
+        self.assertIn("TASK-0001 provider-checks", line)
+        self.assertIn("PR #25", line)
+        self.assertIn("queued 2", line)
+        self.assertIn("next=poll", line)
+
+    def test_status_leads_with_approved_provider_wait(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            store.state["taskStates"]["TASK-0001"] = {"phase": "approved", "providerStatus": "pending"}
+            store.state["pullRequests"]["TASK-0001"] = {"number": 25, "state": "OPEN", "url": "https://example.invalid/25"}
+            store.state["providerDeadlines"]["TASK-0001"] = time.time() + 60
+            store.save()
+            output = io.StringIO()
+            with patch("sys.stdout", output):
+                self.assertEqual(status.main(["--repo", root]), 0)
+            shown = output.getvalue()
+            self.assertTrue(shown.startswith("Overall: 0/1 integrated"))
+            self.assertIn("External/provider waits", shown)
+            self.assertIn("TASK-0001: PR #25 status=pending", shown)
 
     def test_azure_policy_pass_failure_conflict_and_timeout(self):
         with tempfile.TemporaryDirectory() as root:
@@ -782,7 +882,13 @@ class DeterministicCoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
             store.state["targetInstructions"] = "custom target rules"
-            with patch("run.bounded_run", side_effect=subprocess.TimeoutExpired("codex", 1)) as command, self.assertRaises(RuntimeError):
+            def timeout(*args, **kwargs):
+                persisted = json.loads(store.path.read_text(encoding="utf-8"))
+                self.assertEqual(persisted["attemptCounters"]["TASK-0001"], 1)
+                self.assertEqual(persisted["taskStates"]["TASK-0001"]["operation"], "worker")
+                raise subprocess.TimeoutExpired("codex", 1)
+            store.state["taskStates"]["TASK-0001"] = {"phase": "implementing"}
+            with patch("run.bounded_run", side_effect=timeout) as command, self.assertRaises(RuntimeError):
                 run.invoke_agent(store, __import__("threading").Semaphore(1), Path(root), "TASK-0001", "worker", "prompt", mode="task")
             self.assertTrue(command.call_args.kwargs["input"].startswith("Target repository instructions:\ncustom target rules\n\n"))
             self.assertEqual(store.state["attemptCounters"]["TASK-0001"], 1)
