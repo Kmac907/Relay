@@ -102,6 +102,22 @@ def main(argv: list[str] | None = None) -> int:
     if state.get("reviewSessions"):
         print("\nReview sessions")
         for assignment_id, session in sorted(state["reviewSessions"].items()): print(f"  {assignment_id}: {session['phase']} calls={session['reviewCallsStarted']}/{session['reviewCallLimit']} fixes={session['repairAttemptsStarted']}/{state['fixLoopLimit']}")
+    if state.get("recoveryAttemptGrants") or state.get("recoveryHistory") or state.get("pendingRecovery"):
+        print("\nRecovery")
+        for assignment_id, count in sorted(state.get("recoveryAttemptGrants", {}).items()):
+            print(f"  {assignment_id}: grants={count} started={state.get('recoveryAttemptsStarted', {}).get(assignment_id, 0)}")
+        pending = state.get("pendingRecovery") or {}
+        for action in pending.get("actions", []):
+            key = f"{action['action']}:{action['assignmentId']}"
+            print(f"  {action['assignmentId']}: {action['action']} status={'done' if key in pending.get('completed', []) else 'required'}")
+        for index, recovery in enumerate(state.get("recoveryHistory", []), 1):
+            actions = ", ".join(f"{item['assignmentId']}:{item['action']}" for item in recovery["actions"])
+            print(f"  history-{index} {recovery['recoveredAt']}: {actions}")
+    recoverable = sorted(assignment_id for assignment_id, task in task_states.items() if task.get("phase") == "needs-user")
+    if recoverable:
+        print("\nRecoverable assignments")
+        for assignment_id in recoverable:
+            print(f"  {assignment_id}: inspect with run.py --recover and an explicit disposition")
     if bugs:
         print("\nBugs")
         for label, count in sorted(bugs.items()): print(f"  {label}: {count}")

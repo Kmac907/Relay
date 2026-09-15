@@ -128,7 +128,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(session["phase"], "approved")
 
     def test_worker_cannot_change_mode(self):
-        value = {"mode": "repair", "assignmentId": "TASK-0001", "status": "candidate", "candidateSha": "abc", "changedPaths": [], "validation": [], "summary": ""}
+        value = {"mode": "repair", "assignmentId": "TASK-0001", "status": "candidate", "candidateSha": "abc", "validation": [], "summary": ""}
         with self.assertRaises(ValueError):
             run.validate_agent_result("worker", value, "TASK-0001", "task")
         value["mode"], value["status"] = "task", "completed"
@@ -525,7 +525,7 @@ class DeterministicCoreTests(unittest.TestCase):
             def worker(*args, **kwargs):
                 prompts.append(args[5])
                 store.state["attemptCounters"][assignment["id"]] = store.state["attemptCounters"].get(assignment["id"], 0) + 1
-                return {"status": "candidate"}
+                return {"status": "candidate", "candidateSha": "candidate"}
             with patch("run.create_worktree", return_value=(Path(root), "branch")), patch("run.invoke_with_replacements", side_effect=worker), patch("run.validate_candidate", side_effect=[RuntimeError("validation command 1 exited with code 1; log: first.log"), RuntimeError("validation command 1 exited with code 2; log: second.log")]):
                 self.assertFalse(run.process_assignment(store, threading.Semaphore(1), assignment, "task"))
             self.assertEqual(store.state["attemptCounters"][assignment["id"]], 2)
@@ -542,12 +542,159 @@ class DeterministicCoreTests(unittest.TestCase):
                 "phase": "repair-1", "acceptedBlockerIds": [], "repairAttemptsStarted": 0,
                 "reviewCallsStarted": 0, "reviewCallLimit": 9,
             }
-            candidate = {"status": "candidate"}
+            candidate = {"status": "candidate", "candidateSha": "repair"}
             with patch("run.invoke_with_replacements", return_value=candidate) as worker, patch("run.validate_candidate", side_effect=[RuntimeError("first validation"), RuntimeError("last validation")]):
                 self.assertFalse(run.run_review(store, threading.Semaphore(1), assignment, Path(root), "sha"))
             session = store.state["reviewSessions"][assignment["id"]]
             self.assertEqual((worker.call_count, session["repairAttemptsStarted"], session["phase"]), (2, 2, "needs-user"))
             self.assertEqual(store.state["taskStates"][assignment["id"]]["error"], "last validation")
+
+    def test_completed_worker_resumes_validation_without_another_attempt(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            store.state["attemptCounters"][assignment["id"]] = store.state["taskAttemptLimit"]
+            store.state["taskStates"][assignment["id"]] = {"phase": "candidate-validation", "mode": "task", "pendingWorkerSha": "abc", "pushed": False, "merged": False}
+            def approved(*args):
+                store.state["reviewSessions"][assignment["id"]] = {"phase": "approved", "reviewedSha": "abc"}
+                return True
+            with patch("run.create_worktree", return_value=(Path(root), "branch")), patch("run.invoke_with_replacements") as worker, patch("run.validate_candidate", return_value="abc") as validate, patch("run.publish_candidate", return_value={"number": 1}), patch("run.run_review", side_effect=approved), patch("run.merge_assignment", return_value=True), patch("run.cleanup_worktree"):
+                self.assertTrue(run.process_assignment(store, threading.Semaphore(1), assignment, "task"))
+            worker.assert_not_called()
+            validate.assert_called_once()
+
+    def test_completed_repair_resumes_validation_then_verification(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            store.state["taskStates"][assignment["id"]] = {"phase": "repair-2"}
+            store.state["worktrees"][assignment["id"]] = {"baseSha": "base"}
+            store.state["reviewSessions"][assignment["id"]] = {"phase": "repair-2", "acceptedBlockerIds": [], "repairAttemptsStarted": 2, "reviewCallsStarted": 3, "reviewCallLimit": 9, "pendingWorkerSha": "new", "previousCandidateSha": "old"}
+            verified = {"assignmentId": assignment["id"], "candidateSha": "new", "status": "resolved"}
+            with patch("run.validate_candidate", return_value="new") as validate, patch("run.invoke_with_replacements", return_value=verified) as agent:
+                self.assertTrue(run.run_review(store, threading.Semaphore(1), assignment, Path(root), "old"))
+            validate.assert_called_once()
+            self.assertEqual(agent.call_args.args[4], "verification-reviewer")
+
+    def test_real_cumulative_candidate_and_one_file_repair_validate(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = make_git_repository(Path(root))
+            base = git_output(target, "rev-parse", "HEAD").strip()
+            for name in ("one.txt", "two.txt"):
+                (target / name).write_text("original\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", "one.txt", "two.txt"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "candidate"], check=True, capture_output=True)
+            (target / "one.txt").write_text("repair\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "commit", "-am", "repair"], check=True, capture_output=True)
+            repaired = git_output(target, "rev-parse", "HEAD").strip()
+            store = self.state_store(target)
+            run.exclude_relay_files(target)
+            assignment = ContractTests().task()
+            assignment.update(allowedPaths=["one.txt", "two.txt"], validationCommands=[])
+            store.state["taskStates"][assignment["id"]] = {"phase": "candidate-validation"}
+            store.state["worktrees"][assignment["id"]] = {"baseSha": base}
+            self.assertEqual(run.validate_candidate(store, assignment, target, {"candidateSha": repaired}), repaired)
+            self.assertEqual(store.state["candidateShas"][assignment["id"]], repaired)
+
+    def test_candidate_rejects_dirty_and_exact_out_of_scope_paths(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = make_git_repository(Path(root))
+            base = git_output(target, "rev-parse", "HEAD").strip()
+            (target / "outside.txt").write_text("committed\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", "outside.txt"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "outside"], check=True, capture_output=True)
+            sha = git_output(target, "rev-parse", "HEAD").strip()
+            store = self.state_store(target)
+            run.exclude_relay_files(target)
+            assignment = ContractTests().task()
+            assignment["validationCommands"] = []
+            store.state["taskStates"][assignment["id"]] = {"phase": "candidate-validation"}
+            store.state["worktrees"][assignment["id"]] = {"baseSha": base}
+            with self.assertRaisesRegex(ValueError, "outside.txt"):
+                run.validate_candidate(store, assignment, target, {"candidateSha": sha})
+            (target / "untracked.txt").write_text("dirty\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "uncommitted"):
+                run.validate_candidate(store, assignment, target, {"candidateSha": sha})
+
+    def test_out_of_scope_blocker_stops_before_repair_budget(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            bug = {"id": "BUG-0001", "title": "Export", "severity": "P1", "status": "active", "source": assignment["id"], "sourceFindingId": "export", "location": "module.psm1:1", "failure": "not exported", "reproduction": "test", "requirement": "export", "evidence": "missing", "allowedPaths": ["module.psm1"]}
+            Path(root, "bugs.md").write_text(run.render_bugs("test", Path(root), [bug]), encoding="utf-8")
+            store.state["taskStates"][assignment["id"]] = {"phase": "repair-1"}
+            store.state["reviewSessions"][assignment["id"]] = {"phase": "repair-1", "acceptedBlockerIds": [bug["id"]], "repairAttemptsStarted": 0, "reviewCallsStarted": 3, "reviewCallLimit": 9}
+            with patch("run.invoke_with_replacements") as worker:
+                self.assertFalse(run.run_review(store, threading.Semaphore(1), assignment, Path(root), "sha"))
+            worker.assert_not_called()
+            self.assertEqual(store.state["reviewSessions"][assignment["id"]]["repairAttemptsStarted"], 0)
+            self.assertIn("module.psm1", store.state["taskStates"][assignment["id"]]["error"])
+
+    def test_recovery_preview_preserves_state_and_grant_is_separate(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            store.state.update(phase="needs-user")
+            store.state["taskStates"][assignment["id"]] = {"phase": "needs-user", "candidateSha": "new", "error": "provider pull request source commit does not match candidate"}
+            store.save()
+            before = store.path.read_bytes()
+            def recovery_git(repo_path, *args, **kwargs):
+                output = "new\n" if args[0] == "rev-parse" else "new\trefs/heads/relay/TASK-0001\n" if args[0] == "ls-remote" else ""
+                return subprocess.CompletedProcess([], 0, output, "")
+            with patch("run.recovery_worktree", return_value=(Path(root), {"branch": "relay/TASK-0001"})), patch("run.git", side_effect=recovery_git):
+                actions = run.plan_recovery(store, [assignment], [], [])
+            self.assertEqual(actions, [{"action": "resume-publish", "assignmentId": assignment["id"], "candidateSha": "new"}])
+            self.assertEqual(store.path.read_bytes(), before)
+            store.state["attemptCounters"][assignment["id"]] = store.state["taskAttemptLimit"]
+            store.state["recoveryAttemptGrants"] = {assignment["id"]: 1}
+            number, process_id = run._consume_agent_call(store, assignment["id"], "worker", "task", False, False)
+            self.assertEqual(number, "recovery-1")
+            store.state["activeProcesses"].pop(process_id)
+            with self.assertRaisesRegex(RuntimeError, "attempt limit"):
+                run._consume_agent_call(store, assignment["id"], "worker", "task", False, False)
+
+    def test_confirmed_defer_archives_rejected_repair_and_restores_candidate(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = make_git_repository(Path(root))
+            (target / "src").mkdir()
+            (target / "src" / "run.ps1").write_text("candidate\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", "src/run.ps1"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "candidate"], check=True, capture_output=True)
+            candidate = git_output(target, "rev-parse", "HEAD").strip()
+            (target / "module.psm1").write_text("rejected\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", "module.psm1"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "rejected repair"], check=True, capture_output=True)
+            rejected = git_output(target, "rev-parse", "HEAD").strip()
+            store = self.state_store(target)
+            run.exclude_relay_files(target)
+            assignment = ContractTests().task()
+            bug = {"id": "BUG-0001", "title": "Export", "severity": "P1", "status": "active", "source": assignment["id"], "sourceFindingId": "export", "location": "module.psm1:1", "failure": "not exported", "reproduction": "test", "requirement": "export", "evidence": "missing", "allowedPaths": ["module.psm1"]}
+            Path(target, "bugs.md").write_text(run.render_bugs("test", target, [bug]), encoding="utf-8")
+            store.state.update(phase="needs-user")
+            store.state["taskStates"][assignment["id"]] = {"phase": "needs-user", "candidateSha": candidate}
+            store.state["reviewSessions"][assignment["id"]] = {"phase": "needs-user", "acceptedBlockerIds": [bug["id"]], "initialCandidateSha": candidate, "repairAttemptsStarted": 2}
+            action = {"action": "defer-review", "assignmentId": assignment["id"], "bugIds": [bug["id"]], "headSha": rejected, "candidateSha": candidate, "branch": "relay/TASK-0001"}
+            with patch("run.recovery_worktree", return_value=(target, {"branch": "relay/TASK-0001"})):
+                run.apply_recovery(store, [assignment], [action])
+            self.assertEqual(git_output(target, "rev-parse", "HEAD").strip(), candidate)
+            archive = f"archive/test/{assignment['id']}/rejected-{rejected[:12]}"
+            self.assertEqual(git_output(target, "rev-parse", archive).strip(), rejected)
+            self.assertEqual(run.load_bugs(store)[0]["status"], "backlog")
+            self.assertEqual(store.state["reviewSessions"][assignment["id"]]["repairAttemptsStarted"], 2)
+            self.assertEqual((store.state["phase"], len(store.state["recoveryHistory"])), ("build", 1))
+
+    def test_recovery_rejects_active_campaign_and_unknown_ids(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            store.state.update(phase="needs-user", activeProcesses={"worker": {}})
+            with self.assertRaisesRegex(RuntimeError, "inactive"):
+                run.plan_recovery(store, [assignment], [], [])
+            store.state["activeProcesses"] = {}
+            with self.assertRaisesRegex(ValueError, "active campaign bug"):
+                run.plan_recovery(store, [assignment], ["BUG-9999"], [])
+            with self.assertRaisesRegex(ValueError, "campaign task"):
+                run.plan_recovery(store, [assignment], [], ["TASK-9999"])
 
     def test_detects_supported_provider_remotes_and_decodes_names(self):
         cases = {
@@ -914,7 +1061,7 @@ class DeterministicCoreTests(unittest.TestCase):
                 role = args[4]
                 store.state["reviewSessions"][assignment["id"]]["reviewCallsStarted"] += 1
                 if role == "worker":
-                    return {"mode": "repair", "assignmentId": assignment["id"], "status": "candidate", "candidateSha": "new", "changedPaths": ["src"], "validation": [], "summary": ""}
+                    return {"mode": "repair", "assignmentId": assignment["id"], "status": "candidate", "candidateSha": "new", "validation": [], "summary": ""}
                 return {"assignmentId": assignment["id"], "candidateSha": "new", "status": "resolved"}
             with patch("run.wait_for_checks", side_effect=["failed", "passed"]), patch("run.git", return_value=completed), patch("run.invoke_with_replacements", side_effect=agent), patch("run.validate_candidate", return_value="new"), patch("run.publish_candidate"), patch("run.provider_with_retries", return_value=completed):
                 self.assertTrue(run.merge_assignment(store, __import__("threading").Semaphore(1), assignment, Path(root), "relay/TASK-0001", {"number": 1}, "old"))
@@ -926,7 +1073,7 @@ class DeterministicCoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
             assignment = ContractTests().task()
-            pr = {"number": 1, "state": "OPEN", "url": "x"}
+            pr = {"number": 1, "state": "OPEN", "url": "x", "headRefOid": "sha"}
             store.state["taskStates"][assignment["id"]] = {"pushedSha": "sha", "pr": pr, "phase": "approved"}
             store.state["pullRequests"][assignment["id"]] = pr
             store.state["reviewSessions"][assignment["id"]] = {"phase": "approved", "repairAttemptsStarted": 0, "reviewCallsStarted": 3, "reviewCallLimit": 9}
@@ -938,15 +1085,42 @@ class DeterministicCoreTests(unittest.TestCase):
                 merge.assert_not_called()
 
     def test_publish_ignores_historical_pr_for_reused_branch(self):
+        cases = (("github", 24, "e4086c53", "fcd0513f"), ("azure-devops", 25, "eefb0f87", "920d47a5"))
+        for provider, number, historical_sha, candidate_sha in cases:
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as root:
+                store = self.state_store(root)
+                store.state["provider"] = provider
+                assignment = ContractTests().task()
+                store.state["taskStates"][assignment["id"]] = {"pushedSha": candidate_sha, "phase": "approved"}
+                old = {"number": number, "state": "MERGED", "url": "old", "headRefOid": historical_sha}
+                new = {"number": number + 7, "state": "OPEN", "url": "new", "headRefOid": candidate_sha}
+                with patch("run.pr_discover", return_value=[old]), patch("run.pr_create", return_value=new) as create:
+                    self.assertEqual(run.publish_candidate(store, assignment, Path(root), "relay/TASK-0001", candidate_sha), new)
+                create.assert_called_once()
+
+    def test_repaired_push_refreshes_cached_pr_sha(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
             assignment = ContractTests().task()
-            store.state["taskStates"][assignment["id"]] = {"pushedSha": "new", "phase": "approved"}
-            old = {"number": 1, "state": "MERGED", "url": "old", "headRefOid": "old"}
-            new = {"number": 2, "state": "OPEN", "url": "new", "headRefOid": "new"}
-            with patch("run.pr_discover", return_value=[old]), patch("run.pr_create", return_value=new) as create:
-                self.assertEqual(run.publish_candidate(store, assignment, Path(root), "relay/TASK-0001", "new"), new)
-            create.assert_called_once()
+            stale = {"number": 30, "state": "OPEN", "url": "old", "headRefOid": "f63189a5"}
+            fresh = stale | {"headRefOid": "60d09d4a"}
+            store.state["taskStates"][assignment["id"]] = {"pushedSha": "f63189a5", "pr": stale, "phase": "approved"}
+            completed = subprocess.CompletedProcess([], 0, "f63189a5\trefs/heads/relay/TASK-0001\n", "")
+            with patch("run.git_provider_with_retries", return_value=completed) as git_provider, patch("run.pr_inspect", return_value=fresh) as inspect:
+                self.assertEqual(run.publish_candidate(store, assignment, Path(root), "relay/TASK-0001", "60d09d4a"), fresh)
+            inspect.assert_called_once_with(store, "TASK-0001:pr-refresh:60d09d4a", 30)
+            self.assertIn("--force-with-lease=refs/heads/relay/TASK-0001:f63189a5", git_provider.call_args_list[1].args)
+
+    def test_push_before_pr_refresh_resumes_refresh_without_repush(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            stale = {"number": 30, "state": "OPEN", "url": "old", "headRefOid": "old"}
+            fresh = stale | {"headRefOid": "new"}
+            store.state["taskStates"][assignment["id"]] = {"pushedSha": "new", "pr": stale, "phase": "approved"}
+            with patch("run.git_provider_with_retries") as git_provider, patch("run.pr_inspect", return_value=fresh):
+                self.assertEqual(run.publish_candidate(store, assignment, Path(root), "branch", "new"), fresh)
+            git_provider.assert_not_called()
 
     def test_publish_rejects_open_pr_for_different_sha(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1361,7 +1535,7 @@ elif "Role: Worker" in prompt:
     sha = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
     if events and mode == "task":
         with open(f"{events}.{assignment}.end", "w", encoding="utf-8") as stream: stream.write(str(time.time()))
-    result = {"mode": mode, "assignmentId": assignment, "status": "candidate", "candidateSha": sha, "changedPaths": allowed, "validation": [], "summary": "done"}
+    result = {"mode": mode, "assignmentId": assignment, "status": "candidate", "candidateSha": sha, "validation": [], "summary": "done"}
 elif "Role: contract-reviewer" in prompt or "Role: risk-reviewer" in prompt:
     role = "contract-reviewer" if "Role: contract-reviewer" in prompt else "risk-reviewer"
     findings = []

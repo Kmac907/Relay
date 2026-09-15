@@ -36,7 +36,7 @@ ACTIVE_CHILDREN: set[subprocess.Popen] = set()
 STATE_SCHEMA_VERSION = 2
 
 AGENT_SCHEMAS = {
-    "worker": {"mode": str, "assignmentId": str, "status": str, "candidateSha": str, "changedPaths": list, "validation": list, "summary": str},
+    "worker": {"mode": str, "assignmentId": str, "status": str, "candidateSha": str, "validation": list, "summary": str},
     "contract-reviewer": {"assignmentId": str, "candidateSha": str, "findings": list},
     "risk-reviewer": {"assignmentId": str, "candidateSha": str, "findings": list},
     "triage-pm": {"assignmentId": str, "decisions": list},
@@ -47,9 +47,9 @@ AGENT_SCHEMAS = {
 
 FINDING_FIELDS = {"id": str, "severity": str, "location": str, "failure": str, "reproduction": str, "requirement": str, "evidence": str, "candidateIntroduced": bool}
 ROLE_PROMPTS = {
-    "contract-reviewer": "Check only acceptance criteria, required behavior/tests, and candidate-introduced regressions. Finding severity must be exactly P0, P1, P2, or P3. Do not inspect unrelated code.",
-    "risk-reviewer": "Independently check only candidate correctness, regression, security/data-loss, changed error paths, and missing candidate tests. Finding severity must be exactly P0, P1, P2, or P3.",
-    "triage-pm": "Decide each supplied finding once: accept-blocker, backlog, discard, or needs-user. Unsupported and pre-existing findings cannot block.",
+    "contract-reviewer": "Check only acceptance criteria, required behavior/tests, and candidate-introduced regressions. Finding severity must be exactly P0, P1, P2, or P3. Do not inspect unrelated code. Do not block on work explicitly owned by a later task.",
+    "risk-reviewer": "Independently check only candidate correctness, regression, security/data-loss, changed error paths, and missing candidate tests. Finding severity must be exactly P0, P1, P2, or P3. Do not block on work explicitly owned by a later task.",
+    "triage-pm": "Decide each supplied finding once: accept-blocker, backlog, discard, or needs-user. Unsupported, pre-existing, deferred, and out-of-scope findings cannot enter repair.",
     "verification-reviewer": "Verify only the accepted blocker and exact repair delta. Return resolved, unresolved, or invalid-result; do not reopen full review.",
     "audit-planner": "Define one finite list of explicit audit scopes. Every scopeId must be AUDIT-NNNN, starting at AUDIT-0001. Never request an unrestricted search or another audit.",
     "audit-worker": "Inspect only the assigned finite scope, read-only, and return evidence-backed findings with severity exactly P0, P1, P2, or P3. Do not create more work.",
@@ -72,7 +72,7 @@ FINDING_JSON = _json_object({
 ROLE_JSON_SCHEMAS = {
     "worker": _json_object({
         "mode": {"type": "string", "enum": ["task", "bug", "repair"]}, "assignmentId": {"type": "string"}, "status": {"type": "string", "enum": ["candidate"]},
-        "candidateSha": {"type": "string"}, "changedPaths": _string_array(),
+        "candidateSha": {"type": "string"},
         "validation": {"type": "array", "items": _json_object({"command": {"type": "string"}, "exitCode": {"type": "integer"}})},
         "summary": {"type": "string"},
     }),
@@ -151,6 +151,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--plan", type=Path, help="plan path (default for new campaigns: <repo>/PLAN.md)")
     result.add_argument("--dry-run", action="store_true")
     result.add_argument("--cleanup", action="store_true")
+    result.add_argument("--recover", action="store_true", help="preview or apply recovery of a needs-user campaign")
+    result.add_argument("--defer-blocker", action="append", default=[], metavar="BUG-NNNN")
+    result.add_argument("--grant-attempt", action="append", default=[], metavar="TASK-NNNN")
     result.add_argument("--confirm", action="store_true")
     return result
 
@@ -554,6 +557,10 @@ def exclude_relay_files(repo: Path) -> None:
         atomic_write(exclude, existing + ("" if not existing or existing.endswith("\n") else "\n") + "\n".join(missing) + "\n")
 
 
+def finding_path(location: str) -> str:
+    return re.sub(r":\d+(?::\d+)?$", "", location.replace("\\", "/"))
+
+
 def render_bugs(campaign: str, repo: Path, bugs: list[dict] | None = None) -> str:
     lines = ["# Bugs", "", f"<!-- relay: campaign={campaign} repository={hashlib.sha256(str(repo.resolve()).encode()).hexdigest()[:12]} -->", ""]
     for bug in bugs or []:
@@ -562,7 +569,7 @@ def render_bugs(campaign: str, repo: Path, bugs: list[dict] | None = None) -> st
             f"- Source: {bug['source']}", f"- Source finding: {bug.get('sourceFindingId', bug['id'])}",
             f"- Location: {bug['location']}", f"- Observable failure: {bug['failure']}",
             f"- Reproduction: `{bug['reproduction']}`", f"- Requirement: {bug['requirement']}", f"- Evidence: {bug['evidence']}",
-            "- Allowed paths:", *[f"  - `{item}`" for item in bug.get("allowedPaths", [bug["location"].replace("\\", "/").split(":", 1)[0]])],
+            "- Allowed paths:", *[f"  - `{item}`" for item in bug.get("allowedPaths", [finding_path(bug["location"])])],
             f"- Branch: {bug.get('branch', 'pending')}", f"- Pull request: {bug.get('pullRequest', 'pending')}", f"- Candidate: {bug.get('candidate', 'pending')}", "",
         ]
     return "\n".join(lines).rstrip() + "\n"
@@ -587,7 +594,7 @@ def parse_bugs(text: str) -> tuple[dict, list[dict]]:
             "id": heading.group(1), "title": heading.group(2), "severity": values["Severity"], "status": values["Status"],
             "source": values["Source"], "location": values["Location"], "failure": values["Observable failure"],
             "sourceFindingId": _field(block, "Source finding") if "- Source finding:" in block else heading.group(1),
-            "allowedPaths": _sublist(block, "Allowed paths") if "- Allowed paths:" in block else [values["Location"].replace("\\", "/").split(":", 1)[0]],
+            "allowedPaths": _sublist(block, "Allowed paths") if "- Allowed paths:" in block else [finding_path(values["Location"])],
             "reproduction": reproduction[1:-1] if reproduction.startswith("`") and reproduction.endswith("`") else reproduction,
             "requirement": values["Requirement"], "evidence": values["Evidence"], "branch": values["Branch"],
             "pullRequest": values["Pull request"], "candidate": values["Candidate"],
@@ -703,7 +710,14 @@ Bounded context: {json.dumps(context)}
 Return only the required JSON."""
 
 
-def _consume_agent_call(store: StateStore, assignment_id: str, role: str, mode: str | None, review: bool, audit: bool) -> tuple[int, str]:
+def task_ownership(store: StateStore) -> list[dict]:
+    return [
+        {key: task[key] for key in ("id", "title", "dependencies", "allowedPaths")}
+        for task in load_tasks(store)
+    ]
+
+
+def _consume_agent_call(store: StateStore, assignment_id: str, role: str, mode: str | None, review: bool, audit: bool) -> tuple[int | str, str]:
     result = {}
     def change(state: dict) -> None:
         if review:
@@ -718,10 +732,17 @@ def _consume_agent_call(store: StateStore, assignment_id: str, role: str, mode: 
             state["auditCallsStarted"] += 1
             number = state["auditCallsStarted"]
         else:
-            if state["attemptCounters"].get(assignment_id, 0) >= state["taskAttemptLimit"]:
-                raise RuntimeError("implementation attempt limit exhausted")
-            state["attemptCounters"][assignment_id] = state["attemptCounters"].get(assignment_id, 0) + 1
-            number = state["attemptCounters"][assignment_id]
+            count = state["attemptCounters"].get(assignment_id, 0)
+            if count < state["taskAttemptLimit"]:
+                state["attemptCounters"][assignment_id] = count + 1
+                number = state["attemptCounters"][assignment_id]
+            else:
+                granted = state.get("recoveryAttemptGrants", {}).get(assignment_id, 0)
+                started = state.setdefault("recoveryAttemptsStarted", {}).get(assignment_id, 0)
+                if started >= granted:
+                    raise RuntimeError("implementation attempt limit exhausted")
+                state["recoveryAttemptsStarted"][assignment_id] = started + 1
+                number = f"recovery-{started + 1}"
         process_id = f"{assignment_id}:{role}:{number}"
         state["activeProcesses"][process_id] = {"assignmentId": assignment_id, "role": role, "mode": mode, "status": "queued", "reservedAt": datetime.now(timezone.utc).isoformat(), "deadlineSeconds": state["agentTimeoutSeconds"]}
         result.update(number=number, process_id=process_id)
@@ -734,6 +755,13 @@ def _consume_agent_call(store: StateStore, assignment_id: str, role: str, mode: 
             count = store.state["attemptCounters"][assignment_id]
             update_task_ledger(store, assignment_id, attempt=f"{count}/{store.state['taskAttemptLimit']}")
     return result["number"], result["process_id"]
+
+
+def worker_attempt_available(state: dict, assignment_id: str) -> bool:
+    return (
+        state["attemptCounters"].get(assignment_id, 0) < state["taskAttemptLimit"]
+        or state.get("recoveryAttemptsStarted", {}).get(assignment_id, 0) < state.get("recoveryAttemptGrants", {}).get(assignment_id, 0)
+    )
 
 
 def invoke_agent(store: StateStore, semaphore: threading.Semaphore, repo: Path, assignment_id: str, role: str, prompt: str, *, mode: str | None = None, review: bool = False, audit: bool = False) -> dict:
@@ -879,19 +907,24 @@ def validate_candidate(store: StateStore, assignment: dict, worktree: Path, resu
     sha = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
     if result["candidateSha"] != sha:
         raise ValueError("reported candidate does not equal worktree HEAD")
+    dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout.splitlines()
+    if dirty:
+        raise ValueError("candidate worktree has uncommitted changes")
     assignment_base = store.state["worktrees"][assignment["id"]]["baseSha"]
     ancestry = git(worktree, "merge-base", "--is-ancestor", assignment_base, sha, timeout=store.state["validationTimeoutSeconds"], check=False)
     if ancestry.returncode:
         raise ValueError("candidate does not descend from expected base")
     changed = target_changes(store, worktree, assignment_base, sha)
-    if sorted(changed) != sorted(result["changedPaths"]) or any(not allowed_change(item, assignment["allowedPaths"]) for item in changed):
-        raise ValueError("candidate changed paths outside assignment scope")
+    outside = sorted(item for item in changed if not allowed_change(item, assignment["allowedPaths"]))
+    if outside:
+        raise ValueError(f"candidate changed paths outside assignment scope: {', '.join(outside)}")
     store.update(lambda state: state["taskStates"][assignment["id"]].__setitem__("validationShellVersion", 2))
     run_validations(store, assignment, worktree)
     def accepted(state: dict) -> None:
         state["candidateShas"][assignment["id"]] = sha
         state["taskStates"][assignment["id"]].update(candidateSha=sha, phase="push-and-open-pr")
         state["taskStates"][assignment["id"]].pop("error", None)
+        state["taskStates"][assignment["id"]].pop("pendingWorkerSha", None)
     store.update(accepted)
     console("DONE", f"operation=candidate assignment={assignment['id']} sha={sha[:12]} validation=passed")
     return sha
@@ -1093,15 +1126,24 @@ def git_provider_with_retries(store: StateStore, key: str, repo: Path, *args: st
 def publish_candidate(store: StateStore, assignment: dict, worktree: Path, branch: str, sha: str) -> dict:
     assignment_id, task_state = assignment["id"], store.state["taskStates"][assignment["id"]]
     start_operation(store, assignment_id, "publish", store.state["providerTimeoutSeconds"])
-    if task_state.get("pushedSha") != sha:
+    pushed = task_state.get("pushedSha") != sha
+    if pushed:
         remote = git_provider_with_retries(store, f"{assignment_id}:ls-remote", worktree, "ls-remote", "--heads", "origin", f"refs/heads/{branch}")
         if not remote.stdout.startswith(sha):
-            git_provider_with_retries(store, f"{assignment_id}:push:{sha}", worktree, "push", "--set-upstream", "origin", branch)
+            remote_sha = remote.stdout.split()[0] if remote.stdout.split() else ""
+            lease = (f"--force-with-lease=refs/heads/{branch}:{remote_sha}",) if remote_sha else ()
+            git_provider_with_retries(store, f"{assignment_id}:push:{sha}", worktree, "push", *lease, "--set-upstream", "origin", branch)
         store.update(lambda state: state["taskStates"][assignment_id].update(pushed=True, pushedSha=sha))
         console("DONE", f"operation=publish assignment={assignment_id} branch={branch}")
     if task_state.get("pr"):
+        refresh = pushed or task_state["pr"].get("headRefOid") != sha
+        pr = pr_inspect(store, f"{assignment_id}:pr-refresh:{sha}", task_state["pr"]["number"]) if refresh else task_state["pr"]
+        if pr["headRefOid"] != sha:
+            raise RuntimeError("provider pull request source commit does not match candidate")
+        if refresh:
+            store.update(lambda state: (state["taskStates"][assignment_id].__setitem__("pr", pr), state["pullRequests"].__setitem__(assignment_id, pr)))
         clear_operation(store, assignment_id, "publish")
-        return task_state["pr"]
+        return pr
     body = store.path.parent / f".{assignment_id}-pr.md"
     atomic_write(body, f"Relay assignment {assignment_id}\n\nCandidate: {sha}\n")
     try:
@@ -1143,6 +1185,7 @@ def record_findings(store: StateStore, assignment_id: str, findings: list[dict],
                     "status": "active" if action == "accept-blocker" else "backlog", "source": assignment_id,
                     "sourceFindingId": finding["id"], "location": finding["location"], "failure": finding["failure"],
                     "reproduction": finding["reproduction"], "requirement": finding["requirement"], "evidence": finding["evidence"],
+                    "allowedPaths": [finding_path(finding["location"])],
                 }
                 bugs.append(bug)
                 known.add(finding_key)
@@ -1172,6 +1215,7 @@ def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: di
     session = ensure_review_session(store, assignment_id, sha)
     try:
         if session["phase"] == "initial-review":
+            ownership = task_ownership(store)
             roles = [role for role in ("contract-reviewer", "risk-reviewer") if role not in session["initialResults"]]
             if roles:
                 def start_logical_assignments(state: dict) -> None:
@@ -1182,7 +1226,7 @@ def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: di
                     current["initialReviewAssignmentsStarted"] += len(new_roles)
                 store.update(start_logical_assignments)
                 with ThreadPoolExecutor(max_workers=len(roles)) as pool:
-                    futures = {pool.submit(invoke_with_replacements, store, semaphore, worktree, assignment_id, role, role_prompt(role, assignment, sha, {}), review=True): role for role in roles}
+                    futures = {pool.submit(invoke_with_replacements, store, semaphore, worktree, assignment_id, role, role_prompt(role, assignment, sha, {"taskOwnership": ownership}), review=True): role for role in roles}
                     for future in as_completed(futures):
                         role, result = futures[future], future.result()
                         if result["candidateSha"] != sha:
@@ -1192,7 +1236,7 @@ def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: di
             store.save()
         if session["phase"] == "triage":
             findings = [finding for result in session["initialResults"].values() for finding in result["findings"]]
-            triage = invoke_with_replacements(store, semaphore, worktree, assignment_id, "triage-pm", role_prompt("triage-pm", assignment, sha, findings), review=True)
+            triage = invoke_with_replacements(store, semaphore, worktree, assignment_id, "triage-pm", role_prompt("triage-pm", assignment, sha, {"findings": findings, "taskOwnership": task_ownership(store)}), review=True)
             if any(item["action"] == "needs-user" for item in triage["decisions"]):
                 transition_review(session, "needs-user", store.state["fixLoopLimit"])
                 session["triageCompleted"] = True
@@ -1206,35 +1250,56 @@ def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: di
                 current["acceptedBlockerIds"] = [item["id"] for item in accepted]
                 transition_review(current, "repair-1" if accepted and state["fixLoopLimit"] else "needs-user" if accepted else "approved", state["fixLoopLimit"])
                 current["reviewedSha"] = sha if not accepted else ""
+                current["currentCandidateSha"] = sha
             store.update(triaged)
             console("DONE", f"operation=internal-review assignment={assignment_id} blockers={len(accepted)}")
-        while session["phase"].startswith("repair-"):
+        while session["phase"] not in TERMINAL_REVIEW_PHASES:
             number = int(session["phase"].split("-")[1])
-            if session["repairAttemptsStarted"] >= store.state["fixLoopLimit"]:
-                transition_review(session, "needs-user", store.state["fixLoopLimit"])
-                store.save()
-                return False
-            store.update(lambda state: state["reviewSessions"][assignment_id].__setitem__("repairAttemptsStarted", state["reviewSessions"][assignment_id]["repairAttemptsStarted"] + 1))
             blockers = [bug for bug in load_bugs(store) if bug["id"] in session["acceptedBlockerIds"]]
-            try:
-                repair = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt("repair", assignment, sha, blockers, store.state["taskStates"][assignment_id].get("error", "")), mode="repair", review=True)
-                repaired_sha = validate_candidate(store, assignment, worktree, repair)
-            except (RuntimeError, ValueError, json.JSONDecodeError) as error:
-                store.state["taskStates"][assignment_id]["error"] = str(error)
-                target = f"repair-{number + 1}" if number < store.state["fixLoopLimit"] and session["reviewCallsStarted"] < session["reviewCallLimit"] else "needs-user"
-                transition_review(session, target, store.state["fixLoopLimit"])
+            if session["phase"].startswith("repair-"):
+                outside = sorted({path for bug in blockers for path in bug.get("allowedPaths", []) if not allowed_change(path, assignment["allowedPaths"])})
+                if outside:
+                    store.state["taskStates"][assignment_id]["error"] = f"accepted blocker requires paths outside assignment scope: {', '.join(outside)}"
+                    transition_review(session, "needs-user", store.state["fixLoopLimit"])
+                    store.save()
+                    return False
+                current_sha = session.get("previousCandidateSha") or session.get("currentCandidateSha", sha)
+                try:
+                    if session.get("pendingWorkerSha"):
+                        repair = {"candidateSha": session["pendingWorkerSha"]}
+                    else:
+                        if session["repairAttemptsStarted"] >= store.state["fixLoopLimit"]:
+                            transition_review(session, "needs-user", store.state["fixLoopLimit"])
+                            store.save()
+                            return False
+                        store.update(lambda state: state["reviewSessions"][assignment_id].__setitem__("repairAttemptsStarted", state["reviewSessions"][assignment_id]["repairAttemptsStarted"] + 1))
+                        repair = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt("repair", assignment, current_sha, blockers, store.state["taskStates"][assignment_id].get("error", "")), mode="repair", review=True)
+                        session.update(previousCandidateSha=current_sha, pendingWorkerSha=repair["candidateSha"])
+                        store.save()
+                    repaired_sha = validate_candidate(store, assignment, worktree, repair)
+                except (RuntimeError, ValueError, json.JSONDecodeError) as error:
+                    store.state["taskStates"][assignment_id]["error"] = str(error)
+                    session.pop("pendingWorkerSha", None)
+                    target = f"repair-{number + 1}" if number < store.state["fixLoopLimit"] and session["reviewCallsStarted"] < session["reviewCallLimit"] else "needs-user"
+                    transition_review(session, target, store.state["fixLoopLimit"])
+                    store.save()
+                    continue
+                session.update(currentCandidateSha=repaired_sha, pendingRepairSha=repaired_sha, pendingRepairNumber=number)
+                session.pop("pendingWorkerSha", None)
+                transition_review(session, f"verify-{number}", store.state["fixLoopLimit"])
                 store.save()
                 continue
-            transition_review(session, f"verify-{number}", store.state["fixLoopLimit"])
-            store.save()
-            verification = invoke_with_replacements(store, semaphore, worktree, assignment_id, "verification-reviewer", role_prompt("verification-reviewer", assignment, repaired_sha, {"blockers": blockers, "previousCandidate": sha, "repairDiff": f"{sha}..{repaired_sha}"}), review=True)
+            repaired_sha = session["pendingRepairSha"]
+            previous_sha = session["previousCandidateSha"]
+            verification = invoke_with_replacements(store, semaphore, worktree, assignment_id, "verification-reviewer", role_prompt("verification-reviewer", assignment, repaired_sha, {"blockers": blockers, "previousCandidate": previous_sha, "repairDiff": f"{previous_sha}..{repaired_sha}"}), review=True)
             console("DONE", f"operation=repair assignment={assignment_id} fix={number}/{store.state['fixLoopLimit']} result={verification['status']}")
             if verification["candidateSha"] != repaired_sha:
                 raise ValueError("verification reviewer changed candidate SHA")
-            sha = repaired_sha
             if verification["status"] == "resolved":
                 transition_review(session, "approved", store.state["fixLoopLimit"])
-                session["reviewedSha"] = sha
+                session["reviewedSha"] = repaired_sha
+                session.pop("pendingRepairSha", None)
+                session.pop("pendingRepairNumber", None)
                 with store.lock:
                     bugs = load_bugs(store)
                     for bug in blockers:
@@ -1243,6 +1308,8 @@ def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: di
                 break
             target = f"repair-{number + 1}" if number < store.state["fixLoopLimit"] else "needs-user"
             transition_review(session, target, store.state["fixLoopLimit"])
+            session.pop("pendingRepairSha", None)
+            session.pop("pendingRepairNumber", None)
             store.save()
         return session["phase"] == "approved"
     except (RuntimeError, ValueError, json.JSONDecodeError) as error:
@@ -1499,18 +1566,22 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
         task_state.update(worktree=str(worktree), branch=branch)
         store.save()
         sha = task_state.get("candidateSha")
-        while not sha and store.state["attemptCounters"].get(assignment_id, 0) < store.state["taskAttemptLimit"]:
+        while not sha and (task_state.get("pendingWorkerSha") or worker_attempt_available(store.state, assignment_id)):
             task_state["phase"] = "implementing"
             store.save()
             try:
-                result = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt(mode, assignment, previous_failure=task_state.get("error", "")), mode=mode)
-                if result["status"] != "candidate":
-                    raise ValueError("Worker did not return a candidate")
-                task_state["phase"] = "candidate-validation"
-                store.save()
+                if task_state.get("pendingWorkerSha"):
+                    result = {"candidateSha": task_state["pendingWorkerSha"]}
+                else:
+                    result = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt(mode, assignment, previous_failure=task_state.get("error", "")), mode=mode)
+                    task_state.update(pendingWorkerSha=result["candidateSha"], phase="candidate-validation")
+                    store.save()
                 sha = validate_candidate(store, assignment, worktree, result)
+                task_state.pop("pendingWorkerSha", None)
+                store.save()
             except (RuntimeError, ValueError, json.JSONDecodeError) as error:
                 task_state["error"] = str(error)
+                task_state.pop("pendingWorkerSha", None)
                 store.save()
                 sha = None
         if not sha:
@@ -1519,9 +1590,15 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
             console("BLOCKED", f"operation=worker assignment={assignment_id} reason={task_state.get('error', 'attempt budget exhausted')}")
             clear_operation(store, assignment_id)
             return False
-        pr = publish_candidate(store, assignment, worktree, branch, sha)
-        task_state["phase"] = "initial-review"
-        store.save()
+        session = store.state.get("reviewSessions", {}).get(assignment_id)
+        if session:
+            pr = task_state.get("pr") or store.state.get("pullRequests", {}).get(assignment_id)
+            if not pr:
+                pr = publish_candidate(store, assignment, worktree, branch, session.get("initialCandidateSha", sha))
+        else:
+            pr = publish_candidate(store, assignment, worktree, branch, sha)
+            task_state["phase"] = "initial-review"
+            store.save()
         if not run_review(store, semaphore, assignment, worktree, sha):
             task_state["phase"] = "needs-user"
             store.save()
@@ -1532,6 +1609,8 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
         task_state["phase"] = "approved"
         store.save()
         console("DONE", f"operation=internal-review assignment={assignment_id} result=approved sha={session['reviewedSha'][:12]}")
+        if task_state.get("pushedSha") != session["reviewedSha"]:
+            pr = publish_candidate(store, assignment, worktree, branch, session["reviewedSha"])
         if not merge_assignment(store, semaphore, assignment, worktree, branch, pr, session["reviewedSha"]):
             return False
         if mode == "task":
@@ -1837,6 +1916,163 @@ def bootstrap_agents(store: StateStore) -> bool:
         return _agents_bootstrap_needs_user(store, str(error))
 
 
+def recovery_worktree(store: StateStore, assignment_id: str) -> tuple[Path, dict]:
+    record = store.state.get("worktrees", {}).get(assignment_id)
+    if not record:
+        raise RuntimeError(f"recovery worktree is missing: {assignment_id}")
+    campaign_root = Path(tempfile.gettempdir()).resolve() / "relay-worktrees" / store.state["campaignId"]
+    root = safe_within(Path(record.get("root", record["path"])), campaign_root)
+    worktree = safe_within(Path(record["path"]), root)
+    if not worktree.is_dir():
+        raise RuntimeError(f"recovery worktree does not exist: {assignment_id}")
+    top = Path(git(worktree, "rev-parse", "--show-toplevel", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()).resolve()
+    if top != root:
+        raise RuntimeError(f"recovery worktree mismatch: {assignment_id}")
+    return worktree, record
+
+
+def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str], grants: list[str]) -> list[dict]:
+    pending = store.state.get("pendingRecovery")
+    if pending:
+        if not isinstance(pending, dict) or not isinstance(pending.get("actions"), list) or not isinstance(pending.get("completed"), list):
+            raise RuntimeError("invalid pending recovery journal")
+        return pending["actions"]
+    if store.state.get("phase") != "needs-user" or store.state.get("activeProcesses"):
+        raise RuntimeError("recovery requires an inactive needs-user campaign")
+    by_id = {task["id"]: task for task in tasks}
+    bugs = {bug["id"]: bug for bug in load_bugs(store)}
+    if len(deferred) != len(set(deferred)) or any(bug_id not in bugs or bugs[bug_id]["status"] != "active" for bug_id in deferred):
+        raise ValueError("--defer-blocker requires unique active campaign bug IDs")
+    if len(grants) != len(set(grants)) or any(task_id not in by_id for task_id in grants):
+        raise ValueError("--grant-attempt requires unique campaign task IDs")
+    actions = []
+    handled = set()
+    for assignment_id, task_state in sorted(store.state.get("taskStates", {}).items()):
+        if assignment_id not in by_id or task_state.get("phase") != "needs-user":
+            continue
+        assignment = by_id[assignment_id]
+        if assignment_id in grants:
+            worktree, _ = recovery_worktree(store, assignment_id)
+            head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
+            dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout.splitlines()
+            interrupted = any(item.get("assignmentId") == assignment_id and item.get("role") == "worker" for item in store.state.get("interruptedProcesses", []))
+            if dirty and not interrupted:
+                raise RuntimeError(f"cannot grant an attempt for an unexpectedly dirty worktree: {assignment_id}")
+            actions.append({"action": "grant-attempt", "assignmentId": assignment_id, "grant": store.state.get("recoveryAttemptGrants", {}).get(assignment_id, 0) + 1, "headSha": head, "dirty": dirty, "interruptionCause": "unknown" if interrupted else "none"})
+            handled.add(assignment_id)
+            continue
+        error = str(task_state.get("error", ""))
+        if error == "provider pull request source commit does not match candidate" and task_state.get("candidateSha"):
+            worktree, record = recovery_worktree(store, assignment_id)
+            candidate = task_state["candidateSha"]
+            head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
+            dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout
+            remote = git(worktree, "ls-remote", "--heads", "origin", f"refs/heads/{record['branch']}", timeout=store.state["providerTimeoutSeconds"]).stdout
+            if head != candidate or dirty or not remote.startswith(candidate):
+                raise RuntimeError(f"publication state drifted during recovery: {assignment_id}")
+            actions.append({"action": "resume-publish", "assignmentId": assignment_id, "candidateSha": candidate})
+            handled.add(assignment_id)
+            continue
+        session = store.state.get("reviewSessions", {}).get(assignment_id)
+        if not session:
+            continue
+        accepted = set(session.get("acceptedBlockerIds", []))
+        deferred_here = accepted & set(deferred)
+        worktree, record = recovery_worktree(store, assignment_id)
+        head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
+        dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout.splitlines()
+        if deferred_here == accepted and accepted:
+            if dirty:
+                raise RuntimeError(f"cannot restore dirty recovery worktree: {assignment_id}")
+            original = session["initialCandidateSha"]
+            actions.append({"action": "defer-review", "assignmentId": assignment_id, "bugIds": sorted(accepted), "headSha": head, "candidateSha": original, "branch": record["branch"]})
+            handled.add(assignment_id)
+            continue
+        changed = target_changes(store, worktree, record["baseSha"], head)
+        outside = sorted(path for path in changed if not allowed_change(path, assignment["allowedPaths"]))
+        if not dirty and not outside and head != session.get("initialCandidateSha"):
+            actions.append({"action": "salvage-repair", "assignmentId": assignment_id, "headSha": head, "previousSha": session.get("currentCandidateSha") or session["initialCandidateSha"], "repair": session["repairAttemptsStarted"]})
+            handled.add(assignment_id)
+    unresolved = sorted(
+        assignment_id for assignment_id, task_state in store.state.get("taskStates", {}).items()
+        if assignment_id in by_id and task_state.get("phase") == "needs-user" and assignment_id not in handled
+    )
+    if unresolved:
+        raise RuntimeError(f"recovery needs an explicit disposition: {', '.join(unresolved)}")
+    return actions
+
+
+def print_recovery(actions: list[dict]) -> None:
+    for action in actions:
+        detail = f"assignment={action['assignmentId']} action={action['action']}"
+        if action.get("bugIds"):
+            detail += f" blockers={','.join(action['bugIds'])}"
+        print(f"RECOVER {detail}")
+
+
+def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) -> None:
+    by_id = {task["id"]: task for task in tasks}
+    if not store.state.get("pendingRecovery"):
+        store.update(lambda state: state.__setitem__("pendingRecovery", {"actions": actions, "completed": []}))
+    completed = set(store.state["pendingRecovery"]["completed"])
+    bugs = load_bugs(store)
+    for action in actions:
+        assignment_id = action["assignmentId"]
+        key = f"{action['action']}:{assignment_id}"
+        if key in completed:
+            continue
+        task_state = store.state["taskStates"][assignment_id]
+        if action["action"] == "grant-attempt":
+            worktree, _ = recovery_worktree(store, assignment_id)
+            head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
+            dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout.splitlines()
+            if head != action["headSha"] or dirty != action["dirty"]:
+                raise RuntimeError(f"recovery worktree changed: {assignment_id}")
+            store.state.setdefault("recoveryAttemptGrants", {})[assignment_id] = max(store.state.get("recoveryAttemptGrants", {}).get(assignment_id, 0), action["grant"])
+            task_state.update(phase="ready")
+            task_state.pop("error", None)
+        elif action["action"] == "resume-publish":
+            if task_state.get("candidateSha") != action["candidateSha"]:
+                raise RuntimeError(f"candidate changed during recovery: {assignment_id}")
+            task_state.update(phase="push-and-open-pr")
+            task_state.pop("error", None)
+        elif action["action"] == "defer-review":
+            worktree, record = recovery_worktree(store, assignment_id)
+            head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
+            if head not in {action["headSha"], action["candidateSha"]} or git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout:
+                raise RuntimeError(f"recovery worktree changed: {assignment_id}")
+            rejected = action["headSha"]
+            archive = f"archive/{store.state['campaignId']}/{assignment_id}/rejected-{rejected[:12]}"
+            existing = git(worktree, "show-ref", "--verify", f"refs/heads/{archive}", timeout=store.state["validationTimeoutSeconds"], check=False)
+            if existing.returncode:
+                git(worktree, "branch", archive, rejected, timeout=store.state["validationTimeoutSeconds"])
+            elif not existing.stdout.startswith(rejected):
+                raise RuntimeError(f"recovery archive ref collision: {archive}")
+            if head != action["candidateSha"]:
+                git(worktree, "reset", "--hard", action["candidateSha"], timeout=store.state["validationTimeoutSeconds"])
+            for bug in bugs:
+                if bug["id"] in action["bugIds"]:
+                    bug["status"] = "backlog"
+            write_bugs(store, bugs)
+            session = store.state["reviewSessions"][assignment_id]
+            session.update(phase="approved", reviewedSha=action["candidateSha"], currentCandidateSha=action["candidateSha"], acceptedBlockerIds=[])
+            session.pop("pendingRepairSha", None)
+            session.pop("pendingRepairNumber", None)
+            task_state.update(phase="approved", candidateSha=action["candidateSha"])
+            task_state.pop("error", None)
+        elif action["action"] == "salvage-repair":
+            worktree, _ = recovery_worktree(store, assignment_id)
+            if task_state.get("candidateSha") != action["headSha"]:
+                validate_candidate(store, by_id[assignment_id], worktree, {"candidateSha": action["headSha"]})
+            session = store.state["reviewSessions"][assignment_id]
+            session.update(phase=f"verify-{action['repair']}", previousCandidateSha=action["previousSha"], currentCandidateSha=action["headSha"], pendingRepairSha=action["headSha"], pendingRepairNumber=action["repair"])
+            task_state.update(phase=f"verify-{action['repair']}")
+            task_state.pop("error", None)
+        store.state["pendingRecovery"]["completed"].append(key)
+        store.save()
+    store.update(lambda state: (state.setdefault("recoveryHistory", []).append({"recoveredAt": datetime.now(timezone.utc).isoformat(), "actions": actions}), state.__setitem__("pendingRecovery", None), state.__setitem__("phase", "build")))
+
+
 def reconcile(store: StateStore) -> None:
     repository = Path(store.state["repository"])
     if git(repository, "rev-parse", "--show-toplevel", timeout=store.state["providerTimeoutSeconds"], check=False).returncode == 0:
@@ -2076,6 +2312,10 @@ def main(argv: list[str] | None = None) -> int:
     repo = args.repo.resolve()
     if not repo.is_dir():
         parser().error("repository does not exist")
+    if (args.defer_blocker or args.grant_attempt) and not args.recover:
+        parser().error("--defer-blocker and --grant-attempt require --recover")
+    if args.recover and (args.cleanup or args.dry_run or args.plan):
+        parser().error("--recover cannot be combined with --cleanup, --dry-run, or --plan")
     if args.cleanup:
         try:
             return permanent_cleanup(repo, args.confirm)
@@ -2118,11 +2358,20 @@ def main(argv: list[str] | None = None) -> int:
             parse_tasks(text)
             store, tasks = initialize_campaign(repo, text, args)
             resuming = False
+        if args.recover and not resuming:
+            raise RuntimeError("recovery requires an existing campaign")
+        if args.recover and not args.confirm:
+            print_recovery(plan_recovery(store, load_tasks(store), args.defer_blocker, args.grant_attempt))
+            return 0
         stderr_event("START", f"operation=campaign campaign={store.state['campaignId']} workers={store.state['workerLimit']} tasks={store.state.get('taskTotal', len(tasks or []))}")
         with coordinator_lock(store.path.parent):
             if resuming:
                 reconcile(store)
                 tasks = load_tasks(store)
+            if args.recover:
+                actions = plan_recovery(store, tasks, args.defer_blocker, args.grant_attempt)
+                print_recovery(actions)
+                apply_recovery(store, tasks, actions)
             stop = threading.Event()
             heartbeat = threading.Thread(target=heartbeat_loop, args=(store, stop), daemon=True)
             heartbeat.start()
