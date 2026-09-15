@@ -222,8 +222,10 @@ def invoke_agent(repo: Path, prompt: str, schema: dict, timeout: int, budget: Ca
         root = Path(temporary)
         schema_path, result_path = root / "schema.json", root / "result.json"
         schema_path.write_text(json.dumps(schema), encoding="utf-8")
+        in_git_worktree = any((parent / ".git").exists() for parent in (repo, *repo.parents))
         invocation = command("codex") + [
-            "exec", "--ephemeral", "--sandbox", "read-only", "--cd", str(repo),
+            "exec", *([] if in_git_worktree else ["--skip-git-repo-check"]),
+            "--ephemeral", "--sandbox", "read-only", "--cd", str(repo),
             "--output-schema", str(schema_path), "--output-last-message", str(result_path), "-",
         ]
         completed = subprocess.run(invocation, input=prompt, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout)

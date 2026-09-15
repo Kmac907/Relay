@@ -220,6 +220,16 @@ class PlanningTests(unittest.TestCase):
                 plan.invoke_agent(Path(root), "prompt", {"type": "object"}, .01, budget)
             self.assertEqual(budget.started, 1)
 
+    def test_only_gitless_scouts_skip_codex_repo_check(self):
+        with tempfile.TemporaryDirectory() as root:
+            snapshot, repository = Path(root) / "snapshot", Path(root) / "repository"
+            snapshot.mkdir(); (repository / ".git").mkdir(parents=True)
+            subdirectory = repository / "subdirectory"; subdirectory.mkdir()
+            for directory, skipped in ((snapshot, True), (subdirectory, False)):
+                with self.subTest(directory=directory.name), patch("plan.subprocess.run", side_effect=subprocess.TimeoutExpired("codex", .01)) as command, self.assertRaises(subprocess.TimeoutExpired):
+                    plan.invoke_agent(directory, "prompt", {"type": "object"}, .01, plan.CallBudget(1))
+                self.assertEqual("--skip-git-repo-check" in command.call_args.args[0], skipped)
+
     def test_real_plan_file_to_dry_run_needs_no_pipe(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
