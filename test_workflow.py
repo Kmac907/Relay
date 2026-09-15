@@ -102,6 +102,12 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(metadata["campaignId"], "campaign")
             self.assertEqual(bugs[0]["reproduction"], "python x.py")
 
+    def test_finding_line_ranges_are_not_part_of_allowed_path(self):
+        with tempfile.TemporaryDirectory() as root:
+            bug = {"id": "BUG-0001", "title": "Broken", "severity": "P1", "status": "active", "source": "TASK-0001", "location": "src/run.ps1:27-34,60-70", "failure": "fails", "reproduction": "test", "requirement": "works", "evidence": "failure"}
+            _, bugs = run.parse_bugs(run.render_bugs("campaign", Path(root), [bug]))
+            self.assertEqual(bugs[0]["allowedPaths"], ["src/run.ps1"])
+
     def test_invalid_dependency_rejected(self):
         text = plan.render_tasks([self.task(dependencies=["TASK-9999"])], "0123456", "abc123")
         with self.assertRaises(ValueError):
@@ -695,6 +701,25 @@ class DeterministicCoreTests(unittest.TestCase):
                 run.plan_recovery(store, [assignment], ["BUG-9999"], [])
             with self.assertRaisesRegex(ValueError, "campaign task"):
                 run.plan_recovery(store, [assignment], [], ["TASK-9999"])
+
+    def test_recovery_resumes_review_after_correcting_location_range(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            assignment["allowedPaths"] = ["src/run.ps1"]
+            bug = {"id": "BUG-0001", "title": "Broken", "severity": "P1", "status": "active", "source": assignment["id"], "sourceFindingId": "range", "location": "src/run.ps1:27-34,60-70", "failure": "fails", "reproduction": "test", "requirement": "works", "evidence": "failure", "allowedPaths": ["src/run.ps1:27-34,60-70"]}
+            Path(root, "bugs.md").write_text(run.render_bugs("test", Path(root), [bug]), encoding="utf-8")
+            store.state.update(phase="needs-user")
+            store.state["taskStates"][assignment["id"]] = {"phase": "needs-user", "candidateSha": "sha", "error": "accepted blocker requires paths outside assignment scope: src/run.ps1:27-34,60-70"}
+            store.state["reviewSessions"][assignment["id"]] = {"phase": "needs-user", "acceptedBlockerIds": [bug["id"]], "repairAttemptsStarted": 0}
+            def recovery_git(repo_path, *args, **kwargs):
+                return subprocess.CompletedProcess([], 0, "sha\n" if args[0] == "rev-parse" else "", "")
+            with patch("run.recovery_worktree", return_value=(Path(root), {"branch": "branch"})), patch("run.git", side_effect=recovery_git):
+                actions = run.plan_recovery(store, [assignment], [], [])
+                run.apply_recovery(store, [assignment], actions)
+            self.assertEqual(actions[0]["action"], "resume-review")
+            self.assertEqual(store.state["reviewSessions"][assignment["id"]]["phase"], "repair-1")
+            self.assertEqual(store.state["reviewSessions"][assignment["id"]]["repairAttemptsStarted"], 0)
 
     def test_detects_supported_provider_remotes_and_decodes_names(self):
         cases = {

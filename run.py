@@ -558,7 +558,7 @@ def exclude_relay_files(repo: Path) -> None:
 
 
 def finding_path(location: str) -> str:
-    return re.sub(r":\d+(?::\d+)?$", "", location.replace("\\", "/"))
+    return re.sub(r":\d.*$", "", location.replace("\\", "/"))
 
 
 def render_bugs(campaign: str, repo: Path, bugs: list[dict] | None = None) -> str:
@@ -594,7 +594,7 @@ def parse_bugs(text: str) -> tuple[dict, list[dict]]:
             "id": heading.group(1), "title": heading.group(2), "severity": values["Severity"], "status": values["Status"],
             "source": values["Source"], "location": values["Location"], "failure": values["Observable failure"],
             "sourceFindingId": _field(block, "Source finding") if "- Source finding:" in block else heading.group(1),
-            "allowedPaths": _sublist(block, "Allowed paths") if "- Allowed paths:" in block else [finding_path(values["Location"])],
+            "allowedPaths": [finding_path(item) for item in _sublist(block, "Allowed paths")] if "- Allowed paths:" in block else [finding_path(values["Location"])],
             "reproduction": reproduction[1:-1] if reproduction.startswith("`") and reproduction.endswith("`") else reproduction,
             "requirement": values["Requirement"], "evidence": values["Evidence"], "branch": values["Branch"],
             "pullRequest": values["Pull request"], "candidate": values["Candidate"],
@@ -1981,6 +1981,14 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str], gra
         worktree, record = recovery_worktree(store, assignment_id)
         head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
         dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout.splitlines()
+        blockers = [bugs[bug_id] for bug_id in accepted]
+        outside = sorted({path for bug in blockers for path in bug.get("allowedPaths", []) if not allowed_change(path, assignment["allowedPaths"])})
+        if error.startswith("accepted blocker requires paths outside assignment scope:") and accepted and not outside:
+            if dirty or head != task_state.get("candidateSha") or session["repairAttemptsStarted"] >= store.state["fixLoopLimit"]:
+                raise RuntimeError(f"cannot resume corrected review scope: {assignment_id}")
+            actions.append({"action": "resume-review", "assignmentId": assignment_id, "headSha": head, "repair": session["repairAttemptsStarted"] + 1})
+            handled.add(assignment_id)
+            continue
         if deferred_here == accepted and accepted:
             if dirty:
                 raise RuntimeError(f"cannot restore dirty recovery worktree: {assignment_id}")
@@ -2035,6 +2043,15 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
             if task_state.get("candidateSha") != action["candidateSha"]:
                 raise RuntimeError(f"candidate changed during recovery: {assignment_id}")
             task_state.update(phase="push-and-open-pr")
+            task_state.pop("error", None)
+        elif action["action"] == "resume-review":
+            worktree, _ = recovery_worktree(store, assignment_id)
+            head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
+            dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout
+            if head != action["headSha"] or dirty:
+                raise RuntimeError(f"recovery worktree changed: {assignment_id}")
+            store.state["reviewSessions"][assignment_id]["phase"] = f"repair-{action['repair']}"
+            task_state.update(phase=f"repair-{action['repair']}")
             task_state.pop("error", None)
         elif action["action"] == "defer-review":
             worktree, record = recovery_worktree(store, assignment_id)
