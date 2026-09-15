@@ -456,8 +456,8 @@ class DeterministicCoreTests(unittest.TestCase):
             run.exclude_relay_files(target)
             store.state.update(baseSha=base, phase="needs-user")
             assignment = ContractTests().task()
-            assignment["validationCommands"] = ["legacy command"]
-            legacy_error = str(subprocess.CalledProcessError(1, "legacy command"))
+            assignment["validationCommands"] = ["legacy 'command'"]
+            legacy_error = str(subprocess.CalledProcessError(1, "legacy 'command'"))
             task_state = {"phase": "needs-user", "mode": "task", "pushed": False, "merged": False, "worktree": str(target), "branch": "main", "error": legacy_error}
             store.state["taskStates"][assignment["id"]] = task_state
             store.state["worktrees"][assignment["id"]] = {"path": str(target), "root": str(target), "branch": "main", "baseSha": base}
@@ -494,8 +494,8 @@ class DeterministicCoreTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(target), "commit", "-m", "candidate"], check=True, capture_output=True)
             store = self.state_store(target)
             run.exclude_relay_files(target)
-            assignment = ContractTests().task(); assignment["validationCommands"] = ["legacy command"]
-            task_state = {"phase": "needs-user", "mode": "task", "pushed": False, "merged": False, "worktree": str(target), "branch": "main", "error": str(subprocess.CalledProcessError(1, "legacy command"))}
+            assignment = ContractTests().task(); assignment["validationCommands"] = ["legacy 'command'"]
+            task_state = {"phase": "needs-user", "mode": "task", "pushed": False, "merged": False, "worktree": str(target), "branch": "main", "error": str(subprocess.CalledProcessError(1, "legacy 'command'"))}
             store.state["taskStates"][assignment["id"]] = task_state
             store.state["worktrees"][assignment["id"]] = {"path": str(target), "root": str(target), "branch": "main", "baseSha": base}
             store.state["validationCommandsStarted"][assignment["id"]] = 1

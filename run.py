@@ -1271,7 +1271,7 @@ def legacy_candidate(store: StateStore, assignment: dict) -> tuple[Path, str, st
     error = task.get("error")
     if not isinstance(error, str):
         return None
-    failures = [re.fullmatch(rf"Command {re.escape(repr(command))} returned non-zero exit status [1-9]\d*\.", error or "") for command in assignment["validationCommands"]]
+    failures = [re.fullmatch(rf"Command '{re.escape(command)}' returned non-zero exit status [1-9]\d*\.", error) for command in assignment["validationCommands"]]
     if not (
         task.get("phase") == "needs-user"
         and task.get("validationShellVersion", 1) == 1
