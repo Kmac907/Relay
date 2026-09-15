@@ -395,7 +395,10 @@ def coordinator_lock(relay: Path):
 
 
 def tool_command(tool: str) -> list[str]:
-    return shlex.split(os.environ.get(f"RELAY_{tool.upper()}", tool), posix=os.name != "nt")
+    parts = shlex.split(os.environ.get(f"RELAY_{tool.upper()}", tool), posix=os.name != "nt")
+    if os.name == "nt" and parts:
+        parts[0] = shutil.which(parts[0]) or parts[0]
+    return parts
 
 
 def run_tool(tool: str, *args: str, timeout: int, cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:

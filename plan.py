@@ -143,7 +143,10 @@ def json_schema(properties: dict[str, type], array_name: str | None = None) -> d
 
 
 def command(tool: str) -> list[str]:
-    return shlex.split(os.environ.get(f"RELAY_{tool.upper()}", tool), posix=os.name != "nt")
+    parts = shlex.split(os.environ.get(f"RELAY_{tool.upper()}", tool), posix=os.name != "nt")
+    if os.name == "nt" and parts:
+        parts[0] = shutil.which(parts[0]) or parts[0]
+    return parts
 
 
 def git(repo: Path, *args: str) -> str:

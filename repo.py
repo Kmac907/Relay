@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -39,7 +40,10 @@ def create_exclusive(path: Path, content: str) -> bool:
 
 
 def _command(tool: str) -> list[str]:
-    return shlex.split(os.environ.get(f"RELAY_{tool.upper()}", tool), posix=os.name != "nt")
+    parts = shlex.split(os.environ.get(f"RELAY_{tool.upper()}", tool), posix=os.name != "nt")
+    if os.name == "nt" and parts:
+        parts[0] = shutil.which(parts[0]) or parts[0]
+    return parts
 
 
 def positive(value: str) -> int:
