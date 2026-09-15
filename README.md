@@ -123,7 +123,7 @@ Terminal `needs-user` decisions require explicit recovery. `--recover` previews 
 
 ### 5. Finite audit
 
-After all planned tasks integrate, Relay updates local `main` and plans one finite audit campaign. Read-only Audit Workers inspect explicit scopes concurrently, and triage classifies their evidence once. Accepted P0/P1 findings become bounded bug-mode Worker assignments; P2 findings may enter the backlog. Fixes do not trigger recursive audit planning.
+After all planned tasks integrate, Relay updates local `main` and plans one finite audit campaign. Each scope requires explicit executable validation commands. Read-only Audit Workers inspect explicit scopes concurrently, and triage classifies their human-readable reproduction evidence once. Accepted P0/P1 findings become bounded bug-mode Worker assignments validated by their originating scope commands; P2 findings may enter the backlog. Fixes do not trigger recursive audit planning.
 
 The campaign becomes `complete` when no active audit bugs remain. A blocker needing judgment becomes `needs-user`; incomplete provider checks become `waiting-provider`.
 
