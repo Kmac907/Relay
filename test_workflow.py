@@ -715,6 +715,27 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertIn("External/provider waits", shown)
             self.assertIn("TASK-0001: PR #25 status=pending", shown)
 
+    def test_live_and_snapshot_status_name_approval_bypass_and_policy_wait(self):
+        state = {
+            "workerLimit": 2, "taskTotal": 2, "activeProcesses": {},
+            "taskStates": {
+                "TASK-0001": {"phase": "approved", "operation": "provider-approve"},
+                "TASK-0002": {"phase": "approved", "operation": "merge-bypass"},
+            },
+        }
+        live = run.runtime_progress(state, 0)
+        self.assertIn("TASK-0001 provider-approve", live)
+        self.assertIn("TASK-0002 merge-bypass", live)
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            store.state["taskStates"]["TASK-0001"] = {"phase": "waiting-provider", "providerStatus": "policy-waiting"}
+            store.state["pullRequests"]["TASK-0001"] = {"number": 25, "state": "OPEN", "url": "https://example.invalid/25"}
+            store.save()
+            output = io.StringIO()
+            with patch("sys.stdout", output):
+                self.assertEqual(status.main(["--repo", root]), 0)
+            self.assertIn("status=policy-waiting", output.getvalue())
+
     def test_azure_policy_pass_failure_conflict_and_timeout(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.azure_store(root)
@@ -732,6 +753,116 @@ class DeterministicCoreTests(unittest.TestCase):
             queued = subprocess.CompletedProcess([], 0, json.dumps([{"configuration": {"isBlocking": True}, "status": "queued"}]), "")
             with patch("run.run_tool", side_effect=lambda *args, **kwargs: queued if "policy" in args else show):
                 self.assertEqual(run.wait_for_checks(store, "TIMEOUT", {"number": 7}, "abc"), "waiting-provider")
+
+    def test_azure_approval_is_persisted_before_launch_and_is_sha_idempotent(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.azure_store(root)
+            store.state["taskStates"]["TASK-0001"] = {"phase": "approved"}
+            store.state["reviewSessions"]["TASK-0001"] = {"phase": "approved"}
+            store.save()
+            launches = []
+            def approve(*args, **kwargs):
+                persisted = json.loads(store.path.read_text(encoding="utf-8"))
+                sha = ("abc", "def")[len(launches)]
+                self.assertEqual(persisted["taskStates"]["TASK-0001"]["operation"], "provider-approve")
+                self.assertGreater(persisted["taskStates"]["TASK-0001"]["operationDeadline"], time.time())
+                self.assertEqual(persisted["providerAttemptCounters"][f"TASK-0001:provider-approve:{sha}"], 1)
+                self.assertEqual(kwargs["timeout"], store.state["providerTimeoutSeconds"])
+                launches.append(sha)
+                return subprocess.CompletedProcess([], 0, "{}", "")
+            with patch("run.run_tool", side_effect=approve) as provider:
+                self.assertTrue(run.provider_approve(store, "TASK-0001", {"number": 7}, "abc"))
+                self.assertTrue(run.provider_approve(store, "TASK-0001", {"number": 7}, "abc"))
+                self.assertTrue(run.provider_approve(store, "TASK-0001", {"number": 7}, "def"))
+            self.assertEqual(provider.call_count, 2)
+            self.assertEqual(provider.call_args_list[0].args, ("az", "repos", "pr", "set-vote", "--id", "7", "--vote", "approve", "--organization", "https://dev.azure.com/my%20org", "--output", "json"))
+            self.assertEqual(store.state["reviewSessions"]["TASK-0001"]["providerApprovalSha"], "def")
+            self.assertEqual((store.state["providerAttemptCounters"]["TASK-0001:provider-approve:abc"], store.state["providerAttemptCounters"]["TASK-0001:provider-approve:def"]), (1, 1))
+            provider_log = (Path(root) / ".relay" / "logs" / "provider.log").read_text(encoding="utf-8")
+            self.assertIn("TASK-0001:provider-approve:abc", provider_log)
+
+    def test_azure_reviewer_policy_wait_does_not_consume_repair(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.azure_store(root)
+            assignment = ContractTests().task()
+            store.state["providerCheckTimeoutSeconds"] = 1
+            store.state["taskStates"][assignment["id"]] = {"phase": "approved"}
+            store.state["pullRequests"][assignment["id"]] = {"number": 7, "state": "OPEN"}
+            store.state["reviewSessions"][assignment["id"]] = {"phase": "approved", "reviewedSha": "abc", "repairAttemptsStarted": 0, "reviewCallsStarted": 3, "reviewCallLimit": 9}
+            show = subprocess.CompletedProcess([], 0, json.dumps(self.azure_pr()), "")
+            waiting = subprocess.CompletedProcess([], 0, json.dumps([{"configuration": {"isBlocking": True, "type": {"id": "fa4e907d-c16b-4a4c-9dfa-4906e5d171dd"}}, "status": "rejected"}]), "")
+            with patch("run.provider_approve"), patch("run.run_tool", side_effect=[show, waiting]), patch("run.time.time", side_effect=[100, 100, 101]), patch("run.time.sleep"), patch("run.invoke_with_replacements") as worker:
+                self.assertFalse(run.merge_assignment(store, threading.Semaphore(1), assignment, Path(root), "branch", {"number": 7}, "abc"))
+            self.assertEqual((store.state["taskStates"][assignment["id"]]["phase"], store.state["taskStates"][assignment["id"]]["providerStatus"]), ("waiting-provider", "policy-waiting"))
+            self.assertEqual(store.state["reviewSessions"][assignment["id"]]["repairAttemptsStarted"], 0)
+            worker.assert_not_called()
+
+    def test_failed_azure_vote_can_be_followed_by_external_approval(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.azure_store(root)
+            assignment = ContractTests().task()
+            store.state["taskStates"][assignment["id"]] = {"phase": "approved"}
+            store.state["pullRequests"][assignment["id"]] = {"number": 7, "state": "OPEN"}
+            store.state["reviewSessions"][assignment["id"]] = {"phase": "approved", "reviewedSha": "abc", "repairAttemptsStarted": 0, "reviewCallsStarted": 3, "reviewCallLimit": 9}
+            merged = subprocess.CompletedProcess([], 0, "{}", "")
+            with patch("run.provider_with_retries", side_effect=[RuntimeError("vote denied"), merged]) as provider, patch("run.wait_for_checks", return_value="passed"), patch("run.invoke_with_replacements") as worker:
+                self.assertTrue(run.merge_assignment(store, threading.Semaphore(1), assignment, Path(root), "branch", {"number": 7}, "abc"))
+            self.assertIn("set-vote", provider.call_args_list[0].args)
+            self.assertIn("update", provider.call_args_list[1].args)
+            self.assertEqual(store.state["reviewSessions"][assignment["id"]]["repairAttemptsStarted"], 0)
+            worker.assert_not_called()
+
+    def test_github_blocked_clean_checks_are_bypassable_but_bootstrap_is_not(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            store.state["provider"] = "github"
+            blocked = subprocess.CompletedProcess([], 0, json.dumps({"headRefOid": "abc", "mergeStateStatus": "BLOCKED", "statusCheckRollup": [], "state": "OPEN"}), "")
+            with patch("run.run_tool", return_value=blocked):
+                self.assertEqual(run.wait_for_checks(store, "TASK-0001", {"number": 1}, "abc"), "bypassable")
+            store.state["agentsBootstrap"] = {"phase": "checks"}
+            with patch("run.run_tool", return_value=blocked):
+                self.assertEqual(run.wait_for_checks(store, "AGENTS", {"number": 1}, "abc"), "waiting-provider")
+
+    def test_github_pending_and_failed_checks_never_become_bypassable(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            store.state.update(provider="github", providerCheckTimeoutSeconds=1)
+            pending = subprocess.CompletedProcess([], 0, json.dumps({"headRefOid": "abc", "mergeStateStatus": "BLOCKED", "statusCheckRollup": [{"status": "IN_PROGRESS"}], "state": "OPEN"}), "")
+            with patch("run.run_tool", return_value=pending), patch("run.time.time", side_effect=[100, 100, 101]), patch("run.time.sleep"):
+                self.assertEqual(run.wait_for_checks(store, "PENDING", {"number": 1}, "abc"), "waiting-provider")
+            failed = subprocess.CompletedProcess([], 0, json.dumps({"headRefOid": "abc", "mergeStateStatus": "BLOCKED", "statusCheckRollup": [{"conclusion": "FAILURE"}], "state": "OPEN"}), "")
+            with patch("run.run_tool", return_value=failed):
+                self.assertEqual(run.wait_for_checks(store, "FAILED", {"number": 1}, "abc"), "failed")
+
+    def test_github_bypass_uses_reviewed_sha_and_denial_waits_without_repair(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            store.state["provider"] = "github"
+            assignment = ContractTests().task()
+            store.state["taskStates"][assignment["id"]] = {"phase": "approved"}
+            store.state["pullRequests"][assignment["id"]] = {"number": 1, "state": "OPEN"}
+            store.state["reviewSessions"][assignment["id"]] = {"phase": "approved", "reviewedSha": "abc", "repairAttemptsStarted": 0, "reviewCallsStarted": 3, "reviewCallLimit": 9}
+            with patch("run.wait_for_checks", return_value="bypassable"), patch("run.provider_with_retries", return_value=subprocess.CompletedProcess([], 0, "", "")) as provider:
+                self.assertTrue(run.merge_assignment(store, threading.Semaphore(1), assignment, Path(root), "branch", {"number": 1}, "abc"))
+            self.assertIn("--admin", provider.call_args.args)
+            self.assertEqual(provider.call_args.args[provider.call_args.args.index("--match-head-commit") + 1], "abc")
+
+            store.state["taskStates"][assignment["id"]] = {"phase": "approved"}
+            store.state["pullRequests"][assignment["id"]]["state"] = "OPEN"
+            with patch("run.wait_for_checks", return_value="bypassable"), patch("run.provider_with_retries", side_effect=RuntimeError("denied")), patch("run.invoke_with_replacements") as worker:
+                self.assertFalse(run.merge_assignment(store, threading.Semaphore(1), assignment, Path(root), "branch", {"number": 1}, "abc"))
+            self.assertEqual(store.state["taskStates"][assignment["id"]]["phase"], "waiting-provider")
+            self.assertIn("provider.log", store.state["taskStates"][assignment["id"]]["providerStatus"])
+            self.assertEqual(store.state["reviewSessions"][assignment["id"]]["repairAttemptsStarted"], 0)
+            worker.assert_not_called()
+
+    def test_github_unblocked_merge_retains_non_admin_path(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            with patch("run.provider_with_retries") as provider:
+                run.pr_merge(store, "merge", 1)
+            self.assertNotIn("--admin", provider.call_args.args)
+            self.assertNotIn("--match-head-commit", provider.call_args.args)
 
     def test_azure_sha_drift_and_merge_modes(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1102,6 +1233,9 @@ class FakeEndToEndTests(unittest.TestCase):
             self.assertEqual((state["provider"], state["azureOrganization"], state["azureProject"], state["azureRepository"]), ("azure-devops", "org", "project", "repo"))
             self.assertEqual(state["phase"], "complete")
             self.assertEqual(len(list(provider.glob("*.json"))), 2)
+            records = [json.loads(path.read_text()) for path in provider.glob("*.json")]
+            self.assertEqual([record.get("operations", []) for record in records if "agents-bootstrap" not in record["branch"]], [["provider-approve"]])
+            self.assertNotIn("provider-approve", next(record for record in records if "agents-bootstrap" in record["branch"]).get("operations", []))
 
     def test_bootstrap_timeout_resumes_without_duplicate_pr_or_task_launch(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1205,7 +1339,7 @@ class FakeEndToEndTests(unittest.TestCase):
             requirements = root / "requirements.md"; requirements.write_text("Create two independent files.", encoding="utf-8")
             environment = os.environ | VALIDATION_ENV | {
                 "RELAY_CODEX": f"{sys.executable} {fake_codex}", "RELAY_GH": f"{sys.executable} {fake_gh}",
-                "RELAY_ALLOW_FAKE_PROVIDER": "1", "FAKE_EVENTS": str(events), "FAKE_GH_STATE": str(provider), "FAKE_AUDIT_SCOPE": "1", "FAKE_TWO_TASKS": "1", "FAKE_REQUIRE_TARGET_INSTRUCTIONS": "1",
+                "RELAY_ALLOW_FAKE_PROVIDER": "1", "FAKE_EVENTS": str(events), "FAKE_GH_STATE": str(provider), "FAKE_AUDIT_SCOPE": "1", "FAKE_TWO_TASKS": "1", "FAKE_REQUIRE_TARGET_INSTRUCTIONS": "1", "FAKE_GH_BLOCKED": "1",
             }
             planned = subprocess.run([sys.executable, str(Path(plan.__file__)), "--repo", str(target), "--requirements", str(requirements), "--workers", "2"], capture_output=True, text=True, env=environment, check=True)
             self.assertTrue(Path(planned.stdout.strip()).samefile(target / "PLAN.md"))
@@ -1227,6 +1361,9 @@ class FakeEndToEndTests(unittest.TestCase):
             spans = {task: {action: float(Path(f"{events}.{task}.{action}").read_text()) for action in ("start", "end")} for task in ("TASK-0001", "TASK-0002")}
             self.assertLess(max(spans[task]["start"] for task in spans), min(spans[task]["end"] for task in spans))
             self.assertEqual(len(list(provider.glob("*.json"))), 3)
+            records = [json.loads(path.read_text()) for path in provider.glob("*.json")]
+            self.assertTrue(all(record.get("operations") == ["merge-bypass"] for record in records if "agents-bootstrap" not in record["branch"]))
+            self.assertEqual(next(record for record in records if "agents-bootstrap" in record["branch"])["operations"], ["merge"])
             self.assertEqual(state["providerAttemptCounters"]["AGENTS:pr-create"], 1)
             self.assertEqual(git_output(target, "diff", "--name-only", "HEAD^..HEAD").splitlines(), ["AGENTS.md"])
             self.assertTrue(all(state["providerAttemptCounters"][f"{task}:pr-create"] == 1 for task in ("TASK-0001", "TASK-0002")))
@@ -1391,13 +1528,17 @@ if args[:2] == ["pr", "view"]:
     path, record = next((item for item in records if item[1]["branch"] == key or str(item[1]["number"]) == key))
     if any("statusCheckRollup" in arg for arg in args):
         checks = [{"status": "IN_PROGRESS"}] if os.environ.get("FAKE_BOOTSTRAP_PENDING") and "agents-bootstrap" in record["branch"] else []
-        record.update(mergeStateStatus="CLEAN", statusCheckRollup=checks)
+        blocked = os.environ.get("FAKE_GH_BLOCKED") and "agents-bootstrap" not in record["branch"]
+        record.update(mergeStateStatus="BLOCKED" if blocked else "CLEAN", statusCheckRollup=checks)
     print(json.dumps(record)); raise SystemExit(0)
 if args[:2] == ["pr", "merge"]:
     key = args[2]
     for path in root.glob("*.json"):
         record = json.loads(path.read_text())
         if str(record["number"]) == key:
+            operation = "merge-bypass" if "--admin" in args else "merge"
+            if operation == "merge-bypass" and args[args.index("--match-head-commit") + 1] != record["headRefOid"]: raise SystemExit("head mismatch")
+            record.setdefault("operations", []).append(operation)
             if "agents-bootstrap" in record["branch"]:
                 remote = root.parent / "remote.git"
                 subprocess.run(["git", "--git-dir", str(remote), "update-ref", "refs/heads/main", record["headRefOid"]], check=True)
@@ -1435,6 +1576,12 @@ if args[:3] == ["repos", "pr", "show"]:
     print(json.dumps(record)); raise SystemExit(0)
 if args[:4] == ["repos", "pr", "policy", "list"]:
     print("[]"); raise SystemExit(0)
+if args[:3] == ["repos", "pr", "set-vote"]:
+    number = args[args.index("--id") + 1]
+    for path in root.glob("*.json"):
+        record = json.loads(path.read_text())
+        if str(record["pullRequestId"]) == number:
+            record.setdefault("operations", []).append("provider-approve"); path.write_text(json.dumps(record)); print(json.dumps(record)); raise SystemExit(0)
 if args[:3] == ["repos", "pr", "update"]:
     number = args[args.index("--id") + 1]
     for path in root.glob("*.json"):
