@@ -9,10 +9,10 @@ requirements
 plan.py -> plan review -> technical audit -> optional repair verification -> PLAN.md + missing AGENTS.md
     |
     v
-run.py -> AGENTS.md bootstrap PR (when needed)
+run.py -> planned-base campaign validation -> AGENTS.md bootstrap PR (when needed)
     |
     v
-Workers -> validation -> review/repair -> provider PRs -> merge
+Workers -> focused + campaign validation -> review/repair -> provider PRs -> merge
     |
     v
 finite audit -> accepted bug fixes -> complete
@@ -92,7 +92,7 @@ Planner attempts report `START`, `WAIT`, `DONE`, `RETRY`, and `FAILED` lifecycle
 
 On success, planning exclusively creates `PLAN.md`, then exclusively creates `AGENTS.md` if it is still missing. Existing files or other filesystem entries are preserved. When `AGENTS.md` was initially missing, scouts and the Planning PM receive the same generic rules in memory.
 
-`PLAN.md` records each task's dependencies, allowed paths, acceptance criteria, validation commands, attempt limit, and shared fix-loop limit. Relay refuses to start a new campaign if the planned base no longer matches `HEAD`.
+`PLAN.md` records explicit campaign-validation commands plus each task's dependencies, allowed paths, acceptance criteria, focused validation commands, attempt limit, and shared fix-loop limit. Campaign commands must pass on the untouched planned base and every candidate; task-specific regression commands are never promoted automatically. Relay refuses to start a new campaign if the planned base no longer matches `HEAD`. Successful planning keeps stdout to the generated path and emits deterministic `SUMMARY` and executable `NEXT` lines on stderr.
 
 ### 3. Target instructions bootstrap
 
@@ -109,7 +109,9 @@ Relay never copies this repository's development `AGENTS.md` into a target. The 
 
 `run.py` copies the validated plan into the active `tasks.md` ledger, creates `bugs.md` and `.relay/state.json`, and excludes coordinator-owned runtime files from Git.
 
-Ready tasks run concurrently only when dependencies are satisfied and allowed paths do not overlap. Each task gets an isolated branch and Git worktree. The Worker is the only write-capable role and must commit a candidate locally. Before publication, Relay verifies ancestry, the reported SHA, changed paths, and every assigned validation command.
+Before provider authentication, bootstrap, or Worker launch, Relay creates a detached worktree at the exact planned base and runs the campaign-validation commands there. A failure stops as `BASELINE` without consuming a Worker attempt; a matching successful result is cached for resume.
+
+Ready tasks run concurrently only when dependencies are satisfied and allowed paths do not overlap. Each task gets an isolated branch and Git worktree. The Worker is the only write-capable role and must commit a candidate locally. Before publication, Relay verifies ancestry, the reported SHA, changed paths, then runs the task's focused commands once followed by the campaign commands once. The same candidate and stable validation failure repeated twice trips a circuit breaker instead of spending the remaining Worker attempts.
 
 Validation commands run explicitly through `pwsh -NoLogo -NoProfile -NonInteractive -Command` on Windows and `/bin/sh -c` on POSIX; set `RELAY_PWSH` to override the PowerShell executable. Relay checks that shell before launching Workers. Each command's shell, exit code, stdout, and stderr is captured in `.relay/logs/<assignment>-validation-<number>.log`; console and state errors contain only the command number, result, and log path. A failed initial validation stays within the task-attempt budget, while repair validation stays within the shared fix-loop and review-call budgets.
 
@@ -125,7 +127,15 @@ Terminal `needs-user` decisions require explicit recovery. `--recover` previews 
 
 After all planned tasks integrate, Relay updates local `main` and plans one finite audit campaign. Each scope requires explicit executable validation commands. Read-only Audit Workers inspect explicit scopes concurrently, and triage classifies their human-readable reproduction evidence once. Accepted P0/P1 findings become bounded bug-mode Worker assignments validated by their originating scope commands; P2 findings may enter the backlog. Fixes do not trigger recursive audit planning.
 
-The campaign becomes `complete` when no active audit bugs remain. A blocker needing judgment becomes `needs-user`; incomplete provider checks become `waiting-provider`.
+The campaign becomes `complete` when no active audit bugs remain. Before completion, Relay atomically publishes every deferred bug to a repository-visible `BACKLOG.md`; a later campaign replaces or removes only a Relay-owned backlog for the same repository. A blocker needing judgment becomes `needs-user`; incomplete provider checks become `waiting-provider`. Every terminal wave emits deterministic task, baseline, bug, and next-step summaries from validated ledgers and state.
+
+Use a completed campaign's backlog directly as the next requirements input:
+
+```powershell
+uv run .\plan.py `
+  --repo C:\path\to\target `
+  --requirements C:\path\to\target\BACKLOG.md
+```
 
 ## Campaign files
 
@@ -135,6 +145,7 @@ The campaign becomes `complete` when no active audit bugs remain. A blocker need
 | Relay task plan files | Planner | Removed by confirmed cleanup |
 | `tasks.md` | Coordinator | Active task ledger; removed only by confirmed cleanup |
 | `bugs.md` | Coordinator | Audit/review evidence ledger; removed only by confirmed cleanup |
+| `BACKLOG.md` | Coordinator handoff | Latest verified deferred-work snapshot; preserved by cleanup |
 | `.relay/state.json` | Coordinator | Resume authority, counters, phases, PRs, worktrees, and deadlines |
 | `.relay/logs/` | Coordinator | Raw agent and provider logs, separate from console output |
 
@@ -161,7 +172,7 @@ python run.py --repo C:\Code\Projects\Example --cleanup
 python run.py --repo C:\Code\Projects\Example --cleanup --confirm
 ```
 
-Cleanup is allowed only for a complete, inactive campaign with no worktrees or open Relay PRs. It removes `tasks.md`, `bugs.md`, Relay-format plan files in the repository root, and `.relay`; it preserves human-authored plans, `AGENTS.md`, source, and Git history.
+Cleanup is allowed only for a complete, inactive campaign with no worktrees or open Relay PRs. It removes `tasks.md`, `bugs.md`, Relay-format plan files in the repository root, and `.relay`; it preserves `BACKLOG.md`, human-authored plans, `AGENTS.md`, source, and Git history.
 
 Run Relay's deterministic test gate with:
 
