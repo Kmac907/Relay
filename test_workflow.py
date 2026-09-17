@@ -926,8 +926,10 @@ class DeterministicCoreTests(unittest.TestCase):
                 self.assertFalse((target / "tasks.md").exists())
                 payload = plan.parse_handoff(handoff.read_text(encoding="utf-8"), target)
                 self.assertEqual([entry["contract"]["id"] for entry in payload["tasks"]], ["TASK-0001", "TASK-0002"])
-                commands, seeded = plan.apply_handoff([dict(task) for task in tasks], ["invented"], payload)
+                extra = ContractTests().task("TASK-0003")
+                commands, seeded = plan.apply_handoff([*[dict(task) for task in tasks], extra], ["invented"], payload)
                 self.assertEqual(commands, [shared])
+                self.assertEqual([task["id"] for task in seeded], ["TASK-0001", "TASK-0002"])
                 self.assertEqual(seeded[0]["validationCommands"], ["focused-1"])
             finally:
                 for worktree_root in roots:
