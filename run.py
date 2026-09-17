@@ -28,6 +28,7 @@ MARKER = re.compile(r"<!-- relay: planned-base=([0-9a-f]{7,64}) requirements=([0
 TASK_HEADING = re.compile(r"^## (TASK-\d{4}) — (.+)$")
 BUG_HEADING = re.compile(r"^## (BUG-\d{4}) — (.+)$")
 BUG_MARKER = re.compile(r"<!-- relay: campaign=([A-Za-z0-9._-]+) repository=([0-9a-f]{12}) -->")
+BACKLOG_MARKER = re.compile(r"<!-- relay: backlog campaign=([A-Za-z0-9._-]+) repository=([0-9a-f]{12}) -->")
 TASK_FIELDS = ("Status", "Priority", "Dependencies", "Allowed paths", "Acceptance criteria", "Validation", "Attempt", "Fix loop", "Branch", "Pull request", "Candidate")
 WORKER_MODES = {"task", "bug", "repair"}
 TERMINAL_REVIEW_PHASES = {"approved", "needs-user"}
@@ -191,6 +192,22 @@ def parse_tasks(text: str, runtime: bool = False) -> tuple[dict, list[dict]]:
         raise ValueError("missing Relay ownership marker")
     lines = text.splitlines()
     starts = [i for i, line in enumerate(lines) if TASK_HEADING.fullmatch(line)]
+    campaign_heading = [i for i, line in enumerate(lines) if line == "## Campaign validation"]
+    if len(campaign_heading) > 1:
+        raise ValueError("expected one Campaign validation section")
+    campaign_commands = None
+    if campaign_heading:
+        start = campaign_heading[0]
+        if starts and start > starts[0]:
+            raise ValueError("Campaign validation must precede tasks")
+        end = starts[0] if starts else len(lines)
+        campaign_commands = []
+        for line in lines[start + 1:end]:
+            if line.startswith("- "):
+                command = line[2:].strip()
+                campaign_commands.append(command[1:-1] if len(command) > 1 and command[0] == command[-1] == "`" else command)
+        if not campaign_commands or any(not command.strip() for command in campaign_commands):
+            raise ValueError("Campaign validation must contain nonempty commands")
     tasks = []
     for index, start in enumerate(starts):
         match = TASK_HEADING.fullmatch(lines[start])
@@ -250,7 +267,11 @@ def parse_tasks(text: str, runtime: bool = False) -> tuple[dict, list[dict]]:
     fix_loop_limits = {task["fixLoopLimit"] for task in tasks}
     if len(attempt_limits) != 1 or len(fix_loop_limits) != 1:
         raise ValueError("task limits must be consistent")
-    return {"baseSha": marker.group(1), "requirementsHash": marker.group(2), "taskAttemptLimit": attempt_limits.pop(), "fixLoopLimit": fix_loop_limits.pop()}, tasks
+    return {
+        "baseSha": marker.group(1), "requirementsHash": marker.group(2),
+        "taskAttemptLimit": attempt_limits.pop(), "fixLoopLimit": fix_loop_limits.pop(),
+        "campaignValidationCommands": campaign_commands or [], "legacyCampaignValidation": campaign_commands is None,
+    }, tasks
 
 
 def validate_agent_result(role: str, value: object, assignment_id: str | None = None, mode: str | None = None) -> dict:
@@ -327,6 +348,7 @@ def paths_conflict(paths: list[str], active: set[str]) -> bool:
 
 
 def initial_state(repo: Path, metadata: dict, args: argparse.Namespace) -> dict:
+    campaign_commands = list(metadata.get("campaignValidationCommands", []))
     return {
         "schemaVersion": STATE_SCHEMA_VERSION, "campaignId": "", "repository": str(repo.resolve()), "phase": "build",
         "baseSha": metadata["baseSha"], "requirementsHash": metadata.get("requirementsHash", "000000"), "workerLimit": args.workers, "taskAttemptLimit": args.task_attempts,
@@ -341,7 +363,18 @@ def initial_state(repo: Path, metadata: dict, args: argparse.Namespace) -> dict:
         "auditPlanStarted": False, "auditPlanCompleted": False, "auditCallsStarted": 0,
         "auditCallLimit": 0, "auditScopes": {}, "pendingLedgerOperation": None,
         "targetInstructions": "", "agentsBootstrap": None,
+        "campaignValidationCommands": campaign_commands,
+        "baselineValidation": {
+            "baseSha": metadata["baseSha"], "commandsHash": commands_hash(campaign_commands),
+            "phase": "legacy-skipped" if metadata.get("legacyCampaignValidation", not campaign_commands) else "pending",
+            "commandsStarted": 0, "currentCommand": None, "startedAt": None, "deadline": None,
+            "completedAt": None, "error": None, "log": None,
+        },
     }
+
+
+def commands_hash(commands: list[str]) -> str:
+    return hashlib.sha256(json.dumps(commands, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
 
 
 def atomic_write(path: Path, content: str) -> None:
@@ -373,7 +406,7 @@ class StateStore:
             self.save()
 
 
-OPERATION_FIELDS = ("operation", "operationStartedAt", "operationDeadline", "validationCommand", "validationPosition", "validationTotal")
+OPERATION_FIELDS = ("operation", "operationStartedAt", "operationDeadline", "validationCommand", "validationPosition", "validationTotal", "validationCategory")
 AZURE_REVIEW_POLICY_IDS = {"fa4e907d-c16b-4a4c-9dfa-4906e5d171dd", "fd2167ab-b0be-447a-8ec8-39368250530e"}
 
 
@@ -383,6 +416,8 @@ def _duration(seconds: float) -> str:
 
 
 def _operation_target(state: dict, assignment_id: str) -> dict | None:
+    if assignment_id == "BASELINE":
+        return state.get("baselineValidation")
     if assignment_id == "AGENTS":
         return state.get("agentsBootstrap")
     return state.get("taskStates", {}).get(assignment_id)
@@ -403,6 +438,9 @@ def runtime_progress(state: dict, now: float | None = None) -> str:
     bootstrap = state.get("agentsBootstrap")
     if bootstrap and bootstrap.get("operation") and "AGENTS" not in active_assignments:
         operations.append(("AGENTS", bootstrap["operation"], bootstrap))
+    baseline = state.get("baselineValidation")
+    if baseline and baseline.get("operation"):
+        operations.append(("BASELINE", baseline["operation"], baseline))
     for assignment_id, task in task_states.items():
         if task.get("operation") and assignment_id not in active_assignments:
             operations.append((assignment_id, task["operation"], task))
@@ -570,6 +608,7 @@ def render_bugs(campaign: str, repo: Path, bugs: list[dict] | None = None) -> st
             f"- Source: {bug['source']}", f"- Source finding: {bug.get('sourceFindingId', bug['id'])}",
             f"- Location: {bug['location']}", f"- Observable failure: {bug['failure']}",
             f"- Reproduction: `{bug['reproduction']}`", f"- Requirement: {bug['requirement']}", f"- Evidence: {bug['evidence']}",
+            *([f"- Deferral reason: {bug['deferralReason']}"] if bug.get("deferralReason") else []),
             "- Allowed paths:", *[f"  - `{item}`" for item in bug.get("allowedPaths", [finding_path(bug["location"])])],
             f"- Branch: {bug.get('branch', 'pending')}", f"- Pull request: {bug.get('pullRequest', 'pending')}", f"- Candidate: {bug.get('candidate', 'pending')}", "",
         ]
@@ -598,6 +637,7 @@ def parse_bugs(text: str) -> tuple[dict, list[dict]]:
             "allowedPaths": [finding_path(item) for item in _sublist(block, "Allowed paths")] if "- Allowed paths:" in block else [finding_path(values["Location"])],
             "reproduction": reproduction[1:-1] if reproduction.startswith("`") and reproduction.endswith("`") else reproduction,
             "requirement": values["Requirement"], "evidence": values["Evidence"], "branch": values["Branch"],
+            "deferralReason": _field(block, "Deferral reason") if any(line.startswith("- Deferral reason:") for line in block) else None,
             "pullRequest": values["Pull request"], "candidate": values["Candidate"],
         })
     ids = [bug["id"] for bug in bugs]
@@ -613,6 +653,8 @@ def _validate_ledger(store: StateStore, name: str, text: str) -> None:
         for key in ("baseSha", "requirementsHash", "taskAttemptLimit", "fixLoopLimit"):
             if metadata[key] != store.state[key]:
                 raise RuntimeError(f"tasks.md {key} does not match campaign state")
+        if "campaignValidationCommands" in store.state and metadata["campaignValidationCommands"] != store.state["campaignValidationCommands"]:
+            raise RuntimeError("tasks.md campaign validation commands do not match campaign state")
     elif name == "bugs.md":
         metadata, _ = parse_bugs(text)
         expected = hashlib.sha256(str(repo.resolve()).encode()).hexdigest()[:12]
@@ -665,6 +707,46 @@ def load_bugs(store: StateStore) -> list[dict]:
 
 def write_bugs(store: StateStore, bugs: list[dict]) -> None:
     write_ledger(store, "bugs.md", render_bugs(store.state["campaignId"], Path(store.state["repository"]), bugs))
+
+
+def render_backlog(campaign: str, repo: Path, bugs: list[dict]) -> str:
+    repository_hash = hashlib.sha256(str(repo.resolve()).encode()).hexdigest()[:12]
+    lines = [
+        "# Relay Backlog", "",
+        f"<!-- relay: backlog campaign={campaign} repository={repository_hash} -->", "",
+        "Resolve the following verified backlog defects. Plan only work still missing from the repository.", "",
+    ]
+    for bug in sorted((item for item in bugs if item["status"] == "backlog"), key=lambda item: item["id"]):
+        lines += [
+            f"## {bug['id']} — {bug['title']}", "",
+            f"- Severity: {bug['severity']}", f"- Source: {bug['source']}",
+            f"- Source finding: {bug.get('sourceFindingId', bug['id'])}",
+            f"- Location: {bug['location']}", f"- Observable failure: {bug['failure']}",
+            f"- Reproduction: `{bug['reproduction']}`", f"- Requirement: {bug['requirement']}",
+            f"- Evidence: {bug['evidence']}",
+            f"- Deferral reason: {bug.get('deferralReason') or 'Reason not recorded by the originating campaign'}",
+            "- Allowed paths:", *[f"  - `{path}`" for path in bug.get("allowedPaths", [finding_path(bug["location"])])], "",
+        ]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def publish_backlog(store: StateStore, bugs: list[dict]) -> Path | None:
+    repo = Path(store.state["repository"])
+    path = repo / "BACKLOG.md"
+    repository_hash = hashlib.sha256(str(repo.resolve()).encode()).hexdigest()[:12]
+    if os.path.lexists(path):
+        if not path.is_file():
+            raise RuntimeError(f"refusing user-owned backlog: {path}")
+        marker = BACKLOG_MARKER.search(path.read_text(encoding="utf-8"))
+        if not marker or marker.group(2) != repository_hash:
+            raise RuntimeError(f"refusing user-owned or malformed backlog: {path}")
+    backlog = [bug for bug in bugs if bug["status"] == "backlog"]
+    if backlog:
+        atomic_write(path, render_backlog(store.state["campaignId"], repo, backlog))
+        return path
+    if os.path.lexists(path):
+        path.unlink()
+    return None
 
 
 def update_task_ledger(store: StateStore, assignment_id: str, **values: str) -> None:
@@ -873,43 +955,62 @@ def _output(value: str | bytes | None) -> str:
     return value.decode("utf-8", "replace") if isinstance(value, bytes) else value or ""
 
 
-def run_validations(store: StateStore, assignment: dict, worktree: Path) -> None:
-    for command_number, command in enumerate(assignment["validationCommands"], 1):
+def run_validations(store: StateStore, assignment: dict, worktree: Path, category: str = "task", commands: list[str] | None = None, record: dict | None = None) -> None:
+    assignment_id = assignment["id"]
+    commands = assignment["validationCommands"] if commands is None else commands
+    expected_record = store.state["baselineValidation"] if assignment_id == "BASELINE" else store.state["taskStates"][assignment_id]
+    record = expected_record if record is None else record
+    if record is not expected_record:
+        raise ValueError("validation state record mismatch")
+    for command_number, command in enumerate(commands, 1):
         started = {}
         def consume(state: dict) -> None:
-            count = state["validationCommandsStarted"].get(assignment["id"], 0) + 1
-            state["validationCommandsStarted"][assignment["id"]] = count
+            key = assignment_id if category == "task" else f"{assignment_id}:{category}"
+            count = state["validationCommandsStarted"].get(key, 0) + 1
+            state["validationCommandsStarted"][key] = count
             started["number"] = count
-            state["taskStates"][assignment["id"]].update(
+            target = state["baselineValidation"] if assignment_id == "BASELINE" else state["taskStates"][assignment_id]
+            target.update(
                 operation="validate", operationStartedAt=datetime.now(timezone.utc).isoformat(),
                 operationDeadline=time.time() + state["validationTimeoutSeconds"], validationCommand=command,
-                validationPosition=command_number, validationTotal=len(assignment["validationCommands"]),
+                validationPosition=command_number, validationTotal=len(commands), validationCategory=category,
             )
+            if assignment_id == "BASELINE":
+                target.update(phase="running", commandsStarted=count, currentCommand=command, startedAt=target.get("startedAt") or datetime.now(timezone.utc).isoformat(), deadline=target["operationDeadline"])
         store.update(consume)
         relay_console.update(runtime_progress(store.state, datetime.now(timezone.utc).timestamp()))
-        console("START", f"operation=validate assignment={assignment['id']} command={command_number}/{len(assignment['validationCommands'])} attempt={started['number']} deadline={store.state['validationTimeoutSeconds']}s")
+        console("START", f"operation=validate category={category} assignment={assignment_id} command={command_number}/{len(commands)} attempt={started['number']} deadline={store.state['validationTimeoutSeconds']}s")
         shell = validation_command(command)
-        log = store.path.parent / "logs" / f"{assignment['id']}-validation-{started['number']}.log"
+        middle = "" if category == "task" else f"-{category}"
+        log = store.path.parent / "logs" / f"{assignment_id}{middle}-validation-{started['number']}.log"
         try:
             completed = bounded_run(shell, cwd=worktree, check=False, timeout=store.state["validationTimeoutSeconds"])
             exit_code, stdout, stderr = str(completed.returncode), completed.stdout, completed.stderr
         except subprocess.TimeoutExpired as error:
             exit_code, stdout, stderr = "timeout", _output(error.stdout), _output(error.stderr)
             atomic_write(log, f"command: {command}\nshell: {json.dumps(shell)}\nexitCode: {exit_code}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}")
-            message = f"validation command {command_number} timed out after {store.state['validationTimeoutSeconds']}s; log: {log}"
-            store.update(lambda state: state["taskStates"][assignment["id"]].__setitem__("error", message))
-            console("FAILED", f"operation=validate assignment={assignment['id']} command={command_number}/{len(assignment['validationCommands'])} log={log}")
-            clear_operation(store, assignment["id"], "validate")
+            prefix = "" if category == "task" else f"{category} "
+            message = f"{prefix}validation command {command_number} timed out after {store.state['validationTimeoutSeconds']}s; log: {log}"
+            def timed_out(state: dict) -> None:
+                target = state["baselineValidation"] if assignment_id == "BASELINE" else state["taskStates"][assignment_id]
+                target.update(error=message, validationFailure={"category": category, "command": command, "commandHash": hashlib.sha256(command.encode()).hexdigest(), "outcome": "timeout"}, validationLog=str(log))
+            store.update(timed_out)
+            console("FAILED", f"operation=validate category={category} assignment={assignment_id} command={command_number}/{len(commands)} log={log}")
+            clear_operation(store, assignment_id, "validate")
             raise RuntimeError(message) from error
         atomic_write(log, f"command: {command}\nshell: {json.dumps(shell)}\nexitCode: {exit_code}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}")
         if completed.returncode:
-            message = f"validation command {command_number} exited with code {completed.returncode}; log: {log}"
-            store.update(lambda state: state["taskStates"][assignment["id"]].__setitem__("error", message))
-            console("FAILED", f"operation=validate assignment={assignment['id']} command={command_number}/{len(assignment['validationCommands'])} exit={completed.returncode} log={log}")
-            clear_operation(store, assignment["id"], "validate")
+            prefix = "" if category == "task" else f"{category} "
+            message = f"{prefix}validation command {command_number} exited with code {completed.returncode}; log: {log}"
+            def failed(state: dict) -> None:
+                target = state["baselineValidation"] if assignment_id == "BASELINE" else state["taskStates"][assignment_id]
+                target.update(error=message, validationFailure={"category": category, "command": command, "commandHash": hashlib.sha256(command.encode()).hexdigest(), "outcome": f"exit:{completed.returncode}"}, validationLog=str(log))
+            store.update(failed)
+            console("FAILED", f"operation=validate category={category} assignment={assignment_id} command={command_number}/{len(commands)} exit={completed.returncode} log={log}")
+            clear_operation(store, assignment_id, "validate")
             raise RuntimeError(message)
-        console("DONE", f"operation=validate assignment={assignment['id']} command={command_number}/{len(assignment['validationCommands'])} log={log}")
-        clear_operation(store, assignment["id"], "validate")
+        console("DONE", f"operation=validate category={category} assignment={assignment_id} command={command_number}/{len(commands)} log={log}")
+        clear_operation(store, assignment_id, "validate")
 
 
 def validate_candidate(store: StateStore, assignment: dict, worktree: Path, result: dict) -> str:
@@ -927,13 +1028,19 @@ def validate_candidate(store: StateStore, assignment: dict, worktree: Path, resu
     outside = sorted(item for item in changed if not allowed_change(item, assignment_paths(store, assignment)))
     if outside:
         raise ValueError(f"candidate changed paths outside assignment scope: {', '.join(outside)}")
-    store.update(lambda state: state["taskStates"][assignment["id"]].__setitem__("validationShellVersion", 2))
-    run_validations(store, assignment, worktree)
+    store.update(lambda state: state["taskStates"][assignment["id"]].update(validationShellVersion=3, validationCandidateSha=sha))
+    run_validations(store, assignment, worktree, "task")
+    campaign_commands = store.state.get("campaignValidationCommands", [])
+    if campaign_commands:
+        run_validations(store, assignment, worktree, "campaign", campaign_commands)
     def accepted(state: dict) -> None:
         state["candidateShas"][assignment["id"]] = sha
         state["taskStates"][assignment["id"]].update(candidateSha=sha, phase="push-and-open-pr")
         state["taskStates"][assignment["id"]].pop("error", None)
         state["taskStates"][assignment["id"]].pop("pendingWorkerSha", None)
+        state["taskStates"][assignment["id"]].pop("validationFailure", None)
+        state["taskStates"][assignment["id"]].pop("validationFailureRepeat", None)
+        state["taskStates"][assignment["id"]].pop("validationCircuitBroken", None)
     store.update(accepted)
     console("DONE", f"operation=candidate assignment={assignment['id']} sha={sha[:12]} validation=passed")
     return sha
@@ -1175,6 +1282,7 @@ def publish_candidate(store: StateStore, assignment: dict, worktree: Path, branc
 
 def record_findings(store: StateStore, assignment_id: str, findings: list[dict], decisions: list[dict]) -> list[dict]:
     actions = {item["findingId"]: item["action"] for item in decisions}
+    reasons = {item["findingId"]: item["reason"] for item in decisions}
     accepted = []
     bugs = load_bugs(store)
     known = {(bug["source"], bug["sourceFindingId"]) for bug in bugs}
@@ -1196,10 +1304,14 @@ def record_findings(store: StateStore, assignment_id: str, findings: list[dict],
                     "reproduction": finding["reproduction"], "requirement": finding["requirement"], "evidence": finding["evidence"],
                     "allowedPaths": [finding_path(finding["location"])],
                 }
+                if action == "backlog":
+                    bug["deferralReason"] = reasons.get(finding["id"]) or "Reason not recorded by the originating campaign"
                 bugs.append(bug)
                 known.add(finding_key)
             else:
                 bug = next(item for item in bugs if (item["source"], item["sourceFindingId"]) == finding_key)
+                if action == "backlog" and not bug.get("deferralReason"):
+                    bug["deferralReason"] = reasons.get(finding["id"]) or "Reason not recorded by the originating campaign"
             if action == "accept-blocker":
                 accepted.append(bug)
     write_bugs(store, bugs)
@@ -1283,6 +1395,8 @@ def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: di
                             return False
                         store.update(lambda state: state["reviewSessions"][assignment_id].__setitem__("repairAttemptsStarted", state["reviewSessions"][assignment_id]["repairAttemptsStarted"] + 1))
                         repair = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt("repair", assignment, current_sha, blockers, store.state["taskStates"][assignment_id].get("error", "")), mode="repair", review=True)
+                        if repair.get("summary") is not None:
+                            store.state["taskStates"][assignment_id]["workerSummary"] = repair["summary"]
                         session.update(previousCandidateSha=current_sha, pendingWorkerSha=repair["candidateSha"])
                         store.save()
                     repaired_sha = validate_candidate(store, assignment, worktree, repair)
@@ -1487,6 +1601,7 @@ def merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignme
                 store.state["worktrees"][assignment_id]["baseSha"] = current_base.stdout.strip()
                 store.save()
             result = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt("repair", assignment, reviewed_sha, blocker, store.state["taskStates"][assignment_id].get("error", "")), mode="repair", review=True)
+            store.update(lambda state: state["taskStates"][assignment_id].update(**({"workerSummary": result["summary"]} if result.get("summary") is not None else {}), pendingWorkerSha=result["candidateSha"]))
             replacement = validate_candidate(store, assignment, worktree, result)
             publish_candidate(store, assignment, worktree, branch, replacement)
             verification = invoke_with_replacements(store, semaphore, worktree, assignment_id, "verification-reviewer", role_prompt("verification-reviewer", assignment, replacement, {"previousCandidate": reviewed_sha, "repairDiff": f"{reviewed_sha}..{replacement}", "providerFailure": status}), review=True)
@@ -1562,6 +1677,89 @@ def cleanup_worktree(store: StateStore, assignment_id: str) -> None:
         store.save()
 
 
+def cleanup_baseline_worktree(store: StateStore) -> None:
+    with store.lock:
+        record = store.state.get("worktrees", {}).get("BASELINE")
+        baseline = store.state.get("baselineValidation", {})
+        raw_root = (record or {}).get("root") or baseline.get("worktreeRoot")
+        if not raw_root:
+            return
+        campaign_root = Path(tempfile.gettempdir()).resolve() / "relay-worktrees" / store.state["campaignId"]
+        root = safe_within(Path(raw_root), campaign_root)
+        repository_root = safe_within(Path(store.state.get("repositoryRoot", store.state["repository"])), Path(store.state.get("repositoryRoot", store.state["repository"])))
+        removed = git(repository_root, "worktree", "remove", "--force", str(root), timeout=store.state["validationTimeoutSeconds"], check=False)
+        if removed.returncode and root.exists():
+            return
+        store.state.get("worktrees", {}).pop("BASELINE", None)
+        store.save()
+
+
+def run_baseline_validation(store: StateStore) -> bool:
+    commands = store.state.get("campaignValidationCommands", [])
+    baseline = store.state.get("baselineValidation")
+    if not commands:
+        if baseline is None:
+            store.update(lambda state: state.__setitem__("baselineValidation", {
+                "baseSha": state["baseSha"], "commandsHash": commands_hash([]), "phase": "legacy-skipped",
+                "commandsStarted": 0, "currentCommand": None, "startedAt": None, "deadline": None,
+                "completedAt": None, "error": None, "log": None,
+            }))
+        elif baseline.get("phase") != "legacy-skipped":
+            raise RuntimeError("campaign validation state/ledger drift")
+        return True
+    expected_hash = commands_hash(commands)
+    if baseline is None:
+        raise RuntimeError("campaign validation state is missing")
+    if baseline.get("baseSha") != store.state["baseSha"] or baseline.get("commandsHash") != expected_hash:
+        raise RuntimeError("campaign validation state/ledger drift")
+    if baseline.get("phase") == "passed":
+        return True
+    if baseline.get("phase") == "blocked":
+        store.update(lambda state: state.__setitem__("phase", "needs-user"))
+        return False
+    cleanup_baseline_worktree(store)
+    if "BASELINE" in store.state.get("worktrees", {}):
+        raise RuntimeError("baseline worktree cleanup failed")
+    campaign_root = Path(tempfile.gettempdir()).resolve() / "relay-worktrees" / store.state["campaignId"]
+    worktree_root = safe_within(campaign_root / "BASELINE", campaign_root)
+    worktree = safe_within(worktree_root / Path(store.state.get("repositoryPrefix", "")), worktree_root)
+    def starting(state: dict) -> None:
+        state["phase"] = "baseline-validation"
+        state["baselineValidation"].update(
+            phase="worktree", currentCommand=None, startedAt=datetime.now(timezone.utc).isoformat(),
+            deadline=time.time() + state["validationTimeoutSeconds"], completedAt=None, error=None, log=None,
+            worktreeRoot=str(worktree_root),
+        )
+        state["worktrees"]["BASELINE"] = {"path": str(worktree), "root": str(worktree_root), "baseSha": state["baseSha"], "detached": True}
+    store.update(starting)
+    try:
+        worktree_root.parent.mkdir(parents=True, exist_ok=True)
+        repository_root = Path(store.state.get("repositoryRoot", store.state["repository"])).resolve()
+        git(repository_root, "worktree", "add", "--detach", str(worktree_root), store.state["baseSha"], timeout=store.state["validationTimeoutSeconds"])
+        worktree.mkdir(parents=True, exist_ok=True)
+        top = Path(git(worktree_root, "rev-parse", "--show-toplevel", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()).resolve()
+        if top != worktree_root.resolve() or safe_within(worktree, worktree_root) != worktree.resolve():
+            raise RuntimeError("baseline worktree mismatch")
+        run_validations(store, {"id": "BASELINE", "validationCommands": commands}, worktree, "baseline", commands, baseline)
+        store.update(lambda state: state["baselineValidation"].update(
+            phase="passed", completedAt=datetime.now(timezone.utc).isoformat(), currentCommand=None,
+            deadline=None, error=None, log=None,
+        ))
+        return True
+    except KeyboardInterrupt:
+        store.update(lambda state: state["baselineValidation"].update(phase="interrupted", error="interrupted"))
+        raise
+    except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
+        def blocked(state: dict) -> None:
+            record = state["baselineValidation"]
+            record.update(phase="blocked", completedAt=datetime.now(timezone.utc).isoformat(), error=str(error), log=record.get("validationLog"))
+            state["phase"] = "needs-user"
+        store.update(blocked)
+        return False
+    finally:
+        cleanup_baseline_worktree(store)
+
+
 def process_assignment(store: StateStore, semaphore: threading.Semaphore, assignment: dict, mode: str) -> bool:
     assignment_id = assignment["id"]
     def initialize(state: dict) -> None:
@@ -1575,7 +1773,7 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
         task_state.update(worktree=str(worktree), branch=branch)
         store.save()
         sha = task_state.get("candidateSha")
-        while not sha and (task_state.get("pendingWorkerSha") or worker_attempt_available(store.state, assignment_id)):
+        while not sha and not task_state.get("validationCircuitBroken") and (task_state.get("pendingWorkerSha") or worker_attempt_available(store.state, assignment_id)):
             task_state["phase"] = "implementing"
             store.save()
             try:
@@ -1584,12 +1782,27 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
                 else:
                     result = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt(mode, assignment, previous_failure=task_state.get("error", "")), mode=mode)
                     task_state.update(pendingWorkerSha=result["candidateSha"], phase="candidate-validation")
+                    if result.get("summary") is not None:
+                        task_state["workerSummary"] = result["summary"]
                     store.save()
                 sha = validate_candidate(store, assignment, worktree, result)
                 task_state.pop("pendingWorkerSha", None)
                 store.save()
             except (RuntimeError, ValueError, json.JSONDecodeError) as error:
                 task_state["error"] = str(error)
+                failure = task_state.get("validationFailure")
+                if failure:
+                    fingerprint = {
+                        "candidateSha": task_state.get("validationCandidateSha") or task_state.get("pendingWorkerSha"),
+                        "category": failure["category"], "commandHash": failure["commandHash"], "outcome": failure["outcome"],
+                    }
+                    previous = task_state.get("validationFailureRepeat", {})
+                    count = previous.get("count", 0) + 1 if previous.get("fingerprint") == fingerprint else 1
+                    task_state["validationFailureRepeat"] = {"fingerprint": fingerprint, "count": count}
+                    if count >= 2:
+                        task_state["validationCircuitBroken"] = True
+                else:
+                    task_state.pop("validationFailureRepeat", None)
                 task_state.pop("pendingWorkerSha", None)
                 store.save()
                 sha = None
@@ -1707,6 +1920,7 @@ def run_audit(store: StateStore, semaphore: threading.Semaphore, tasks: list[dic
             store.update(lambda state: state.update(phase="needs-user", auditTriageCompleted=True))
             return []
         actions = {item["findingId"]: item["action"] for item in triage["decisions"]}
+        reasons = {item["findingId"]: item["reason"] for item in triage["decisions"]}
         accepted = []
         validation_commands = {}
         bugs = load_bugs(store)
@@ -1732,9 +1946,11 @@ def run_audit(store: StateStore, semaphore: threading.Semaphore, tasks: list[dic
                 accepted.append(bug)
             elif action == "backlog" and finding["severity"] == "P2":
                 if ("audit", finding["id"]) not in known:
-                    bug = {"id": f"BUG-{len(bugs) + 1:04d}", "title": finding["failure"][:80], "severity": "P2", "status": "backlog", "source": "audit", "sourceFindingId": finding["id"], "location": finding["location"], "failure": finding["failure"], "reproduction": finding["reproduction"], "requirement": finding["requirement"], "evidence": finding["evidence"]}
+                    bug = {"id": f"BUG-{len(bugs) + 1:04d}", "title": finding["failure"][:80], "severity": "P2", "status": "backlog", "source": "audit", "sourceFindingId": finding["id"], "location": finding["location"], "failure": finding["failure"], "reproduction": finding["reproduction"], "requirement": finding["requirement"], "evidence": finding["evidence"], "deferralReason": reasons.get(finding["id"]) or "Reason not recorded by the originating campaign"}
                     bugs.append(bug)
                     known[("audit", finding["id"])] = bug
+                elif not known[("audit", finding["id"])].get("deferralReason"):
+                    known[("audit", finding["id"])]["deferralReason"] = reasons.get(finding["id"]) or "Reason not recorded by the originating campaign"
         write_bugs(store, bugs)
         store.update(lambda state: (state.setdefault("auditBugValidationCommands", {}).update(validation_commands), state.__setitem__("auditTriageCompleted", True)))
         return accepted
@@ -2137,6 +2353,7 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
             for bug in bugs:
                 if bug["id"] in action["bugIds"]:
                     bug["status"] = "backlog"
+                    bug["deferralReason"] = "Deferred by the explicit recovery action."
             write_bugs(store, bugs)
             session = store.state["reviewSessions"][assignment_id]
             session.update(phase="approved", reviewedSha=action["candidateSha"], currentCandidateSha=action["candidateSha"], acceptedBlockerIds=[])
@@ -2167,6 +2384,25 @@ def reconcile(store: StateStore) -> None:
         exclude_relay_files(repository)
     metadata, _ = parse_tasks((Path(store.state["repository"]) / "tasks.md").read_text(encoding="utf-8"), runtime=True)
     store.state.setdefault("requirementsHash", metadata["requirementsHash"])
+    if "campaignValidationCommands" not in store.state:
+        if metadata["campaignValidationCommands"]:
+            raise RuntimeError("campaign validation state is missing for a non-legacy ledger")
+        store.state["campaignValidationCommands"] = []
+        store.state["baselineValidation"] = {
+            "baseSha": store.state["baseSha"], "commandsHash": commands_hash([]), "phase": "legacy-skipped",
+            "commandsStarted": 0, "currentCommand": None, "startedAt": None, "deadline": None,
+            "completedAt": None, "error": None, "log": None,
+        }
+    elif store.state["campaignValidationCommands"] != metadata["campaignValidationCommands"]:
+        raise RuntimeError("tasks.md campaign validation commands do not match campaign state")
+    baseline = store.state.get("baselineValidation")
+    if baseline and baseline.get("phase") in {"worktree", "running", "interrupted"}:
+        baseline["phase"] = "interrupted"
+        baseline["error"] = baseline.get("error") or "interrupted"
+        store.save()
+        cleanup_baseline_worktree(store)
+        if "BASELINE" in store.state.get("worktrees", {}):
+            raise RuntimeError("baseline worktree cleanup failed")
     recover_pending_ledger(store)
     if store.state["activeProcesses"]:
         for process in store.state["activeProcesses"].values():
@@ -2253,13 +2489,15 @@ def run_assignments(store: StateStore, semaphore: threading.Semaphore, assignmen
 
 def execute_campaign(store: StateStore, tasks: list[dict]) -> int:
     semaphore = threading.Semaphore(store.state["workerLimit"])
+    require_validation_shell(store.state["validationTimeoutSeconds"])
+    if not run_baseline_validation(store):
+        return 2
     if (store.state.get("agentsBootstrap") or {}).get("phase") == "needs-user":
         store.update(lambda state: state.__setitem__("phase", "needs-user"))
         return 2
     provider_preflight(store)
     if not bootstrap_agents(store):
         return 2
-    require_validation_shell(store.state["validationTimeoutSeconds"])
     by_id = {task["id"]: task for task in tasks}
     run_assignments(store, semaphore, tasks, "task")
     unfinished = [value for key, value in store.state["taskStates"].items() if key in by_id and value["phase"] != "integrated"]
@@ -2281,6 +2519,7 @@ def execute_campaign(store: StateStore, tasks: list[dict]) -> int:
         if unresolved:
             store.update(lambda state: state.__setitem__("phase", "needs-user"))
             return 2
+        publish_backlog(store, load_bugs(store))
         store.update(lambda state: state.__setitem__("phase", "complete"))
         return 0
     except (RuntimeError, ValueError, subprocess.SubprocessError, json.JSONDecodeError) as error:
@@ -2290,6 +2529,9 @@ def execute_campaign(store: StateStore, tasks: list[dict]) -> int:
 
 def blocked_assignments(state: dict) -> list[tuple[str, str]]:
     blocked = []
+    baseline = state.get("baselineValidation") or {}
+    if baseline.get("phase") in {"blocked", "interrupted"}:
+        blocked.append(("BASELINE", str(baseline.get("error") or baseline["phase"])))
     if state.get("error"):
         blocked.append(("CAMPAIGN", str(state["error"])))
     bootstrap = state.get("agentsBootstrap") or {}
@@ -2299,6 +2541,125 @@ def blocked_assignments(state: dict) -> list[tuple[str, str]]:
         if task.get("phase") in {"needs-user", "waiting-provider"}:
             blocked.append((assignment_id, str(task.get("error") or task.get("providerStatus") or task["phase"])))
     return sorted(blocked) or [("CAMPAIGN", "action required")]
+
+
+def _shell_join(arguments: list[str]) -> str:
+    return subprocess.list2cmdline(arguments) if os.name == "nt" else shlex.join(arguments)
+
+
+def _normalized_error(value: object) -> str:
+    text = " ".join(str(value or "action required").split())
+    return re.sub(r";?\s*log:\s*[^\r\n]+$", "", text).strip()
+
+
+def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[list[str], str]:
+    task_states = state.get("taskStates", {})
+    interrupted = {item.get("assignmentId") for item in state.get("activeProcesses", {}).values() if item.get("interrupted")}
+    counts = Counter()
+    bullets = []
+    for task in sorted(tasks, key=lambda item: item["id"]):
+        task_state = task_states.get(task["id"], {})
+        phase = task_state.get("phase")
+        if task["status"] == "satisfied":
+            status = "satisfied"
+            detail = f"no implementation was required — {' '.join(task['acceptanceCriteria'][0].split())}"
+        elif phase == "integrated":
+            status = "completed"
+            summary = task_state.get("workerSummary")
+            validation = "focused and campaign validation passed" if state.get("campaignValidationCommands") else "focused validation passed; campaign validation legacy-skipped"
+            detail = f"{summary}; {validation}" if summary else f"reviewed candidate {task_state.get('candidateSha', 'unknown')} integrated; {validation}"
+        elif phase == "waiting-provider":
+            status = "waiting"
+            pr = task_state.get("pr") or state.get("pullRequests", {}).get(task["id"], {})
+            detail = f"{task_state.get('providerStatus', 'provider action pending')}"
+            if pr:
+                detail += f"; PR {pr.get('url', pr.get('number', 'unknown'))}"
+            if task_state.get("operationDeadline"):
+                detail += f"; deadline {task_state['operationDeadline']}"
+            detail += f"; log {state_path(state, 'logs/provider.log')}"
+        elif phase == "needs-user" or task["id"] in interrupted:
+            status = "blocked"
+            parts = [task_state.get("workerSummary")]
+            if task["id"] in interrupted:
+                parts.append(f"interrupted during {task_state.get('operation', phase or 'assignment')}")
+            else:
+                parts.append(_normalized_error(task_state.get("error") or task_state.get("providerStatus")))
+            if task_state.get("validationFailure"):
+                parts.append(f"{task_state['validationFailure']['category']} validation")
+            if task_state.get("validationLog"):
+                parts.append(f"log {task_state['validationLog']}")
+            detail = "; ".join(part for part in parts if part)
+        else:
+            status = "not-run"
+            unmet = [dependency for dependency in task["dependencies"] if task_states.get(dependency, {}).get("phase") != "integrated" and next((item for item in tasks if item["id"] == dependency), {}).get("status") != "satisfied"]
+            detail = f"unmet dependencies: {', '.join(unmet)}" if unmet else "campaign stopped before launch"
+        counts[status] += 1
+        bullets.append(f"- {task['id']} {status}: {task['title']} — {detail}")
+    bug_counts = Counter(bug["status"] for bug in bugs)
+    lines = [f"tasks={counts['completed']}/{len(tasks)} completed blocked={counts['blocked']} waiting={counts['waiting']} satisfied={counts['satisfied']} not-run={counts['not-run']} bugs={len(bugs)} backlog={bug_counts['backlog']}"]
+    baseline = state.get("baselineValidation")
+    if baseline:
+        phase = baseline.get("phase", "unknown")
+        if phase == "passed":
+            lines.append(f"- BASELINE passed: {baseline.get('baseSha', state.get('baseSha', 'unknown'))} commands={len(state.get('campaignValidationCommands', []))}")
+        elif phase == "blocked":
+            lines.append(f"- BASELINE blocked: {_normalized_error(baseline.get('error'))}; command={baseline.get('currentCommand')}; log={baseline.get('log') or baseline.get('validationLog') or 'not-recorded'}")
+        elif phase == "interrupted":
+            lines.append(f"- BASELINE interrupted: command={baseline.get('currentCommand')} state={baseline.get('operation', 'interrupted')}")
+        elif phase == "legacy-skipped":
+            lines.append("- BASELINE legacy-skipped: campaign predates campaign validation")
+    lines.extend(bullets)
+    for bug in sorted(bugs, key=lambda item: item["id"]):
+        status = "waiting-provider" if task_states.get(bug["id"], {}).get("phase") == "waiting-provider" else bug["status"]
+        bug_state = task_states.get(bug["id"], {})
+        if status == "resolved":
+            detail = bug_state.get("workerSummary") or f"{bug['requirement']} satisfied"
+        elif status == "backlog":
+            detail = f"{bug['failure']} Deferred because {bug.get('deferralReason') or 'Reason not recorded by the originating campaign'}"
+        elif status == "waiting-provider":
+            detail = f"{bug_state.get('providerStatus', 'provider action pending')}; {bug['evidence']}"
+        else:
+            detail = f"{_normalized_error(bug_state.get('error') or bug_state.get('providerStatus') or status)}; {bug['evidence']}"
+        lines.append(f"- {bug['id']} {status}: {detail}")
+    executable = sys.executable
+    run_path = str(Path(__file__).resolve())
+    repo = state["repository"]
+    baseline = state.get("baselineValidation") or {}
+    if baseline.get("phase") == "blocked":
+        next_line = f"Baseline command {baseline.get('currentCommand')} failed; inspect {baseline.get('log') or baseline.get('validationLog') or 'the baseline log'}. No task attempts were consumed. Correct the baseline or campaign command and generate a new plan at the corrected base."
+    elif state.get("phase") == "complete":
+        cleanup = _shell_join([executable, run_path, "--repo", repo, "--cleanup"])
+        next_line = f"Review {Path(repo) / 'BACKLOG.md'}, then preview cleanup with: {cleanup}" if bug_counts["backlog"] else f"Preview cleanup with: {cleanup}"
+    elif state.get("phase") == "waiting-provider":
+        pending = sorted(assignment_id for assignment_id, value in task_states.items() if value.get("phase") == "waiting-provider")
+        resume = _shell_join([executable, run_path, "--repo", repo])
+        next_line = f"Resolve pending checks or approvals for {', '.join(pending) or 'the provider'}, then resume with: {resume}"
+    elif state.get("phase") == "interrupted":
+        next_line = f"Resume with: {_shell_join([executable, run_path, '--repo', repo])}"
+    else:
+        groups: dict[str, list[str]] = {}
+        for assignment_id, reason in blocked_assignments(state):
+            groups.setdefault(_normalized_error(reason), []).append(assignment_id)
+        blockers = "; ".join(f"{reason}: {', '.join(sorted(ids))}" for reason, ids in sorted(groups.items()))
+        next_line = f"Inspect blockers ({blockers}) and preview recovery with: {_shell_join([executable, run_path, '--repo', repo, '--recover'])}"
+    return lines, next_line
+
+
+def state_path(state: dict, relative: str) -> Path:
+    return Path(state["repository"]) / ".relay" / relative
+
+
+def emit_campaign_summary(store: StateStore, tasks: list[dict]) -> None:
+    try:
+        lines, next_line = campaign_summary(store.state, tasks, load_bugs(store))
+        for line in lines:
+            stderr_event("SUMMARY", line)
+        stderr_event("NEXT", next_line)
+    except Exception as error:
+        try:
+            stderr_event("SUMMARY", f"unavailable reason={str(error).splitlines()[0]}")
+        except Exception:
+            print(f"SUMMARY unavailable: {str(error).splitlines()[0]}", file=sys.stderr)
 
 
 def report_stopped(state: dict) -> None:
@@ -2359,6 +2720,8 @@ def permanent_cleanup(repo: Path, confirm: bool) -> int:
 
 def initialize_campaign(repo: Path, text: str, args: argparse.Namespace) -> tuple[StateStore, list[dict]]:
     metadata, tasks = parse_tasks(text)
+    if metadata["legacyCampaignValidation"]:
+        raise RuntimeError("new plans require a Campaign validation section")
     if metadata["taskAttemptLimit"] != args.task_attempts or metadata["fixLoopLimit"] != args.fix_loops:
         raise RuntimeError("plan limits do not match --task-attempts and --fix-loops")
     head = git(repo, "rev-parse", "HEAD", timeout=args.provider_timeout).stdout.strip()
@@ -2428,7 +2791,9 @@ def main(argv: list[str] | None = None) -> int:
                 text = plan_path.read_text(encoding="utf-8") if plan_path.is_file() else ""
             if not text:
                 raise ValueError("a plan on stdin or in PLAN.md is required for --dry-run")
-            parse_tasks(text)
+            metadata, _ = parse_tasks(text)
+            if metadata["legacyCampaignValidation"]:
+                raise ValueError("new plans require a Campaign validation section")
             return 0
         if relay_state.exists():
             if stdin_text.strip() or args.plan:
@@ -2477,6 +2842,7 @@ def main(argv: list[str] | None = None) -> int:
                         report_stopped(store.state)
                     else:
                         stderr_event("COMPLETE", f"operation=campaign integrated={store.state.get('taskTotal', len(tasks))}/{store.state.get('taskTotal', len(tasks))}")
+                    emit_campaign_summary(store, tasks)
                     return result
                 except KeyboardInterrupt:
                     terminate_children()
@@ -2484,6 +2850,7 @@ def main(argv: list[str] | None = None) -> int:
                         process["interrupted"] = True
                     store.update(lambda state: state.update(phase="interrupted", interruptedAt=datetime.now(timezone.utc).isoformat()))
                     stderr_event("STOPPED", "operation=campaign reason=interrupted")
+                    emit_campaign_summary(store, tasks)
                     return 130
             finally:
                 stop.set()

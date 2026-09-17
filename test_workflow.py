@@ -94,6 +94,22 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(metadata["baseSha"], "0123456789abcdef")
         self.assertEqual(tasks[0]["id"], "TASK-0001")
 
+    def test_campaign_validation_round_trip_and_digest(self):
+        commands = ["python -m unittest", "python -m compileall ."]
+        text = plan.render_tasks([self.task()], "0123456789abcdef", "abc123", campaign_validation_commands=commands)
+        metadata, tasks = run.parse_tasks(text)
+        self.assertEqual(metadata["campaignValidationCommands"], commands)
+        self.assertFalse(metadata["legacyCampaignValidation"])
+        self.assertNotEqual(plan.plan_digest(tasks, commands), plan.plan_digest(tasks, commands[::-1]))
+        with self.assertRaises(ValueError):
+            plan.render_tasks(tasks, metadata["baseSha"], metadata["requirementsHash"], campaign_validation_commands=[])
+
+    def test_planning_result_requires_campaign_validation(self):
+        with self.assertRaisesRegex(ValueError, "campaign validation"):
+            plan.validate_plan({"campaignValidationCommands": [], "tasks": [self.task()]})
+        value = {"campaignValidationCommands": ["python -m unittest"], "tasks": [self.task()]}
+        self.assertEqual(plan.validate_plan(value), value)
+
     def test_bug_ledger_round_trip(self):
         with tempfile.TemporaryDirectory() as root:
             bug = {"id": "BUG-0001", "title": "Broken", "severity": "P1", "status": "active", "source": "audit", "sourceFindingId": "AUDIT-F1", "location": "x.py:1", "failure": "fails", "reproduction": "python x.py", "requirement": "works", "evidence": "exit 1"}
@@ -404,6 +420,10 @@ class PlanningTests(unittest.TestCase):
             self.assertNotIn(b"\r\n", plan_path.read_bytes())
             self.assertEqual((target / "AGENTS.md").read_bytes(), repo.TARGET_AGENTS.encode())
             self.assertIn("Relay Planner", planned.stderr)
+            self.assertIn("SUMMARY    campaign-validation=1", planned.stderr)
+            self.assertIn("SUMMARY    - TASK-0001 ready: Add one file", planned.stderr)
+            self.assertIn("NEXT       Review the generated plan, then execute it with:", planned.stderr)
+            self.assertIn("--workers 2 --task-attempts 3 --fix-loops 2", planned.stderr)
             dry = subprocess.run([sys.executable, str(Path(run.__file__)), "--repo", str(target), "--dry-run"], capture_output=True, text=True)
             self.assertEqual(dry.returncode, 0, dry.stderr)
             self.assertFalse((target / ".relay").exists())
@@ -522,6 +542,126 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(store.state["validationCommandsStarted"][assignment["id"]], 2)
             timeout_log = Path(root) / ".relay" / "logs" / "TASK-0001-validation-2.log"
             self.assertIn("before timeout\n\n--- stderr ---\ntimeout error", timeout_log.read_text(encoding="utf-8"))
+
+    def test_candidate_runs_focused_then_campaign_validation(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = make_git_repository(Path(root))
+            base = git_output(target, "rev-parse", "HEAD").strip()
+            store = self.state_store(target)
+            run.exclude_relay_files(target)
+            assignment = ContractTests().task()
+            store.state["campaignValidationCommands"] = ["python -m unittest"]
+            store.state["taskStates"][assignment["id"]] = {"phase": "candidate-validation"}
+            store.state["worktrees"][assignment["id"]] = {"baseSha": base}
+            calls = []
+            with patch("run.run_validations", side_effect=lambda *args, **kwargs: calls.append((args[3], args[4] if len(args) > 4 else None))):
+                self.assertEqual(run.validate_candidate(store, assignment, target, {"candidateSha": base}), base)
+            self.assertEqual(calls, [("task", None), ("campaign", ["python -m unittest"])])
+
+    def test_repeated_candidate_validation_failure_trips_after_second_attempt(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            store.state["taskAttemptLimit"] = 4
+            calls = []
+            def worker(*args, **kwargs):
+                store.state["attemptCounters"][assignment["id"]] = store.state["attemptCounters"].get(assignment["id"], 0) + 1
+                calls.append(1)
+                return {"candidateSha": "same", "summary": "still failing"}
+            def validate(*args):
+                store.state["taskStates"][assignment["id"]].update(
+                    validationCandidateSha="same",
+                    validationFailure={"category": "campaign", "commandHash": "hash", "outcome": "exit:1"},
+                )
+                raise RuntimeError("campaign validation command 1 exited with code 1; log: changing.log")
+            with patch("run.create_worktree", return_value=(Path(root), "branch")), patch("run.invoke_with_replacements", side_effect=worker), patch("run.validate_candidate", side_effect=validate):
+                self.assertFalse(run.process_assignment(store, threading.Semaphore(1), assignment, "task"))
+            self.assertEqual((len(calls), store.state["attemptCounters"][assignment["id"]]), (2, 2))
+            self.assertTrue(store.state["taskStates"][assignment["id"]]["validationCircuitBroken"])
+
+    def test_baseline_failure_is_bounded_and_consumes_no_worker_attempt(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = make_git_repository(Path(root))
+            store = self.state_store(target)
+            base = git_output(target, "rev-parse", "HEAD").strip()
+            commands = ["raise SystemExit(7)"]
+            store.state.update(baseSha=base, repositoryRoot=str(target), repositoryPrefix="", campaignValidationCommands=commands)
+            store.state["baselineValidation"] = {
+                "baseSha": base, "commandsHash": run.commands_hash(commands), "phase": "pending",
+                "commandsStarted": 0, "currentCommand": None, "startedAt": None, "deadline": None,
+                "completedAt": None, "error": None, "log": None,
+            }
+            with patch("run.validation_command", side_effect=lambda command: [sys.executable, "-c", command]):
+                self.assertFalse(run.run_baseline_validation(store))
+            self.assertEqual(store.state["baselineValidation"]["phase"], "blocked")
+            self.assertEqual(store.state["attemptCounters"], {})
+            self.assertNotIn("BASELINE", store.state["worktrees"])
+
+    def test_baseline_success_is_cached_for_matching_base_and_commands(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = make_git_repository(Path(root))
+            store = self.state_store(target)
+            base = git_output(target, "rev-parse", "HEAD").strip()
+            commands = ["import pathlib; assert pathlib.Path('README.md').is_file()"]
+            store.state.update(baseSha=base, repositoryRoot=str(target), repositoryPrefix="", campaignValidationCommands=commands)
+            store.state["baselineValidation"] = {
+                "baseSha": base, "commandsHash": run.commands_hash(commands), "phase": "pending",
+                "commandsStarted": 0, "currentCommand": None, "startedAt": None, "deadline": None,
+                "completedAt": None, "error": None, "log": None,
+            }
+            with patch("run.validation_command", side_effect=lambda command: [sys.executable, "-c", command]):
+                self.assertTrue(run.run_baseline_validation(store))
+            self.assertEqual(store.state["baselineValidation"]["phase"], "passed")
+            self.assertEqual(store.state["baselineValidation"]["commandsStarted"], 1)
+            with patch("run.git", side_effect=AssertionError("cached baseline reran")):
+                self.assertTrue(run.run_baseline_validation(store))
+
+    def test_backlog_snapshot_is_stable_and_user_file_is_preserved(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            bugs = [
+                {"id": "BUG-0002", "title": "Two", "severity": "P3", "status": "backlog", "source": "audit", "sourceFindingId": "two", "location": "b.py:2", "failure": "two fails", "reproduction": "python b.py", "requirement": "two works", "evidence": "two", "allowedPaths": ["b.py"], "deferralReason": "later"},
+                {"id": "BUG-0001", "title": "One", "severity": "P1", "status": "resolved", "source": "audit", "sourceFindingId": "one", "location": "a.py:1", "failure": "one fails", "reproduction": "python a.py", "requirement": "one works", "evidence": "one", "allowedPaths": ["a.py"]},
+            ]
+            path = run.publish_backlog(store, bugs)
+            first = path.read_bytes()
+            self.assertLess(first.index(b"BUG-0002"), len(first))
+            self.assertNotIn(b"BUG-0001", first)
+            run.publish_backlog(store, bugs)
+            self.assertEqual(path.read_bytes(), first)
+            path.write_text("# Mine\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "user-owned"):
+                run.publish_backlog(store, bugs)
+            self.assertEqual(path.read_text(encoding="utf-8"), "# Mine\n")
+
+    def test_campaign_summary_orders_tasks_and_backlog(self):
+        tasks = [ContractTests().task("TASK-0002"), ContractTests().task("TASK-0001")]
+        state = {
+            "repository": str(Path("repo").resolve()), "phase": "complete",
+            "campaignValidationCommands": ["test"], "baselineValidation": {"phase": "passed", "baseSha": "abc"},
+            "taskStates": {
+                "TASK-0001": {"phase": "integrated", "candidateSha": "one", "workerSummary": "implemented one"},
+                "TASK-0002": {"phase": "integrated", "candidateSha": "two", "workerSummary": "implemented two"},
+            },
+        }
+        bug = {"id": "BUG-0002", "status": "backlog", "failure": "formatting remains", "deferralReason": "outside scope"}
+        lines, next_line = run.campaign_summary(state, tasks, [bug])
+        self.assertLess(next(index for index, line in enumerate(lines) if "TASK-0001" in line), next(index for index, line in enumerate(lines) if "TASK-0002" in line))
+        self.assertIn("backlog=1", lines[0])
+        self.assertIn("BACKLOG.md", next_line)
+
+    def test_schema_two_legacy_campaign_resumes_without_baseline(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            store.state.pop("campaignValidationCommands")
+            store.state.pop("baselineValidation")
+            store.save()
+            run.reconcile(store)
+            self.assertEqual(store.state["campaignValidationCommands"], [])
+            self.assertEqual(store.state["baselineValidation"]["phase"], "legacy-skipped")
+            with patch("run.require_validation_shell"), patch("run.provider_preflight", side_effect=RuntimeError("reached provider")):
+                with self.assertRaisesRegex(RuntimeError, "reached provider"):
+                    run.execute_campaign(store, [])
 
     def test_initial_validation_failure_uses_next_task_attempt_and_keeps_last_error(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1294,6 +1434,7 @@ class DeterministicCoreTests(unittest.TestCase):
             (root / "PLAN.reviewed.md").write_text(relay_plan, encoding="utf-8")
             (root / "post-mvp-plan.md").write_text("keep plan\n", encoding="utf-8")
             (root / "AGENTS.md").write_text("keep agents\n", encoding="utf-8")
+            (root / "BACKLOG.md").write_text("keep backlog\n", encoding="utf-8")
             (root / ".git" / "info" / "exclude").write_text("tasks.md\nbugs.md\n.relay/\nkeep.me\n", encoding="utf-8")
             state = {"repository": str(root), "phase": "complete", "activeProcesses": {}, "worktrees": {}, "pullRequests": {}, "campaignId": campaign}
             (relay / "state.json").write_text(json.dumps(state), encoding="utf-8")
@@ -1306,13 +1447,14 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertFalse((root / "PLAN.reviewed.md").exists())
             self.assertEqual((root / "post-mvp-plan.md").read_text(encoding="utf-8"), "keep plan\n")
             self.assertEqual((root / "AGENTS.md").read_text(encoding="utf-8"), "keep agents\n")
+            self.assertEqual((root / "BACKLOG.md").read_text(encoding="utf-8"), "keep backlog\n")
             self.assertEqual((root / ".git" / "info" / "exclude").read_text(encoding="utf-8"), "keep.me\n")
 
     def test_campaign_initialization_generates_only_missing_agents(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root); target = make_git_repository(root)
             args = run.parser().parse_args(["--repo", str(target)])
-            text = plan.render_tasks([ContractTests().task()], git_output(target, "rev-parse", "HEAD").strip(), "abc123")
+            text = plan.render_tasks([ContractTests().task()], git_output(target, "rev-parse", "HEAD").strip(), "abc123", campaign_validation_commands=["python -c \"print('baseline')\""])
             store, _ = run.initialize_campaign(target, text, args)
             self.assertEqual((target / "AGENTS.md").read_bytes(), repo.TARGET_AGENTS.encode())
             self.assertEqual(store.state["agentsBootstrap"]["phase"], "pending")
@@ -1335,7 +1477,7 @@ class DeterministicCoreTests(unittest.TestCase):
             root = Path(root); target = make_git_repository(root)
             agents = target / "AGENTS.md"; agents.write_bytes(b"custom\r\n")
             args = run.parser().parse_args(["--repo", str(target)])
-            text = plan.render_tasks([ContractTests().task()], git_output(target, "rev-parse", "HEAD").strip(), "abc123")
+            text = plan.render_tasks([ContractTests().task()], git_output(target, "rev-parse", "HEAD").strip(), "abc123", campaign_validation_commands=["python -c \"print('baseline')\""])
             store, _ = run.initialize_campaign(target, text, args)
             self.assertEqual(agents.read_bytes(), b"custom\r\n")
             self.assertIsNone(store.state["agentsBootstrap"])
@@ -1348,7 +1490,7 @@ class DeterministicCoreTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(target), "add", "AGENTS.md"], check=True)
             subprocess.run(["git", "-C", str(target), "commit", "-m", "custom agents"], check=True, capture_output=True)
             args = run.parser().parse_args(["--repo", str(target)])
-            text = plan.render_tasks([ContractTests().task()], git_output(target, "rev-parse", "HEAD").strip(), "abc123")
+            text = plan.render_tasks([ContractTests().task()], git_output(target, "rev-parse", "HEAD").strip(), "abc123", campaign_validation_commands=["python -c \"print('baseline')\""])
             store, _ = run.initialize_campaign(target, text, args)
             self.assertEqual(agents.read_bytes(), b"tracked custom\n")
             self.assertIsNone(store.state["agentsBootstrap"])
@@ -1359,12 +1501,12 @@ class DeterministicCoreTests(unittest.TestCase):
             content = repo.TARGET_AGENTS + "customized\n"
             (target / "AGENTS.md").write_text(content, encoding="utf-8", newline="\n")
             args = run.parser().parse_args(["--repo", str(target)])
-            text = plan.render_tasks([ContractTests().task()], git_output(target, "rev-parse", "HEAD").strip(), "abc123")
+            text = plan.render_tasks([ContractTests().task()], git_output(target, "rev-parse", "HEAD").strip(), "abc123", campaign_validation_commands=["python -c \"print('baseline')\""])
             store, tasks = run.initialize_campaign(target, text, args)
             self.assertEqual(store.state["phase"], "needs-user")
             self.assertEqual(store.state["agentsBootstrap"]["providerStatus"], "generated-file-modified")
             self.assertEqual((target / "AGENTS.md").read_text(encoding="utf-8"), content)
-            with patch("run.provider_preflight") as preflight, patch("run.run_assignments") as workers:
+            with patch("run.require_validation_shell"), patch("run.run_baseline_validation", return_value=True), patch("run.provider_preflight") as preflight, patch("run.run_assignments") as workers:
                 self.assertEqual(run.execute_campaign(store, tasks), 2)
             preflight.assert_not_called()
             workers.assert_not_called()
@@ -1419,6 +1561,13 @@ class FakeEndToEndTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr + json.dumps(state, indent=2))
             self.assertEqual((state["provider"], state["azureOrganization"], state["azureProject"], state["azureRepository"]), ("azure-devops", "org", "project", "repo"))
             self.assertEqual(state["phase"], "complete")
+            self.assertEqual(state["baselineValidation"]["phase"], "passed")
+            self.assertEqual(state["baselineValidation"]["commandsStarted"], 1)
+            self.assertEqual(state["validationCommandsStarted"]["TASK-0001:campaign"], 1)
+            self.assertIn("SUMMARY    tasks=1/1 completed", completed.stderr)
+            self.assertIn("SUMMARY    - BASELINE passed:", completed.stderr)
+            self.assertIn("NEXT       Preview cleanup with:", completed.stderr)
+            self.assertFalse((target / "BACKLOG.md").exists())
             self.assertEqual(len(list(provider.glob("*.json"))), 2)
             records = [json.loads(path.read_text()) for path in provider.glob("*.json")]
             self.assertEqual([record.get("operations", []) for record in records if "agents-bootstrap" not in record["branch"]], [["provider-approve"]])
@@ -1548,7 +1697,7 @@ class FakeEndToEndTests(unittest.TestCase):
             task = ContractTests().task()
             task["allowedPaths"] = ["file.txt"]
             task["validationCommands"] = [f'{sys.executable} -c "from pathlib import Path; assert Path(\'file.txt\').is_file()"']
-            text = plan.render_tasks([task], git_output(target, "rev-parse", "HEAD").strip(), "abc123")
+            text = plan.render_tasks([task], git_output(target, "rev-parse", "HEAD").strip(), "abc123", campaign_validation_commands=["python -c \"print('baseline')\""])
             environment = os.environ | VALIDATION_ENV | {"RELAY_CODEX": f"{sys.executable} {fake_codex}", "RELAY_GH": f"{sys.executable} {fake_gh}", "RELAY_ALLOW_FAKE_PROVIDER": "1", "FAKE_GH_STATE": str(provider), "FAKE_ADVERSARIAL": "1"}
             completed = subprocess.run([sys.executable, str(Path(run.__file__)), "--repo", str(target), "--workers", "2", "--fix-loops", "2", "--agent-timeout", "10", "--validation-timeout", "10", "--provider-timeout", "10", "--provider-check-timeout", "1"], input=text, capture_output=True, text=True, env=environment, timeout=60)
             self.assertEqual(completed.returncode, 2, completed.stdout + completed.stderr)
@@ -1604,7 +1753,7 @@ elif prompt.startswith("Role: Planning Project Manager"):
     tasks = [{"id": "TASK-0001", "title": "Add one file", "status": "ready", "priority": "P1", "dependencies": [], "allowedPaths": ["one.txt"], "acceptanceCriteria": ["File exists."], "validationCommands": ["python -c \"from pathlib import Path; assert Path('one.txt').is_file()\""]}]
     if os.environ.get("FAKE_TWO_TASKS"):
         tasks.append({"id": "TASK-0002", "title": "Add another file", "status": "ready", "priority": "P1", "dependencies": [], "allowedPaths": ["two.txt"], "acceptanceCriteria": ["File exists."], "validationCommands": ["python -c \"from pathlib import Path; assert Path('two.txt').is_file()\""]})
-    result = {"tasks": tasks}
+    result = {"campaignValidationCommands": ["python -c \"print('baseline')\""], "tasks": tasks}
 elif "Role: Worker" in prompt:
     mode = re.search(r"Mode: (task|bug|repair)", prompt).group(1)
     allowed = json.loads(re.search(r"Allowed paths: (\[[^\n]+\])", prompt).group(1))
