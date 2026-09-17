@@ -94,6 +94,14 @@ def validate_tasks(value: object) -> list[dict]:
             raise ValueError("allowed paths must stay relative to the repository")
         if set(task["dependencies"]) - known or task["id"] in task["dependencies"]:
             raise ValueError("unknown or self dependency")
+        if "seed" in task:
+            seed = task["seed"]
+            if not isinstance(seed, dict) or set(seed) != {"originalBaseSha", "candidateSha", "archiveRef", "summary"}:
+                raise ValueError("invalid task seed metadata")
+            if any(not isinstance(item, str) or not item.strip() for item in seed.values()):
+                raise ValueError("invalid task seed metadata")
+            if any(not re.fullmatch(r"[0-9a-f]{7,64}", seed[key]) for key in ("originalBaseSha", "candidateSha")) or not re.fullmatch(r"relay/archive/[A-Za-z0-9._-]+/TASK-\d{4}", seed["archiveRef"]):
+                raise ValueError("invalid task seed metadata")
     graph, visiting, visited = {task["id"]: task["dependencies"] for task in tasks}, set(), set()
     def visit(task_id: str) -> None:
         if task_id in visiting:
@@ -153,6 +161,12 @@ def render_tasks(tasks: list[dict], base_sha: str, requirements_hash: str, task_
             *[f"  - `{item}`" for item in task["allowedPaths"]],
             "- Acceptance criteria:", *[f"  - {item}" for item in task["acceptanceCriteria"]],
             "- Validation:", *[f"  - `{item}`" for item in task["validationCommands"]],
+            *([] if not task.get("seed") else [
+                f"- Seed Original base: {task['seed']['originalBaseSha']}",
+                f"- Seed Candidate SHA: {task['seed']['candidateSha']}",
+                f"- Seed Archive ref: {task['seed']['archiveRef']}",
+                f"- Seed Worker summary: {json.dumps(task['seed']['summary'], ensure_ascii=False)}",
+            ]),
             f"- Attempt: 0/{task_attempts}", f"- Fix loop: 0/{fix_loops}", "- Branch: pending",
             "- Pull request: pending", "- Candidate: pending", "",
         ]
@@ -194,6 +208,70 @@ def command(tool: str) -> list[str]:
 
 def git(repo: Path, *args: str) -> str:
     return subprocess.run(command("git") + ["-C", str(repo), *args], check=True, capture_output=True, encoding="utf-8", errors="replace", timeout=60).stdout.strip()
+
+
+def parse_handoff(text: str, repo: Path) -> dict | None:
+    if not text.startswith("# Relay Handoff\n"):
+        return None
+    marker = run.HANDOFF_MARKER.search(text)
+    match = re.search(r"```json\n(.+?)\n```", text, re.DOTALL)
+    if not marker or not match:
+        raise ValueError("invalid Relay handoff")
+    payload = json.loads(match.group(1))
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    repository_hash = hashlib.sha256(str(repo.resolve()).encode()).hexdigest()[:12]
+    if marker.group(2) != repository_hash or marker.group(3) != hashlib.sha256(canonical.encode()).hexdigest():
+        raise ValueError("Relay handoff repository or manifest hash mismatch")
+    if not isinstance(payload, dict) or payload.get("campaignId") != marker.group(1) or payload.get("repositoryHash") != repository_hash:
+        raise ValueError("Relay handoff ownership mismatch")
+    defect, entries = payload.get("baselineDefect"), payload.get("tasks")
+    if not isinstance(defect, dict) or set(defect) != {"category", "command", "commandHash", "outcome"} or defect["commandHash"] != hashlib.sha256(str(defect["command"]).encode()).hexdigest():
+        raise ValueError("invalid Relay handoff baseline defect")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("Relay handoff has no tasks")
+    ids, contracts = [], []
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"contract", "contractHash", "seed"}:
+            raise ValueError("invalid Relay handoff task")
+        contract, seed = entry["contract"], entry["seed"]
+        contract_text = json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        if entry["contractHash"] != hashlib.sha256(contract_text.encode()).hexdigest():
+            raise ValueError("Relay handoff task hash mismatch")
+        if not isinstance(seed, dict) or set(seed) != {"originalBaseSha", "candidateSha", "archiveRef", "summary"}:
+            raise ValueError("invalid Relay handoff seed")
+        if any(not re.fullmatch(r"[0-9a-f]{7,64}", seed[key]) for key in ("originalBaseSha", "candidateSha")) or not re.fullmatch(rf"relay/archive/{re.escape(marker.group(1))}/{re.escape(contract['id'])}", str(seed["archiveRef"])) or not isinstance(seed["summary"], str) or not seed["summary"].strip():
+            raise ValueError("invalid Relay handoff seed")
+        for revision in (seed["originalBaseSha"], seed["candidateSha"], seed["archiveRef"]):
+            git(repo, "cat-file", "-e", f"{revision}^{{commit}}")
+        if git(repo, "rev-parse", seed["archiveRef"]) != seed["candidateSha"]:
+            raise ValueError("Relay handoff archive ref mismatch")
+        ancestry = subprocess.run(command("git") + ["-C", str(repo), "merge-base", "--is-ancestor", seed["originalBaseSha"], seed["candidateSha"]], capture_output=True, timeout=60)
+        if ancestry.returncode:
+            raise ValueError("Relay handoff candidate ancestry mismatch")
+        ids.append(contract["id"])
+        contracts.append(contract)
+    if len(ids) != len(set(ids)):
+        raise ValueError("duplicate Relay handoff task")
+    validate_tasks({"tasks": contracts})
+    return payload
+
+
+def apply_handoff(tasks: list[dict], commands: list[str], handoff: dict | None) -> tuple[list[str], list[dict]]:
+    if handoff is None:
+        return commands, tasks
+    entries = {entry["contract"]["id"]: entry for entry in handoff["tasks"]}
+    planned = {task["id"]: task for task in tasks}
+    missing = sorted(entries.keys() - planned.keys())
+    if missing:
+        raise ValueError(f"reviewed plan omitted migrated tasks: {', '.join(missing)}")
+    shared = handoff["baselineDefect"]["command"]
+    for task_id, entry in entries.items():
+        focused = [command for command in entry["contract"]["validationCommands"] if command != shared]
+        if not focused:
+            raise ValueError(f"migrated task has no focused validation after removing campaign command: {task_id}")
+        planned[task_id]["validationCommands"] = focused
+        planned[task_id]["seed"] = dict(entry["seed"])
+    return [shared], tasks
 
 
 def progress(event: str, detail: str) -> None:
@@ -390,7 +468,7 @@ Findings:\n{json.dumps(findings)}
 Return resolved, unresolved, or invalid-result using the supplied JSON schema."""
 
 
-def reviewed_plan(repo: Path, requirements: str, instructions: str, files: list[str], base: str, tasks: list[dict], timeout: int, budget: CallBudget, retries: int, campaign_validation_commands: list[str] | None = None):
+def reviewed_plan(repo: Path, requirements: str, instructions: str, files: list[str], base: str, tasks: list[dict], timeout: int, budget: CallBudget, retries: int, campaign_validation_commands: list[str] | None = None, handoff: dict | None = None):
     digest = plan_digest(tasks, campaign_validation_commands)
     findings = []
     for role in ("contract-reviewer", "risk-reviewer"):
@@ -411,6 +489,8 @@ def reviewed_plan(repo: Path, requirements: str, instructions: str, files: list[
         validate_plan if campaign_validation_commands is not None else validate_tasks, timeout, budget, retries, "role=planning-pm-repair",
     )
     revised_commands, revised_tasks = (revised["campaignValidationCommands"], revised["tasks"]) if campaign_validation_commands is not None else (None, revised)
+    if revised_commands is not None:
+        revised_commands, revised_tasks = apply_handoff(revised_tasks, revised_commands, handoff)
     revised_digest = plan_digest(revised_tasks, revised_commands)
     verification = invoke_validated(
         repo, plan_verification_prompt(requirements, {"campaignValidationCommands": campaign_validation_commands, "tasks": tasks} if campaign_validation_commands is not None else tasks, revised, findings, revised_digest), run.ROLE_JSON_SCHEMAS["verification-reviewer"],
@@ -452,6 +532,7 @@ def main(argv: list[str] | None = None) -> int:
         parser().error("requirements file must not be empty")
     try:
         base, files, instructions = inspect_repository(repo)
+        handoff = parse_handoff(requirements, repo)
         scopes = scout_scopes(files, args.workers)
         budget = CallBudget(len(scopes) + 5 + args.format_retries)
         progress("START", f"operation=plan name=Relay Planner workers={args.workers} calls={budget.limit}")
@@ -467,7 +548,8 @@ def main(argv: list[str] | None = None) -> int:
                 evidence = [future.result() for future in futures]
         relay_console.update(f"planning-pm synthesize | calls={budget.started}/{budget.limit}")
         planned = invoke_validated(repo, planning_prompt(requirements, instructions, files, base, evidence), planning_schema(), validate_plan, args.agent_timeout, budget, args.format_retries, "role=planning-pm")
-        commands, tasks = reviewed_plan(repo, requirements, instructions, files, base, planned["tasks"], args.agent_timeout, budget, args.format_retries, planned["campaignValidationCommands"])
+        commands, tasks = apply_handoff(planned["tasks"], planned["campaignValidationCommands"], handoff)
+        commands, tasks = reviewed_plan(repo, requirements, instructions, files, base, tasks, args.agent_timeout, budget, args.format_retries, commands, handoff)
         progress("DONE", f"operation=validate-plan tasks={len(tasks)}")
         output = render_tasks(tasks, base, hashlib.sha256(requirements.encode()).hexdigest()[:12], args.task_attempts, args.fix_loops, commands)
         output_path = (args.output or repo / "PLAN.md").resolve()

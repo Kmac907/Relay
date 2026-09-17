@@ -113,6 +113,8 @@ Before provider authentication, bootstrap, or Worker launch, Relay creates a det
 
 Ready tasks run concurrently only when dependencies are satisfied and allowed paths do not overlap. Each task gets an isolated branch and Git worktree. The Worker is the only write-capable role and must commit a candidate locally. Before publication, Relay verifies ancestry, the reported SHA, changed paths, then runs the task's focused commands once followed by the campaign commands once. The same candidate and stable validation failure repeated twice trips a circuit breaker instead of spending the remaining Worker attempts.
 
+A terminal campaign preserves its last clean validation candidate. A plain resume may replay that candidate's validation once without consuming a Worker or repair attempt, then continue review and publication if it passes. A failed replay remains terminal; Relay prints the complete `--recover --grant-attempt` command instead of silently launching new implementation work. Validation blockers are grouped by category, command hash, and outcome, while their exact command, affected assignments, required external change, and logs remain visible.
+
 Validation commands run explicitly through `pwsh -NoLogo -NoProfile -NonInteractive -Command` on Windows and `/bin/sh -c` on POSIX; set `RELAY_PWSH` to override the PowerShell executable. Relay checks that shell before launching Workers. Each command's shell, exit code, stdout, and stderr is captured in `.relay/logs/<assignment>-validation-<number>.log`; console and state errors contain only the command number, result, and log path. A failed initial validation stays within the task-attempt budget, while repair validation stays within the shared fix-loop and review-call budgets.
 
 Relay then pushes the branch, opens or recovers one PR, and runs two independent read-only reviews followed by one triage decision. Accepted blockers enter the same bounded Worker repair loop and receive a focused verification review. Initial blockers, merge conflicts, integration failures, and provider-check repairs share one persisted fix-loop budget.
@@ -121,7 +123,9 @@ Approved candidates must retain the reviewed SHA and pass the selected provider'
 
 `run.py` detects canonical GitHub and Azure HTTPS/SSH origins, including `visualstudio.com` Azure URLs, then persists the provider identity. Azure PR descriptions are passed as a single line for Windows `az.cmd` compatibility; GitHub continues to receive the body file. When `--repo` names a subdirectory of a Git repository, Relay preserves that prefix in bootstrap and Worker worktrees and rejects changes outside it. Resume uses the persisted provider identity and normalized PR number, URL, source SHA, and state. Use the same `run.py --repo ...` command after provider action or interruption. Push, PR creation, policy polling, merge, reconciliation, and the no-AI-review `AGENTS.md` bootstrap all resume without intentionally duplicating completed operations. Campaign state is versioned strictly; unsupported state must be replaced with a newly reviewed plan rather than recovered heuristically.
 
-Terminal `needs-user` decisions require explicit recovery. `--recover` previews every action without changing state; add `--confirm` to journal and apply them, then resume the campaign. `--defer-blocker BUG-NNNN` backlogs work owned by another task, and `--grant-attempt TASK-NNNN` grants one separately-accounted Worker attempt. A candidate deletion outside static scope can be adopted only when the target worktree contains the same user-owned deletion. Recovery refuses active campaigns and drifted worktrees, paths, SHAs, or provider state.
+Terminal `needs-user` decisions require explicit recovery. `--recover` previews every action without changing state; add `--confirm` to journal and apply the actions, then run the printed resume command. Confirmation exits without launching Workers. `--defer-blocker BUG-NNNN` backlogs work owned by another task, and `--grant-attempt TASK-NNNN` grants one separately-accounted Worker attempt. A candidate deletion outside static scope can be adopted only when the target worktree contains the same user-owned deletion. Recovery refuses active campaigns and drifted worktrees, paths, SHAs, or provider state.
+
+Schema-v2 campaigns that predate campaign validation are readable but never executable. A plain run prints the exact migration-preview command. Recovery groups shared validation failures, runs each shared command once in a detached worktree at the historical base, and offers `archive-and-handoff` only for a confirmed baseline defect. Confirmation creates immutable `relay/archive/<campaign>/<task>` refs, validates a byte-stable `.relay-archive/<campaign>/` snapshot and managed `HANDOFF.md`, then removes the old worktrees and active ledgers. The printed `plan.py --requirements .../HANDOFF.md` command creates a modern plan. Relay validates the handoff marker, hashes, ancestry, and refs; injects preserved seed metadata itself; promotes the shared full-build command to campaign validation; and keeps the remaining focused task commands unchanged. Seeded Workers must reapply the archived diff onto the new planned base and produce a newly validated descendant.
 
 ### 5. Finite audit
 
@@ -148,6 +152,7 @@ uv run .\plan.py `
 | `BACKLOG.md` | Coordinator handoff | Latest verified deferred-work snapshot; preserved by cleanup |
 | `.relay/state.json` | Coordinator | Resume authority, counters, phases, PRs, worktrees, and deadlines |
 | `.relay/logs/` | Coordinator | Raw agent and provider logs, separate from console output |
+| `.relay-archive/<campaign>/` | Coordinator handoff | Immutable legacy snapshot, candidate metadata, logs, and managed `HANDOFF.md`; preserved by cleanup |
 
 Only `run.py` modifies active ledgers and runtime state. Counters are persisted before processes or provider operations start, so a crash never grants a free retry.
 
@@ -172,7 +177,7 @@ python run.py --repo C:\Code\Projects\Example --cleanup
 python run.py --repo C:\Code\Projects\Example --cleanup --confirm
 ```
 
-Cleanup is allowed only for a complete, inactive campaign with no worktrees or open Relay PRs. It removes `tasks.md`, `bugs.md`, Relay-format plan files in the repository root, and `.relay`; it preserves `BACKLOG.md`, human-authored plans, `AGENTS.md`, source, and Git history.
+Cleanup is allowed only for a complete, inactive campaign with no worktrees or open Relay PRs. It removes `tasks.md`, `bugs.md`, Relay-format plan files in the repository root, and `.relay`; it preserves `.relay-archive/`, `BACKLOG.md`, human-authored plans, `AGENTS.md`, source, and Git history.
 
 Run Relay's deterministic test gate with:
 

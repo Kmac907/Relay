@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import os
 import subprocess
@@ -103,6 +104,14 @@ class ContractTests(unittest.TestCase):
         self.assertNotEqual(plan.plan_digest(tasks, commands), plan.plan_digest(tasks, commands[::-1]))
         with self.assertRaises(ValueError):
             plan.render_tasks(tasks, metadata["baseSha"], metadata["requirementsHash"], campaign_validation_commands=[])
+
+    def test_seed_metadata_round_trip_and_digest(self):
+        task = self.task()
+        task["seed"] = {"originalBaseSha": "0123456789abcdef", "candidateSha": "fedcba9876543210", "archiveRef": "relay/archive/campaign/TASK-0001", "summary": "preserved work"}
+        text = plan.render_tasks([task], "1111111111111111", "abc123", campaign_validation_commands=["full build"])
+        _, parsed = run.parse_tasks(text)
+        self.assertEqual(parsed[0]["seed"], task["seed"])
+        self.assertNotEqual(plan.plan_digest([task], ["full build"]), plan.plan_digest([{key: value for key, value in task.items() if key != "seed"}], ["full build"]))
 
     def test_planning_result_requires_campaign_validation(self):
         with self.assertRaisesRegex(ValueError, "campaign validation"):
@@ -491,10 +500,11 @@ class PlanningTests(unittest.TestCase):
 class DeterministicCoreTests(unittest.TestCase):
     def state_store(self, root, fix_loops=2, format_retries=2):
         args = run.parser().parse_args(["--repo", str(root), "--fix-loops", str(fix_loops), "--format-retries", str(format_retries)])
-        state = run.initial_state(Path(root), {"baseSha": "0123456", "requirementsHash": "abc123"}, args)
+        campaign_commands = ["python -c \"pass\""]
+        state = run.initial_state(Path(root), {"baseSha": "0123456", "requirementsHash": "abc123", "campaignValidationCommands": campaign_commands, "legacyCampaignValidation": False}, args)
         state["campaignId"] = "test"
         path = Path(root) / ".relay" / "state.json"
-        Path(root, "tasks.md").write_text(plan.render_tasks([ContractTests().task()], "0123456", "abc123", args.task_attempts, args.fix_loops), encoding="utf-8")
+        Path(root, "tasks.md").write_text(plan.render_tasks([ContractTests().task()], "0123456", "abc123", args.task_attempts, args.fix_loops, campaign_commands), encoding="utf-8")
         Path(root, "bugs.md").write_text(run.render_bugs("test", Path(root)), encoding="utf-8")
         return run.StateStore(path, state)
 
@@ -616,6 +626,25 @@ class DeterministicCoreTests(unittest.TestCase):
             with patch("run.git", side_effect=AssertionError("cached baseline reran")):
                 self.assertTrue(run.run_baseline_validation(store))
 
+    def test_terminal_baseline_replays_once_then_requires_explicit_recovery(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            store.state.update(phase="needs-user")
+            store.state["baselineValidation"].update(phase="blocked", error="failed", currentCommand="full build")
+            store.save()
+            run.reconcile(store)
+            self.assertEqual(store.state["baselineValidation"]["phase"], "pending")
+            self.assertTrue(store.state["baselineValidation"]["automaticReplayUsed"])
+            store.state.update(phase="needs-user")
+            store.state["baselineValidation"].update(phase="blocked", error="failed again", currentCommand="full build")
+            store.save()
+            run.reconcile(store)
+            self.assertEqual(store.state["baselineValidation"]["phase"], "blocked")
+            actions = run.plan_recovery(store, run.load_tasks(store), [], [])
+            self.assertEqual(actions[0]["action"], "replay-baseline")
+            run.apply_recovery(store, run.load_tasks(store), actions)
+            self.assertEqual((store.state["phase"], store.state["baselineValidation"]["phase"]), ("build", "pending"))
+
     def test_backlog_snapshot_is_stable_and_user_file_is_preserved(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
@@ -650,18 +679,19 @@ class DeterministicCoreTests(unittest.TestCase):
         self.assertIn("backlog=1", lines[0])
         self.assertIn("BACKLOG.md", next_line)
 
-    def test_schema_two_legacy_campaign_resumes_without_baseline(self):
+    def test_schema_two_legacy_campaign_refuses_execution_without_baseline(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
             store.state.pop("campaignValidationCommands")
             store.state.pop("baselineValidation")
             store.save()
-            run.reconcile(store)
-            self.assertEqual(store.state["campaignValidationCommands"], [])
-            self.assertEqual(store.state["baselineValidation"]["phase"], "legacy-skipped")
-            with patch("run.require_validation_shell"), patch("run.provider_preflight", side_effect=RuntimeError("reached provider")):
-                with self.assertRaisesRegex(RuntimeError, "reached provider"):
-                    run.execute_campaign(store, [])
+            legacy = plan.render_tasks([ContractTests().task()], "0123456", "abc123")
+            Path(root, "tasks.md").write_text(legacy, encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "legacy campaigns require --recover"):
+                run.reconcile(store)
+            with patch("run.provider_preflight") as provider, self.assertRaisesRegex(RuntimeError, "legacy campaigns require --recover"):
+                run.execute_campaign(store, [])
+            provider.assert_not_called()
 
     def test_initial_validation_failure_uses_next_task_attempt_and_keeps_last_error(self):
         with tempfile.TemporaryDirectory() as root:
@@ -710,6 +740,23 @@ class DeterministicCoreTests(unittest.TestCase):
             worker.assert_not_called()
             validate.assert_called_once()
 
+    def test_terminal_candidate_replay_is_persisted_without_attempt(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            store.state["taskStates"][assignment["id"]] = {"phase": "needs-user", "terminalValidationCandidateSha": "candidate", "validationFailure": {"category": "campaign", "command": "build", "commandHash": hashlib.sha256(b"build").hexdigest(), "outcome": "exit:1"}}
+            store.state["worktrees"][assignment["id"]] = {"baseSha": "base"}
+            def replay_git(repo_path, *args, **kwargs):
+                if args[0] == "rev-parse":
+                    return subprocess.CompletedProcess([], 0, "candidate\n", "")
+                return subprocess.CompletedProcess([], 0, "", "")
+            with patch("run.recovery_worktree", return_value=(Path(root), store.state["worktrees"][assignment["id"]])), patch("run.git", side_effect=replay_git):
+                run.prepare_terminal_validation_replays(store)
+            task_state = store.state["taskStates"][assignment["id"]]
+            self.assertEqual((task_state["phase"], task_state["pendingWorkerSha"]), ("candidate-validation", "candidate"))
+            self.assertTrue(task_state["terminalValidationReplayUsed"])
+            self.assertEqual(store.state["attemptCounters"], {})
+
     def test_completed_repair_resumes_validation_then_verification(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
@@ -738,6 +785,7 @@ class DeterministicCoreTests(unittest.TestCase):
             run.exclude_relay_files(target)
             assignment = ContractTests().task()
             assignment.update(allowedPaths=["one.txt", "two.txt"], validationCommands=[])
+            store.state["campaignValidationCommands"] = []
             store.state["taskStates"][assignment["id"]] = {"phase": "candidate-validation"}
             store.state["worktrees"][assignment["id"]] = {"baseSha": base}
             self.assertEqual(run.validate_candidate(store, assignment, target, {"candidateSha": repaired}), repaired)
@@ -829,6 +877,62 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(run.load_bugs(store)[0]["status"], "backlog")
             self.assertEqual(store.state["reviewSessions"][assignment["id"]]["repairAttemptsStarted"], 2)
             self.assertEqual((store.state["phase"], len(store.state["recoveryHistory"])), ("build", 1))
+
+    def test_legacy_preview_and_confirm_archive_candidates_and_handoff(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = make_git_repository(Path(root))
+            base = git_output(target, "rev-parse", "HEAD").strip()
+            campaign = f"migration-{Path(root).name.lower()}"
+            shared = "full build"
+            tasks = [ContractTests().task(f"TASK-{number:04d}") for number in (1, 2)]
+            for number, task in enumerate(tasks, 1):
+                task["allowedPaths"] = [f"candidate-{number}.txt"]
+                task["validationCommands"] = [f"focused-{number}", shared]
+            args = run.parser().parse_args(["--repo", str(target)])
+            metadata = {"baseSha": base, "requirementsHash": "abc123", "campaignValidationCommands": ["modern"], "legacyCampaignValidation": False}
+            state = run.initial_state(target, metadata, args)
+            state.update(campaignId=campaign, phase="needs-user", repositoryRoot=str(target), repositoryPrefix="")
+            state.pop("campaignValidationCommands")
+            state.pop("baselineValidation")
+            relay = target / ".relay"; (relay / "logs").mkdir(parents=True)
+            store = run.StateStore(relay / "state.json", state)
+            (target / "tasks.md").write_text(plan.render_tasks(tasks, base, "abc123"), encoding="utf-8")
+            (target / "bugs.md").write_text(run.render_bugs(campaign, target), encoding="utf-8")
+            failure = {"category": "campaign", "command": shared, "commandHash": hashlib.sha256(shared.encode()).hexdigest(), "outcome": "exit:1"}
+            roots = []
+            try:
+                for number, task in enumerate(tasks, 1):
+                    worktree_root = Path(tempfile.gettempdir()).resolve() / "relay-worktrees" / campaign / task["id"]
+                    roots.append(worktree_root)
+                    subprocess.run(["git", "-C", str(target), "worktree", "add", "-b", f"relay/{task['id']}", str(worktree_root), base], check=True, capture_output=True)
+                    (worktree_root / f"candidate-{number}.txt").write_text(f"candidate {number}\n", encoding="utf-8")
+                    subprocess.run(["git", "-C", str(worktree_root), "add", "."], check=True)
+                    subprocess.run(["git", "-C", str(worktree_root), "commit", "-m", f"candidate {number}"], check=True, capture_output=True)
+                    candidate = git_output(worktree_root, "rev-parse", "HEAD").strip()
+                    state["worktrees"][task["id"]] = {"path": str(worktree_root), "root": str(worktree_root), "branch": f"relay/{task['id']}", "baseSha": base}
+                    state["taskStates"][task["id"]] = {"phase": "needs-user", "validationCandidateSha": candidate, "validationFailure": failure, "workerSummary": f"implemented {number}"}
+                store.save()
+                before = store.path.read_bytes()
+                with patch("run.require_validation_shell"), patch("run.validation_command", return_value=[sys.executable, "-c", "raise SystemExit(7)"]):
+                    actions = run.plan_recovery(store, tasks, [], [])
+                self.assertEqual(store.path.read_bytes(), before)
+                self.assertEqual(actions[0]["action"], "archive-and-handoff")
+                with run.coordinator_lock(store.path.parent):
+                    handoff = run.apply_recovery(store, tasks, actions)
+                run.finish_archive_cleanup(store)
+                archive = target / ".relay-archive" / campaign
+                self.assertTrue(handoff.samefile(archive / "HANDOFF.md"))
+                self.assertFalse((target / ".relay").exists())
+                self.assertFalse((target / "tasks.md").exists())
+                payload = plan.parse_handoff(handoff.read_text(encoding="utf-8"), target)
+                self.assertEqual([entry["contract"]["id"] for entry in payload["tasks"]], ["TASK-0001", "TASK-0002"])
+                commands, seeded = plan.apply_handoff([dict(task) for task in tasks], ["invented"], payload)
+                self.assertEqual(commands, [shared])
+                self.assertEqual(seeded[0]["validationCommands"], ["focused-1"])
+            finally:
+                for worktree_root in roots:
+                    if worktree_root.exists():
+                        subprocess.run(["git", "-C", str(target), "worktree", "remove", "--force", str(worktree_root)], check=False, capture_output=True)
 
     def test_recovery_rejects_active_campaign_and_unknown_ids(self):
         with tempfile.TemporaryDirectory() as root:
