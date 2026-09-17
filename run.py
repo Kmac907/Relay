@@ -29,7 +29,9 @@ TASK_HEADING = re.compile(r"^## (TASK-\d{4}) — (.+)$")
 BUG_HEADING = re.compile(r"^## (BUG-\d{4}) — (.+)$")
 BUG_MARKER = re.compile(r"<!-- relay: campaign=([A-Za-z0-9._-]+) repository=([0-9a-f]{12}) -->")
 BACKLOG_MARKER = re.compile(r"<!-- relay: backlog campaign=([A-Za-z0-9._-]+) repository=([0-9a-f]{12}) -->")
+HANDOFF_MARKER = re.compile(r"<!-- relay: handoff campaign=([A-Za-z0-9._-]+) repository=([0-9a-f]{12}) manifest=([0-9a-f]{64}) -->")
 TASK_FIELDS = ("Status", "Priority", "Dependencies", "Allowed paths", "Acceptance criteria", "Validation", "Attempt", "Fix loop", "Branch", "Pull request", "Candidate")
+SEED_FIELDS = ("Original base", "Candidate SHA", "Archive ref", "Worker summary")
 WORKER_MODES = {"task", "bug", "repair"}
 TERMINAL_REVIEW_PHASES = {"approved", "needs-user"}
 CHILD_LOCK = threading.Lock()
@@ -232,6 +234,17 @@ def parse_tasks(text: str, runtime: bool = False) -> tuple[dict, list[dict]]:
             "attempt": int(attempt.group(1)), "attemptLimit": int(attempt.group(2)),
             "fixLoop": int(fix_loop.group(1)), "fixLoopLimit": int(fix_loop.group(2)),
         })
+        seed_values = {field: _field(block, f"Seed {field}") for field in SEED_FIELDS if any(line.startswith(f"- Seed {field}:") for line in block)}
+        if seed_values:
+            if set(seed_values) != set(SEED_FIELDS):
+                raise ValueError(f"incomplete seed metadata for {match.group(1)}")
+            seed = {
+                "originalBaseSha": seed_values["Original base"], "candidateSha": seed_values["Candidate SHA"],
+                "archiveRef": seed_values["Archive ref"], "summary": json.loads(seed_values["Worker summary"]),
+            }
+            if any(not re.fullmatch(r"[0-9a-f]{7,64}", seed[key]) for key in ("originalBaseSha", "candidateSha")) or not re.fullmatch(r"relay/archive/[A-Za-z0-9._-]+/TASK-\d{4}", seed["archiveRef"]) or not isinstance(seed["summary"], str) or not seed["summary"].strip():
+                raise ValueError(f"invalid seed metadata for {match.group(1)}")
+            tasks[-1]["seed"] = seed
     ids = [task["id"] for task in tasks]
     if not tasks or len(ids) != len(set(ids)):
         raise ValueError("plan needs unique tasks")
@@ -366,7 +379,7 @@ def initial_state(repo: Path, metadata: dict, args: argparse.Namespace) -> dict:
         "campaignValidationCommands": campaign_commands,
         "baselineValidation": {
             "baseSha": metadata["baseSha"], "commandsHash": commands_hash(campaign_commands),
-            "phase": "legacy-skipped" if metadata.get("legacyCampaignValidation", not campaign_commands) else "pending",
+            "phase": "missing" if metadata.get("legacyCampaignValidation", not campaign_commands) else "pending",
             "commandsStarted": 0, "currentCommand": None, "startedAt": None, "deadline": None,
             "completedAt": None, "error": None, "log": None,
         },
@@ -590,7 +603,7 @@ def exclude_relay_files(repo: Path) -> None:
     value = Path(git(repo, "rev-parse", "--git-path", "info/exclude").stdout.strip())
     exclude = value if value.is_absolute() else repo.resolve() / value
     existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
-    entries = [f"{prefix}/{name}" if prefix else name for name in ("tasks.md", "bugs.md", ".relay/")]
+    entries = [f"{prefix}/{name}" if prefix else name for name in ("tasks.md", "bugs.md", ".relay/", ".relay-archive/")]
     missing = [entry for entry in entries if entry not in existing.splitlines()]
     if missing:
         atomic_write(exclude, existing + ("" if not existing or existing.endswith("\n") else "\n") + "\n".join(missing) + "\n")
@@ -649,12 +662,15 @@ def parse_bugs(text: str) -> tuple[dict, list[dict]]:
 def _validate_ledger(store: StateStore, name: str, text: str) -> None:
     repo = Path(store.state["repository"])
     if name == "tasks.md":
-        metadata, _ = parse_tasks(text, runtime=True)
+        metadata, tasks = parse_tasks(text, runtime=True)
         for key in ("baseSha", "requirementsHash", "taskAttemptLimit", "fixLoopLimit"):
             if metadata[key] != store.state[key]:
                 raise RuntimeError(f"tasks.md {key} does not match campaign state")
         if "campaignValidationCommands" in store.state and metadata["campaignValidationCommands"] != store.state["campaignValidationCommands"]:
             raise RuntimeError("tasks.md campaign validation commands do not match campaign state")
+        seeds = {task["id"]: task["seed"] for task in tasks if task.get("seed")}
+        if "taskSeeds" in store.state and seeds != store.state["taskSeeds"]:
+            raise RuntimeError("tasks.md seed metadata does not match campaign state")
     elif name == "bugs.md":
         metadata, _ = parse_bugs(text)
         expected = hashlib.sha256(str(repo.resolve()).encode()).hexdigest()[:12]
@@ -767,6 +783,14 @@ def update_task_ledger(store: StateStore, assignment_id: str, **values: str) -> 
 
 
 def worker_prompt(mode: str, assignment: dict, candidate_sha: str = "", blockers: list[dict] | None = None, previous_failure: str = "") -> str:
+    seed = assignment.get("seed")
+    seed_instruction = ""
+    if seed:
+        seed_instruction = f"""Preserved candidate seed: {json.dumps(seed)}
+Reapply the complete diff from the preserved original base to candidate onto this worktree's planned base.
+Resolve conflicts, run focused validation, and commit a new descendant candidate. Do not modify the archive ref.
+Implementation may begin only after the coordinator verifies this seed.
+"""
     return f"""Role: Worker
 Mode: {mode}
 Assignment ID: {assignment['id']}
@@ -778,8 +802,27 @@ Validation commands: {json.dumps(assignment['validationCommands'])}
 Current candidate: {candidate_sha or 'none'}
 Repair blockers: {json.dumps(blockers or [])}
 Previous validation failure: {previous_failure or 'none'}
+{seed_instruction}
 Implement only this assignment, run validation, commit the candidate locally, and return the required JSON.
 The result status must be the literal string \"candidate\", never \"completed\". The result mode must exactly match {mode}."""
+
+
+def verify_seed(store: StateStore, assignment: dict) -> None:
+    seed = assignment.get("seed")
+    if not seed:
+        return
+    repository = Path(store.state.get("repositoryRoot", store.state["repository"]))
+    timeout = store.state["validationTimeoutSeconds"]
+    for label, revision in (("original base", seed["originalBaseSha"]), ("candidate", seed["candidateSha"]), ("archive ref", seed["archiveRef"]), ("planned base", store.state["baseSha"])):
+        result = git(repository, "cat-file", "-e", f"{revision}^{{commit}}", timeout=timeout, check=False)
+        if result.returncode:
+            raise RuntimeError(f"seed {label} is missing: {assignment['id']}")
+    archived = git(repository, "rev-parse", seed["archiveRef"], timeout=timeout).stdout.strip()
+    if archived != seed["candidateSha"]:
+        raise RuntimeError(f"seed archive ref drifted: {assignment['id']}")
+    ancestry = git(repository, "merge-base", "--is-ancestor", seed["originalBaseSha"], seed["candidateSha"], timeout=timeout, check=False)
+    if ancestry.returncode:
+        raise RuntimeError(f"seed candidate ancestry is invalid: {assignment['id']}")
 
 
 def role_prompt(role: str, assignment: dict, candidate_sha: str, context: object) -> str:
@@ -993,7 +1036,7 @@ def run_validations(store: StateStore, assignment: dict, worktree: Path, categor
             message = f"{prefix}validation command {command_number} timed out after {store.state['validationTimeoutSeconds']}s; log: {log}"
             def timed_out(state: dict) -> None:
                 target = state["baselineValidation"] if assignment_id == "BASELINE" else state["taskStates"][assignment_id]
-                target.update(error=message, validationFailure={"category": category, "command": command, "commandHash": hashlib.sha256(command.encode()).hexdigest(), "outcome": "timeout"}, validationLog=str(log))
+                target.update(error=message, validationFailure={"category": category, "command": command, "commandHash": hashlib.sha256(command.encode()).hexdigest(), "outcome": "timeout", "requiredExternalChange": "make this command pass without changing the preserved candidate"}, validationLog=str(log))
             store.update(timed_out)
             console("FAILED", f"operation=validate category={category} assignment={assignment_id} command={command_number}/{len(commands)} log={log}")
             clear_operation(store, assignment_id, "validate")
@@ -1004,7 +1047,7 @@ def run_validations(store: StateStore, assignment: dict, worktree: Path, categor
             message = f"{prefix}validation command {command_number} exited with code {completed.returncode}; log: {log}"
             def failed(state: dict) -> None:
                 target = state["baselineValidation"] if assignment_id == "BASELINE" else state["taskStates"][assignment_id]
-                target.update(error=message, validationFailure={"category": category, "command": command, "commandHash": hashlib.sha256(command.encode()).hexdigest(), "outcome": f"exit:{completed.returncode}"}, validationLog=str(log))
+                target.update(error=message, validationFailure={"category": category, "command": command, "commandHash": hashlib.sha256(command.encode()).hexdigest(), "outcome": f"exit:{completed.returncode}", "requiredExternalChange": "make this command pass without changing the preserved candidate"}, validationLog=str(log))
             store.update(failed)
             console("FAILED", f"operation=validate category={category} assignment={assignment_id} command={command_number}/{len(commands)} exit={completed.returncode} log={log}")
             clear_operation(store, assignment_id, "validate")
@@ -1041,9 +1084,23 @@ def validate_candidate(store: StateStore, assignment: dict, worktree: Path, resu
         state["taskStates"][assignment["id"]].pop("validationFailure", None)
         state["taskStates"][assignment["id"]].pop("validationFailureRepeat", None)
         state["taskStates"][assignment["id"]].pop("validationCircuitBroken", None)
+        state["taskStates"][assignment["id"]].pop("terminalValidationCandidateSha", None)
+        state["taskStates"][assignment["id"]].pop("terminalValidationReplayInProgress", None)
+        state["taskStates"][assignment["id"]].pop("terminalValidationReviewRepair", None)
+        state["taskStates"][assignment["id"]].pop("terminalValidationReplayUsed", None)
     store.update(accepted)
     console("DONE", f"operation=candidate assignment={assignment['id']} sha={sha[:12]} validation=passed")
     return sha
+
+
+def clean_validation_candidate(store: StateStore, assignment_id: str, worktree: Path) -> str | None:
+    task_state = store.state["taskStates"][assignment_id]
+    candidate = task_state.get("validationCandidateSha") or task_state.get("pendingWorkerSha") or store.state.get("reviewSessions", {}).get(assignment_id, {}).get("pendingWorkerSha")
+    if not candidate:
+        return None
+    head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"], check=False).stdout.strip()
+    dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"], check=False).stdout
+    return candidate if head == candidate and not dirty else None
 
 
 def provider_call(store: StateStore, key: str, *args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -1401,7 +1458,11 @@ def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: di
                         store.save()
                     repaired_sha = validate_candidate(store, assignment, worktree, repair)
                 except (RuntimeError, ValueError, json.JSONDecodeError) as error:
-                    store.state["taskStates"][assignment_id]["error"] = str(error)
+                    task_state = store.state["taskStates"][assignment_id]
+                    task_state["error"] = str(error)
+                    candidate = clean_validation_candidate(store, assignment_id, worktree)
+                    if task_state.get("validationFailure") and candidate:
+                        task_state.update(terminalValidationCandidateSha=candidate, terminalValidationReviewRepair=number)
                     session.pop("pendingWorkerSha", None)
                     target = f"repair-{number + 1}" if number < store.state["fixLoopLimit"] and session["reviewCallsStarted"] < session["reviewCallLimit"] else "needs-user"
                     transition_review(session, target, store.state["fixLoopLimit"])
@@ -1698,15 +1759,7 @@ def run_baseline_validation(store: StateStore) -> bool:
     commands = store.state.get("campaignValidationCommands", [])
     baseline = store.state.get("baselineValidation")
     if not commands:
-        if baseline is None:
-            store.update(lambda state: state.__setitem__("baselineValidation", {
-                "baseSha": state["baseSha"], "commandsHash": commands_hash([]), "phase": "legacy-skipped",
-                "commandsStarted": 0, "currentCommand": None, "startedAt": None, "deadline": None,
-                "completedAt": None, "error": None, "log": None,
-            }))
-        elif baseline.get("phase") != "legacy-skipped":
-            raise RuntimeError("campaign validation state/ledger drift")
-        return True
+        raise RuntimeError("campaign validation state is missing; legacy campaigns require --recover")
     expected_hash = commands_hash(commands)
     if baseline is None:
         raise RuntimeError("campaign validation state is missing")
@@ -1780,6 +1833,7 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
                 if task_state.get("pendingWorkerSha"):
                     result = {"candidateSha": task_state["pendingWorkerSha"]}
                 else:
+                    verify_seed(store, assignment)
                     result = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt(mode, assignment, previous_failure=task_state.get("error", "")), mode=mode)
                     task_state.update(pendingWorkerSha=result["candidateSha"], phase="candidate-validation")
                     if result.get("summary") is not None:
@@ -1793,7 +1847,6 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
                 failure = task_state.get("validationFailure")
                 if failure:
                     fingerprint = {
-                        "candidateSha": task_state.get("validationCandidateSha") or task_state.get("pendingWorkerSha"),
                         "category": failure["category"], "commandHash": failure["commandHash"], "outcome": failure["outcome"],
                     }
                     previous = task_state.get("validationFailureRepeat", {})
@@ -1803,7 +1856,15 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
                         task_state["validationCircuitBroken"] = True
                 else:
                     task_state.pop("validationFailureRepeat", None)
+                candidate = clean_validation_candidate(store, assignment_id, worktree)
+                if failure and candidate:
+                    task_state["terminalValidationCandidateSha"] = candidate
+                else:
+                    task_state.pop("terminalValidationCandidateSha", None)
                 task_state.pop("pendingWorkerSha", None)
+                replaying = task_state.pop("terminalValidationReplayInProgress", False)
+                if replaying:
+                    task_state["validationCircuitBroken"] = True
                 store.save()
                 sha = None
         if not sha:
@@ -2170,7 +2231,99 @@ def recovery_worktree(store: StateStore, assignment_id: str) -> tuple[Path, dict
     return worktree, record
 
 
+def legacy_campaign(store: StateStore) -> bool:
+    tasks_path = Path(store.state["repository"]) / "tasks.md"
+    if not tasks_path.is_file():
+        return bool(store.state.get("pendingRecovery"))
+    metadata, _ = parse_tasks(tasks_path.read_text(encoding="utf-8"), runtime=True)
+    return metadata["legacyCampaignValidation"] or "campaignValidationCommands" not in store.state or "baselineValidation" not in store.state
+
+
+def _legacy_failure_groups(state: dict) -> list[dict]:
+    groups: dict[tuple[str, str, str], dict] = {}
+    for assignment_id, task_state in sorted(state.get("taskStates", {}).items()):
+        failure = task_state.get("validationFailure")
+        if not assignment_id.startswith("TASK-") or not isinstance(failure, dict):
+            continue
+        command = failure.get("command")
+        key = (str(failure.get("category", "task")), str(failure.get("commandHash", "")), str(failure.get("outcome", "unknown")))
+        if not isinstance(command, str) or not command or key[1] != hashlib.sha256(command.encode()).hexdigest():
+            continue
+        group = groups.setdefault(key, {"category": key[0], "command": command, "commandHash": key[1], "outcome": key[2], "assignmentIds": []})
+        group["assignmentIds"].append(assignment_id)
+    return [group for group in groups.values() if len(group["assignmentIds"]) > 1]
+
+
+def _check_legacy_baseline(store: StateStore, groups: list[dict]) -> list[dict]:
+    if not groups:
+        raise RuntimeError("legacy recovery found no shared validation fingerprint")
+    require_validation_shell(store.state["validationTimeoutSeconds"])
+    repository_root = Path(store.state.get("repositoryRoot", store.state["repository"])).resolve()
+    with tempfile.TemporaryDirectory(prefix="relay-legacy-preview-") as temporary:
+        worktree_root = Path(temporary).resolve() / "base"
+        git(repository_root, "worktree", "add", "--detach", str(worktree_root), store.state["baseSha"], timeout=store.state["validationTimeoutSeconds"])
+        try:
+            worktree = safe_within(worktree_root / Path(store.state.get("repositoryPrefix", "")), worktree_root)
+            failures = []
+            for group in groups:
+                try:
+                    result = bounded_run(validation_command(group["command"]), cwd=worktree, check=False, timeout=store.state["validationTimeoutSeconds"])
+                    outcome = f"exit:{result.returncode}"
+                except subprocess.TimeoutExpired:
+                    outcome = "timeout"
+                if outcome != "exit:0":
+                    failures.append(group | {"baselineOutcome": outcome})
+            return failures
+        finally:
+            git(repository_root, "worktree", "remove", "--force", str(worktree_root), timeout=store.state["validationTimeoutSeconds"], check=False)
+
+
+def _archive_contract(task: dict) -> dict:
+    return {
+        "id": task["id"], "title": task["title"], "status": "ready", "priority": task["priority"],
+        "dependencies": list(task["dependencies"]), "allowedPaths": list(task["allowedPaths"]),
+        "acceptanceCriteria": list(task["acceptanceCriteria"]), "validationCommands": list(task["validationCommands"]),
+    }
+
+
+def plan_legacy_migration(store: StateStore, tasks: list[dict]) -> list[dict]:
+    pending = store.state.get("pendingRecovery")
+    if pending:
+        if not isinstance(pending, dict) or not isinstance(pending.get("actions"), list) or not isinstance(pending.get("completed"), list):
+            raise RuntimeError("invalid pending recovery journal")
+        return pending["actions"]
+    if store.state.get("phase") not in {"needs-user", "waiting-provider", "interrupted", "complete"} or store.state.get("activeProcesses"):
+        raise RuntimeError("legacy migration requires an inactive terminal campaign")
+    if any(pr.get("state") == "OPEN" for pr in store.state.get("pullRequests", {}).values()):
+        raise RuntimeError("legacy migration refuses open campaign pull requests")
+    failures = _check_legacy_baseline(store, _legacy_failure_groups(store.state))
+    if len(failures) != 1:
+        raise RuntimeError("legacy migration requires exactly one confirmed shared baseline defect")
+    candidates = []
+    for task in sorted(tasks, key=lambda item: item["id"]):
+        assignment_id = task["id"]
+        task_state = store.state.get("taskStates", {}).get(assignment_id, {})
+        worktree, record = recovery_worktree(store, assignment_id)
+        candidate = task_state.get("validationCandidateSha") or task_state.get("pendingWorkerSha") or task_state.get("candidateSha") or store.state.get("candidateShas", {}).get(assignment_id)
+        head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
+        dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout
+        ancestry = git(worktree, "merge-base", "--is-ancestor", record["baseSha"], candidate, timeout=store.state["validationTimeoutSeconds"], check=False) if candidate else None
+        if not candidate or head != candidate or dirty or ancestry.returncode:
+            raise RuntimeError(f"legacy candidate is missing, dirty, changed, or mismatched: {assignment_id}")
+        candidates.append({
+            "assignmentId": assignment_id, "originalBaseSha": record["baseSha"], "candidateSha": candidate,
+            "archiveRef": f"relay/archive/{store.state['campaignId']}/{assignment_id}",
+            "summary": task_state.get("workerSummary") or "Preserved legacy Worker candidate.",
+            "contract": _archive_contract(task), "worktreeRoot": record.get("root", record["path"]),
+        })
+    return [{"action": "archive-and-handoff", "assignmentId": "CAMPAIGN", "campaignId": store.state["campaignId"], "baselineDefect": failures[0], "candidates": candidates}]
+
+
 def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str], grants: list[str]) -> list[dict]:
+    if legacy_campaign(store):
+        if deferred or grants:
+            raise ValueError("legacy migration does not accept blocker deferrals or attempt grants")
+        return plan_legacy_migration(store, tasks)
     pending = store.state.get("pendingRecovery")
     if pending:
         if not isinstance(pending, dict) or not isinstance(pending.get("actions"), list) or not isinstance(pending.get("completed"), list):
@@ -2187,6 +2340,9 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str], gra
         raise ValueError("--grant-attempt requires unique campaign task IDs")
     actions = []
     handled = set()
+    baseline = store.state.get("baselineValidation") or {}
+    if baseline.get("phase") == "blocked":
+        actions.append({"action": "replay-baseline", "assignmentId": "BASELINE", "baseSha": baseline.get("baseSha"), "commandsHash": baseline.get("commandsHash")})
     for assignment_id, task_state in sorted(store.state.get("taskStates", {}).items()):
         if assignment_id not in by_id or task_state.get("phase") != "needs-user":
             continue
@@ -2279,10 +2435,173 @@ def print_recovery(actions: list[dict]) -> None:
         detail = f"assignment={action['assignmentId']} action={action['action']}"
         if action.get("bugIds"):
             detail += f" blockers={','.join(action['bugIds'])}"
+        if action.get("baselineDefect"):
+            defect = action["baselineDefect"]
+            detail += f" category={defect['category']} command={defect['command']} outcome={defect['baselineOutcome']} affected={','.join(defect['assignmentIds'])}"
         print(f"RECOVER {detail}")
 
 
-def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) -> None:
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _handoff_payload(store: StateStore, action: dict) -> dict:
+    repository_hash = hashlib.sha256(str(Path(store.state["repository"]).resolve()).encode()).hexdigest()[:12]
+    tasks = []
+    for candidate in action["candidates"]:
+        contract = candidate["contract"]
+        canonical = json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        tasks.append({
+            "contract": contract, "contractHash": hashlib.sha256(canonical.encode()).hexdigest(),
+            "seed": {key: candidate[key] for key in ("originalBaseSha", "candidateSha", "archiveRef", "summary")},
+        })
+    defect = {key: action["baselineDefect"][key] for key in ("category", "command", "commandHash", "baselineOutcome")}
+    defect["outcome"] = defect.pop("baselineOutcome")
+    return {"campaignId": action["campaignId"], "repositoryHash": repository_hash, "baselineDefect": defect, "tasks": tasks}
+
+
+def render_handoff(store: StateStore, action: dict) -> str:
+    payload = _handoff_payload(store, action)
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    manifest_hash = hashlib.sha256(canonical.encode()).hexdigest()
+    lines = [
+        "# Relay Handoff", "",
+        f"<!-- relay: handoff campaign={payload['campaignId']} repository={payload['repositoryHash']} manifest={manifest_hash} -->", "",
+        "Plan only work still missing. The preserved candidates are inputs, not accepted changes.", "",
+        "## Shared baseline defect", "",
+        f"- Command: `{payload['baselineDefect']['command']}`", f"- Outcome: {payload['baselineDefect']['outcome']}", "",
+        "## Preserved candidates", "",
+    ]
+    for entry in payload["tasks"]:
+        seed, contract = entry["seed"], entry["contract"]
+        lines += [f"- {contract['id']}: base `{seed['originalBaseSha']}`, candidate `{seed['candidateSha']}`, ref `{seed['archiveRef']}` — {' '.join(seed['summary'].splitlines())}"]
+    lines += ["", "## Managed data", "", "```json", json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False), "```", ""]
+    return "\n".join(lines)
+
+
+def _validate_archive(archive: Path, action: dict, repository: Path, timeout: int) -> Path:
+    manifest_path, handoff = archive / "manifest.json", archive / "HANDOFF.md"
+    if not manifest_path.is_file() or not handoff.is_file():
+        raise RuntimeError("recovery archive is incomplete")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("campaignId") != action["campaignId"]:
+        raise RuntimeError("recovery archive campaign mismatch")
+    expected = {item["assignmentId"]: item["candidateSha"] for item in action["candidates"]}
+    if manifest.get("candidates") != expected:
+        raise RuntimeError("recovery archive candidate mismatch")
+    for relative, digest in manifest.get("artifacts", {}).items():
+        artifact = safe_within(archive / relative, archive)
+        if not artifact.is_file() or _file_sha256(artifact) != digest:
+            raise RuntimeError(f"recovery archive artifact mismatch: {relative}")
+    for candidate in action["candidates"]:
+        resolved = git(repository, "rev-parse", candidate["archiveRef"], timeout=timeout, check=False)
+        if resolved.returncode or resolved.stdout.strip() != candidate["candidateSha"]:
+            raise RuntimeError(f"recovery archive ref mismatch: {candidate['archiveRef']}")
+    return handoff
+
+
+def archive_and_handoff(store: StateStore, action: dict) -> Path:
+    repo = Path(store.state["repository"]).resolve()
+    repository_root = Path(store.state.get("repositoryRoot", repo)).resolve()
+    timeout = store.state["validationTimeoutSeconds"]
+    if store.state.get("phase") not in {"needs-user", "waiting-provider", "interrupted", "complete"} or store.state.get("activeProcesses"):
+        raise RuntimeError("legacy migration requires an inactive terminal campaign")
+    if any(pr.get("state") == "OPEN" for pr in store.state.get("pullRequests", {}).values()):
+        raise RuntimeError("legacy migration refuses open campaign pull requests")
+    completed = "archive-and-handoff:CAMPAIGN" in store.state.get("pendingRecovery", {}).get("completed", [])
+    if not completed:
+        for candidate in action["candidates"]:
+            worktree, record = recovery_worktree(store, candidate["assignmentId"])
+            head = git(worktree, "rev-parse", "HEAD", timeout=timeout).stdout.strip()
+            dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=timeout).stdout
+            ancestry = git(worktree, "merge-base", "--is-ancestor", candidate["originalBaseSha"], candidate["candidateSha"], timeout=timeout, check=False)
+            if record["baseSha"] != candidate["originalBaseSha"] or head != candidate["candidateSha"] or dirty or ancestry.returncode:
+                raise RuntimeError(f"legacy candidate changed before migration: {candidate['assignmentId']}")
+    exclude_relay_files(repo)
+    for candidate in action["candidates"]:
+        ref = f"refs/{candidate['archiveRef']}"
+        existing = git(repository_root, "rev-parse", "--verify", ref, timeout=timeout, check=False)
+        if existing.returncode:
+            git(repository_root, "update-ref", ref, candidate["candidateSha"], "", timeout=timeout)
+        elif existing.stdout.strip() != candidate["candidateSha"]:
+            raise RuntimeError(f"recovery archive ref collision: {candidate['archiveRef']}")
+    archive_root = safe_within(repo / ".relay-archive", repo)
+    archive = safe_within(archive_root / action["campaignId"], archive_root)
+    if not archive.exists():
+        stage = safe_within(archive_root / f".{action['campaignId']}.tmp", archive_root)
+        if stage.exists():
+            shutil.rmtree(stage)
+        stage.mkdir(parents=True)
+        artifacts = {}
+        for name in ("state.json",):
+            source = store.path.parent / name
+            target = stage / name
+            shutil.copy2(source, target)
+            artifacts[name] = _file_sha256(target)
+        for name in ("tasks.md", "bugs.md"):
+            source = repo / name
+            target = stage / name
+            shutil.copy2(source, target)
+            artifacts[name] = _file_sha256(target)
+        logs = store.path.parent / "logs"
+        if logs.is_dir():
+            shutil.copytree(logs, stage / "logs")
+            for path in sorted((stage / "logs").rglob("*")):
+                if path.is_file():
+                    artifacts[path.relative_to(stage).as_posix()] = _file_sha256(path)
+        handoff = stage / "HANDOFF.md"
+        atomic_write(handoff, render_handoff(store, action))
+        artifacts["HANDOFF.md"] = _file_sha256(handoff)
+        manifest = {
+            "campaignId": action["campaignId"],
+            "candidates": {item["assignmentId"]: item["candidateSha"] for item in action["candidates"]},
+            "summaries": {item["assignmentId"]: item["summary"] for item in action["candidates"]},
+            "validationFailures": {item["assignmentId"]: store.state.get("taskStates", {}).get(item["assignmentId"], {}).get("validationFailure") for item in action["candidates"]},
+            "artifacts": artifacts,
+        }
+        atomic_write(stage / "manifest.json", json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+        archive_root.mkdir(parents=True, exist_ok=True)
+        os.replace(stage, archive)
+    handoff = _validate_archive(archive, action, repository_root, timeout)
+    key = "archive-and-handoff:CAMPAIGN"
+    if key not in store.state["pendingRecovery"]["completed"]:
+        store.state["pendingRecovery"]["completed"].append(key)
+        store.save()
+    for candidate in action["candidates"]:
+        assignment_id = candidate["assignmentId"]
+        if assignment_id not in store.state.get("worktrees", {}):
+            continue
+        _, record = recovery_worktree(store, assignment_id)
+        root = safe_within(Path(record.get("root", record["path"])), Path(tempfile.gettempdir()).resolve() / "relay-worktrees" / store.state["campaignId"])
+        removed = git(repository_root, "worktree", "remove", "--force", str(root), timeout=timeout, check=False)
+        if removed.returncode and root.exists():
+            raise RuntimeError(f"failed to remove archived worktree: {assignment_id}")
+        store.state["worktrees"].pop(assignment_id, None)
+        store.save()
+    for ledger in (repo / "tasks.md", repo / "bugs.md"):
+        if ledger.exists():
+            safe_within(ledger, repo).unlink()
+    return handoff
+
+
+def finish_archive_cleanup(store: StateStore) -> None:
+    if "archive-and-handoff:CAMPAIGN" not in store.state.get("pendingRecovery", {}).get("completed", []):
+        raise RuntimeError("legacy migration archive is not complete")
+    repo = Path(store.state["repository"]).resolve()
+    relay = safe_within(store.path.parent, repo)
+    if relay.exists():
+        shutil.rmtree(relay)
+
+
+def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) -> Path | None:
+    if len(actions) == 1 and actions[0].get("action") == "archive-and-handoff":
+        if not store.state.get("pendingRecovery"):
+            store.update(lambda state: state.__setitem__("pendingRecovery", {"actions": actions, "completed": []}))
+        return archive_and_handoff(store, actions[0])
     bugs = load_bugs(store)
     by_id = {task["id"]: task for task in tasks} | {bug["id"]: bug_assignment(store, bug) for bug in bugs if bug.get("source") == "audit" and bug.get("status") == "active"}
     if not store.state.get("pendingRecovery"):
@@ -2292,6 +2611,17 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
         assignment_id = action["assignmentId"]
         key = f"{action['action']}:{assignment_id}"
         if key in completed:
+            continue
+        if action["action"] == "replay-baseline":
+            baseline = store.state.get("baselineValidation") or {}
+            if baseline.get("phase") != "blocked" or baseline.get("baseSha") != action["baseSha"] or baseline.get("commandsHash") != action["commandsHash"]:
+                raise RuntimeError("baseline changed during recovery")
+            baseline.update(phase="pending", currentCommand=None, deadline=None, error=None, log=None, explicitReplay=True)
+            baseline.pop("validationFailure", None)
+            baseline.pop("validationLog", None)
+            store.state["phase"] = "build"
+            store.state["pendingRecovery"]["completed"].append(key)
+            store.save()
             continue
         task_state = store.state["taskStates"][assignment_id]
         if action["action"] == "grant-attempt":
@@ -2303,6 +2633,8 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
             store.state.setdefault("recoveryAttemptGrants", {})[assignment_id] = max(store.state.get("recoveryAttemptGrants", {}).get(assignment_id, 0), action["grant"])
             task_state.update(phase="ready")
             task_state.pop("error", None)
+            for field in ("validationCircuitBroken", "terminalValidationCandidateSha", "terminalValidationReplayInProgress", "terminalValidationReviewRepair", "terminalValidationReplayUsed"):
+                task_state.pop(field, None)
         elif action["action"] == "resume-publish":
             if task_state.get("candidateSha") != action["candidateSha"]:
                 raise RuntimeError(f"candidate changed during recovery: {assignment_id}")
@@ -2372,9 +2704,40 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
         store.state["pendingRecovery"]["completed"].append(key)
         store.save()
     store.update(lambda state: (state.setdefault("recoveryHistory", []).append({"recoveredAt": datetime.now(timezone.utc).isoformat(), "actions": actions}), state.__setitem__("pendingRecovery", None), state.__setitem__("phase", "build")))
+    return None
 
 
-def reconcile(store: StateStore) -> None:
+def prepare_terminal_validation_replays(store: StateStore) -> None:
+    changed = False
+    for assignment_id, task_state in sorted(store.state.get("taskStates", {}).items()):
+        candidate = task_state.get("terminalValidationCandidateSha")
+        if task_state.get("phase") != "needs-user" or not candidate or task_state.get("terminalValidationReplayUsed"):
+            continue
+        try:
+            worktree, record = recovery_worktree(store, assignment_id)
+            head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
+            dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout
+            ancestry = git(worktree, "merge-base", "--is-ancestor", record["baseSha"], candidate, timeout=store.state["validationTimeoutSeconds"], check=False)
+            if head != candidate or dirty or ancestry.returncode:
+                raise RuntimeError("saved validation candidate changed")
+            repair = task_state.get("terminalValidationReviewRepair")
+            if repair is not None:
+                session = store.state.get("reviewSessions", {}).get(assignment_id)
+                if not session or session.get("phase") != "needs-user":
+                    raise RuntimeError("saved repair validation session changed")
+                session.update(phase=f"repair-{repair}", pendingWorkerSha=candidate)
+                task_state.update(phase=f"repair-{repair}", terminalValidationReplayUsed=True)
+            else:
+                task_state.update(phase="candidate-validation", pendingWorkerSha=candidate, terminalValidationReplayUsed=True, terminalValidationReplayInProgress=True)
+                task_state.pop("validationCircuitBroken", None)
+        except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
+            task_state["error"] = f"terminal candidate replay blocked: {error}"
+        changed = True
+    if changed:
+        store.save()
+
+
+def reconcile(store: StateStore, allow_terminal_replay: bool = True) -> None:
     repository = Path(store.state["repository"])
     if git(repository, "rev-parse", "--show-toplevel", timeout=store.state["providerTimeoutSeconds"], check=False).returncode == 0:
         root, prefix = repository_layout(repository, store.state["providerTimeoutSeconds"])
@@ -2382,20 +2745,22 @@ def reconcile(store: StateStore) -> None:
             store.state.update(repositoryRoot=str(root), repositoryPrefix=prefix)
             store.save()
         exclude_relay_files(repository)
-    metadata, _ = parse_tasks((Path(store.state["repository"]) / "tasks.md").read_text(encoding="utf-8"), runtime=True)
+    metadata, ledger_tasks = parse_tasks((Path(store.state["repository"]) / "tasks.md").read_text(encoding="utf-8"), runtime=True)
     store.state.setdefault("requirementsHash", metadata["requirementsHash"])
-    if "campaignValidationCommands" not in store.state:
-        if metadata["campaignValidationCommands"]:
-            raise RuntimeError("campaign validation state is missing for a non-legacy ledger")
-        store.state["campaignValidationCommands"] = []
-        store.state["baselineValidation"] = {
-            "baseSha": store.state["baseSha"], "commandsHash": commands_hash([]), "phase": "legacy-skipped",
-            "commandsStarted": 0, "currentCommand": None, "startedAt": None, "deadline": None,
-            "completedAt": None, "error": None, "log": None,
-        }
-    elif store.state["campaignValidationCommands"] != metadata["campaignValidationCommands"]:
+    if metadata["legacyCampaignValidation"] or "campaignValidationCommands" not in store.state or "baselineValidation" not in store.state:
+        raise RuntimeError("legacy campaigns require --recover")
+    if store.state["campaignValidationCommands"] != metadata["campaignValidationCommands"]:
         raise RuntimeError("tasks.md campaign validation commands do not match campaign state")
+    seeds = {task["id"]: task["seed"] for task in ledger_tasks if task.get("seed")}
+    if seeds != store.state.get("taskSeeds", {}):
+        raise RuntimeError("tasks.md seed metadata does not match campaign state")
     baseline = store.state.get("baselineValidation")
+    if allow_terminal_replay and store.state.get("phase") == "needs-user" and baseline and baseline.get("phase") == "blocked" and not baseline.get("automaticReplayUsed"):
+        baseline.update(phase="pending", currentCommand=None, deadline=None, error=None, log=None, automaticReplayUsed=True)
+        baseline.pop("validationFailure", None)
+        baseline.pop("validationLog", None)
+        store.state["phase"] = "build"
+        store.save()
     if baseline and baseline.get("phase") in {"worktree", "running", "interrupted"}:
         baseline["phase"] = "interrupted"
         baseline["error"] = baseline.get("error") or "interrupted"
@@ -2420,6 +2785,8 @@ def reconcile(store: StateStore) -> None:
         for field in OPERATION_FIELDS:
             store.state["agentsBootstrap"].pop(field, None)
     store.save()
+    if allow_terminal_replay:
+        prepare_terminal_validation_replays(store)
     for task in load_tasks(store):
         task_state = store.state.get("taskStates", {}).get(task["id"], {})
         values = {
@@ -2488,6 +2855,8 @@ def run_assignments(store: StateStore, semaphore: threading.Semaphore, assignmen
 
 
 def execute_campaign(store: StateStore, tasks: list[dict]) -> int:
+    if not store.state.get("campaignValidationCommands") or not store.state.get("baselineValidation"):
+        raise RuntimeError("legacy campaigns require --recover")
     semaphore = threading.Semaphore(store.state["workerLimit"])
     require_validation_shell(store.state["validationTimeoutSeconds"])
     if not run_baseline_validation(store):
@@ -2606,8 +2975,19 @@ def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[
             lines.append(f"- BASELINE blocked: {_normalized_error(baseline.get('error'))}; command={baseline.get('currentCommand')}; log={baseline.get('log') or baseline.get('validationLog') or 'not-recorded'}")
         elif phase == "interrupted":
             lines.append(f"- BASELINE interrupted: command={baseline.get('currentCommand')} state={baseline.get('operation', 'interrupted')}")
-        elif phase == "legacy-skipped":
-            lines.append("- BASELINE legacy-skipped: campaign predates campaign validation")
+        elif phase == "missing":
+            lines.append("- BASELINE missing: legacy campaign requires migration")
+    validation_groups: dict[tuple[str, str, str], dict] = {}
+    for assignment_id, task_state in sorted(task_states.items()):
+        failure = task_state.get("validationFailure")
+        if task_state.get("phase") != "needs-user" or not isinstance(failure, dict):
+            continue
+        key = (str(failure.get("category")), str(failure.get("commandHash")), str(failure.get("outcome")))
+        group = validation_groups.setdefault(key, {"command": failure.get("command", "unknown"), "required": failure.get("requiredExternalChange", "make the command pass"), "ids": [], "logs": []})
+        group["ids"].append(assignment_id)
+        group["logs"].append(task_state.get("validationLog", "not-recorded"))
+    for (category, _command_hash, outcome), group in sorted(validation_groups.items()):
+        lines.append(f"- VALIDATION BLOCKER category={category} outcome={outcome} command={group['command']} affected={','.join(group['ids'])} required={group['required']} logs={','.join(group['logs'])}")
     lines.extend(bullets)
     for bug in sorted(bugs, key=lambda item: item["id"]):
         status = "waiting-provider" if task_states.get(bug["id"], {}).get("phase") == "waiting-provider" else bug["status"]
@@ -2626,7 +3006,12 @@ def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[
     repo = state["repository"]
     baseline = state.get("baselineValidation") or {}
     if baseline.get("phase") == "blocked":
-        next_line = f"Baseline command {baseline.get('currentCommand')} failed; inspect {baseline.get('log') or baseline.get('validationLog') or 'the baseline log'}. No task attempts were consumed. Correct the baseline or campaign command and generate a new plan at the corrected base."
+        if baseline.get("automaticReplayUsed"):
+            recover = _shell_join([executable, run_path, "--repo", repo, "--recover"])
+            next_line = f"Baseline command {baseline.get('currentCommand')} failed after its safe replay; inspect {baseline.get('log') or baseline.get('validationLog') or 'the baseline log'}. No task attempts were consumed. Preview an explicit replay with: {recover}"
+        else:
+            resume = _shell_join([executable, run_path, "--repo", repo])
+            next_line = f"Baseline command {baseline.get('currentCommand')} failed; inspect {baseline.get('log') or baseline.get('validationLog') or 'the baseline log'}. No task attempts were consumed. Correct the external baseline defect, then replay once with: {resume}"
     elif state.get("phase") == "complete":
         cleanup = _shell_join([executable, run_path, "--repo", repo, "--cleanup"])
         next_line = f"Review {Path(repo) / 'BACKLOG.md'}, then preview cleanup with: {cleanup}" if bug_counts["backlog"] else f"Preview cleanup with: {cleanup}"
@@ -2636,6 +3021,16 @@ def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[
         next_line = f"Resolve pending checks or approvals for {', '.join(pending) or 'the provider'}, then resume with: {resume}"
     elif state.get("phase") == "interrupted":
         next_line = f"Resume with: {_shell_join([executable, run_path, '--repo', repo])}"
+    elif validation_groups:
+        replayable = sorted(assignment_id for assignment_id, value in task_states.items() if value.get("phase") == "needs-user" and value.get("terminalValidationCandidateSha") and not value.get("terminalValidationReplayUsed"))
+        if replayable:
+            next_line = f"Replay preserved validation for {', '.join(replayable)} with: {_shell_join([executable, run_path, '--repo', repo])}"
+        else:
+            blocked = sorted({assignment_id for group in validation_groups.values() for assignment_id in group["ids"]})
+            arguments = [executable, run_path, "--repo", repo, "--recover"]
+            for assignment_id in blocked:
+                arguments += ["--grant-attempt", assignment_id]
+            next_line = f"Grant new implementation attempts explicitly with: {_shell_join(arguments)}"
     else:
         groups: dict[str, list[str]] = {}
         for assignment_id, reason in blocked_assignments(state):
@@ -2670,6 +3065,16 @@ def report_stopped(state: dict) -> None:
         match = re.search(r"log:\s*([^\r\n]+)", reason)
         log = match.group(1) if match else "not-recorded"
         stderr_event("BLOCKED", f"assignment={assignment_id} reason={compact} log={log}")
+
+
+def report_legacy_refusal(store: StateStore) -> None:
+    groups = _legacy_failure_groups(store.state)
+    stderr_event("STOPPED", f"phase=legacy-terminal campaign={store.state['campaignId']} assignments={sum(len(group['assignmentIds']) for group in groups)}")
+    stderr_event("SUMMARY", "Legacy campaign has no validated campaign commands or baseline state; Worker, review, provider, and audit activity is disabled.")
+    for group in groups:
+        stderr_event("BLOCKED", f"category={group['category']} command={group['command']} outcome={group['outcome']} assignments={','.join(group['assignmentIds'])}")
+    command = _shell_join([sys.executable, str(Path(__file__).resolve()), "--repo", store.state["repository"], "--recover"])
+    stderr_event("NEXT", f"Preview legacy migration with: {command}")
 
 
 def permanent_cleanup(repo: Path, confirm: bool) -> int:
@@ -2736,6 +3141,7 @@ def initialize_campaign(repo: Path, text: str, args: argparse.Namespace) -> tupl
     relay.mkdir(parents=True, exist_ok=False)
     (relay / "logs").mkdir()
     state = initial_state(repo, metadata, args)
+    state["taskSeeds"] = {task["id"]: task["seed"] for task in tasks if task.get("seed")}
     state["taskTotal"] = len(tasks)
     repository_root, prefix = repository_layout(repo, args.provider_timeout)
     state.update(repositoryRoot=str(repository_root), repositoryPrefix=prefix)
@@ -2820,18 +3226,40 @@ def main(argv: list[str] | None = None) -> int:
             resuming = False
         if args.recover and not resuming:
             raise RuntimeError("recovery requires an existing campaign")
+        if resuming and legacy_campaign(store):
+            if not args.recover:
+                report_legacy_refusal(store)
+                relay_console.close()
+                return 2
+            tasks_path = repo / "tasks.md"
+            tasks = load_tasks(store) if tasks_path.is_file() else []
+            with coordinator_lock(store.path.parent):
+                actions = plan_recovery(store, tasks, args.defer_blocker, args.grant_attempt)
+                print_recovery(actions)
+                if not args.confirm:
+                    relay_console.close()
+                    return 0
+                handoff = apply_recovery(store, tasks, actions)
+            finish_archive_cleanup(store)
+            command = _shell_join([sys.executable, str((Path(__file__).resolve().parent / "plan.py").resolve()), "--repo", str(repo), "--requirements", str(handoff)])
+            stderr_event("NEXT", f"Create the reviewed modern plan with: {command}")
+            relay_console.close()
+            return 0
         if args.recover and not args.confirm:
             print_recovery(plan_recovery(store, load_tasks(store), args.defer_blocker, args.grant_attempt))
             return 0
         stderr_event("START", f"operation=campaign campaign={store.state['campaignId']} workers={store.state['workerLimit']} tasks={store.state.get('taskTotal', len(tasks or []))}")
         with coordinator_lock(store.path.parent):
             if resuming:
-                reconcile(store)
+                reconcile(store, allow_terminal_replay=not args.recover)
                 tasks = load_tasks(store)
             if args.recover:
                 actions = plan_recovery(store, tasks, args.defer_blocker, args.grant_attempt)
                 print_recovery(actions)
                 apply_recovery(store, tasks, actions)
+                stderr_event("NEXT", f"Resume with: {_shell_join([sys.executable, str(Path(__file__).resolve()), '--repo', str(repo)])}")
+                relay_console.close()
+                return 0
             stop = threading.Event()
             heartbeat = threading.Thread(target=heartbeat_loop, args=(store, stop), daemon=True)
             heartbeat.start()
