@@ -264,6 +264,7 @@ def apply_handoff(tasks: list[dict], commands: list[str], handoff: dict | None) 
     missing = sorted(entries.keys() - planned.keys())
     if missing:
         raise ValueError(f"reviewed plan omitted migrated tasks: {', '.join(missing)}")
+    tasks = [planned[task_id] for task_id in entries]
     shared = handoff["baselineDefect"]["command"]
     for task_id, entry in entries.items():
         focused = [command for command in entry["contract"]["validationCommands"] if command != shared]
