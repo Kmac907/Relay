@@ -1143,7 +1143,7 @@ def provider_with_retries(store: StateStore, key: str, *args: str) -> subprocess
             return provider_call(store, key, *args)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as caught:
             error = caught
-    raise RuntimeError(f"{provider_name(store.state)} operation exhausted attempts: {key}") from error
+    raise RuntimeError(f"{provider_name(store.state)} operation exhausted attempts: {key}; log: {store.path.parent / 'logs' / 'provider.log'}") from error
 
 
 def detect_provider(remote: str) -> dict[str, str]:
@@ -2050,7 +2050,7 @@ def target_instructions(repo: Path, create: bool = False) -> tuple[str, bytes]:
 
 def provider_preflight(store: StateStore) -> None:
     if store.state.get("preflightCompleted"):
-        console("DONE", f"operation=provider-preflight provider={provider_name(store.state)} cached=true")
+        console("DONE", f"operation=provider-preflight provider={provider_name(store.state)} identity=cached authentication=not-rechecked")
         if store.state.get("provider") == "azure-devops" and store.state["mergeMethod"] == "rebase":
             raise RuntimeError("Azure DevOps does not support Relay's rebase merge method; use squash or merge")
         return
@@ -2380,15 +2380,19 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str], gra
             actions.append({"action": "resume-audit-validation", "assignmentId": assignment_id, "headSha": head, "commands": assignment["validationCommands"]})
             handled.add(assignment_id)
             continue
-        if error == "provider pull request source commit does not match candidate" and task_state.get("candidateSha"):
+        provider_key = _publication_retry_key(error, assignment_id)
+        if (error == "provider pull request source commit does not match candidate" or provider_key) and task_state.get("candidateSha"):
             worktree, record = recovery_worktree(store, assignment_id)
             candidate = task_state["candidateSha"]
             head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
             dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout
             remote = git(worktree, "ls-remote", "--heads", "origin", f"refs/heads/{record['branch']}", timeout=store.state["providerTimeoutSeconds"]).stdout
-            if head != candidate or dirty or not remote.startswith(candidate):
+            if head != candidate or dirty or not remote.startswith(candidate) or (provider_key and (task_state.get("pushedSha") != candidate or store.state.get("providerAttemptCounters", {}).get(provider_key, 0) < store.state["providerAttemptLimit"])):
                 raise RuntimeError(f"publication state drifted during recovery: {assignment_id}")
-            actions.append({"action": "resume-publish", "assignmentId": assignment_id, "candidateSha": candidate})
+            action = {"action": "resume-publish", "assignmentId": assignment_id, "candidateSha": candidate, "headSha": head, "branch": record["branch"]}
+            if provider_key:
+                action.update(providerOperationKey=provider_key, providerAttempts=store.state["providerAttemptCounters"][provider_key])
+            actions.append(action)
             handled.add(assignment_id)
             continue
         if error.startswith("candidate changed paths outside assignment scope:"):
@@ -2443,6 +2447,8 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str], gra
 def print_recovery(actions: list[dict]) -> None:
     for action in actions:
         detail = f"assignment={action['assignmentId']} action={action['action']}"
+        if action.get("providerOperationKey"):
+            detail += f" provider-operation={action['providerOperationKey']}"
         if action.get("bugIds"):
             detail += f" blockers={','.join(action['bugIds'])}"
         if action.get("baselineDefect"):
@@ -2652,8 +2658,17 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
             for field in ("validationCircuitBroken", "terminalValidationCandidateSha", "terminalValidationReplayInProgress", "terminalValidationReviewRepair", "terminalValidationReplayUsed"):
                 task_state.pop(field, None)
         elif action["action"] == "resume-publish":
-            if task_state.get("candidateSha") != action["candidateSha"]:
-                raise RuntimeError(f"candidate changed during recovery: {assignment_id}")
+            worktree, record = recovery_worktree(store, assignment_id)
+            head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
+            dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout
+            remote = git(worktree, "ls-remote", "--heads", "origin", f"refs/heads/{record['branch']}", timeout=store.state["providerTimeoutSeconds"]).stdout
+            if task_state.get("candidateSha") != action["candidateSha"] or head != action["headSha"] or record["branch"] != action["branch"] or dirty or not remote.startswith(action["candidateSha"]):
+                raise RuntimeError(f"publication state changed during recovery: {assignment_id}")
+            provider_key = action.get("providerOperationKey")
+            if provider_key:
+                if store.state.get("providerAttemptCounters", {}).get(provider_key) != action["providerAttempts"]:
+                    raise RuntimeError(f"provider retry state changed during recovery: {assignment_id}")
+                store.state["providerAttemptCounters"].pop(provider_key)
             task_state.update(phase="push-and-open-pr")
             task_state.pop("error", None)
         elif action["action"] == "resume-review":
@@ -2942,10 +2957,36 @@ def _worktree_setup_failure(value: object) -> bool:
     return text.startswith("worktree setup failed:") or ("'worktree', 'add'" in text and "non-zero exit status" in text)
 
 
+def _provider_exhaustion(value: object) -> tuple[str, str] | None:
+    match = re.match(r"^(Azure DevOps|GitHub) operation exhausted attempts: ([^;\s]+)", _normalized_error(value))
+    return (match.group(1), match.group(2)) if match else None
+
+
+def _publication_retry_key(value: object, assignment_id: str) -> str | None:
+    failure = _provider_exhaustion(value)
+    if not failure or not failure[1].startswith(f"{assignment_id}:"):
+        return None
+    operation = failure[1][len(assignment_id) + 1:]
+    return failure[1] if operation in {"pr-list", "pr-create"} or re.fullmatch(r"pr-refresh:[0-9a-f]+", operation) else None
+
+
 def _blocker_detail(value: object) -> tuple[str, str]:
     if _worktree_setup_failure(value):
         return "worktree-setup", "Git could not create assignment worktrees before Worker launch"
+    provider = _provider_exhaustion(value)
+    if provider:
+        operation = provider[1].split(":", 1)[-1].split(":", 1)[0]
+        labels = {"pr-list": "PR discovery", "pr-create": "PR creation", "pr-refresh": "PR refresh"}
+        if operation in labels:
+            return "provider-publication", f"{provider[0]} {labels[operation]} exhausted attempts"
     return "assignment", _normalized_error(value)
+
+
+def _blocker_log(state: dict, value: object) -> str:
+    match = re.search(r"log:\s*([^\r\n]+)", str(value or ""))
+    if match:
+        return match.group(1)
+    return str(state_path(state, "logs/provider.log")) if _provider_exhaustion(value) else "not-recorded"
 
 
 def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[list[str], str]:
@@ -2953,7 +2994,7 @@ def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[
     interrupted = {item.get("assignmentId") for item in state.get("activeProcesses", {}).values() if item.get("interrupted")}
     counts = Counter()
     bullets = []
-    blocked_groups: dict[tuple[str, str], list[str]] = {}
+    blocked_groups: dict[tuple[str, str, str], list[str]] = {}
     for task in sorted(tasks, key=lambda item: item["id"]):
         task_state = task_states.get(task["id"], {})
         phase = task_state.get("phase")
@@ -2992,8 +3033,9 @@ def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[
             detail = f"unmet dependencies: {', '.join(unmet)}" if unmet else "campaign stopped before launch"
         counts[status] += 1
         if status == "blocked" and not task_state.get("validationFailure"):
-            category, reason = _blocker_detail(task_state.get("error") or task_state.get("providerStatus") or detail)
-            blocked_groups.setdefault((category, reason), []).append(task["id"])
+            blocker = task_state.get("error") or task_state.get("providerStatus") or detail
+            category, reason = _blocker_detail(blocker)
+            blocked_groups.setdefault((category, reason, _blocker_log(state, blocker)), []).append(task["id"])
         else:
             bullets.append(f"- {task['id']} {status}: {task['title']} — {detail}")
     bug_counts = Counter(bug["status"] for bug in bugs)
@@ -3020,8 +3062,8 @@ def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[
         group["logs"].append(task_state.get("validationLog", "not-recorded"))
     for (category, _command_hash, outcome), group in sorted(validation_groups.items()):
         lines.append(f"- VALIDATION BLOCKER category={category} outcome={outcome} command={group['command']} affected={','.join(group['ids'])} required={group['required']} logs={','.join(group['logs'])}")
-    for (category, reason), assignment_ids in sorted(blocked_groups.items()):
-        lines.append(f"- BLOCKED category={category} affected={','.join(assignment_ids)} reason={reason}")
+    for (category, reason, log), assignment_ids in sorted(blocked_groups.items()):
+        lines.append(f"- BLOCKED category={category} affected={','.join(assignment_ids)} reason={reason} log={log}")
     lines.extend(bullets)
     for bug in sorted(bugs, key=lambda item: item["id"]):
         status = "waiting-provider" if task_states.get(bug["id"], {}).get("phase") == "waiting-provider" else bug["status"]
@@ -3055,6 +3097,13 @@ def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[
         next_line = f"Resolve pending checks or approvals for {', '.join(pending) or 'the provider'}, then resume with: {resume}"
     elif state.get("phase") == "interrupted":
         next_line = f"Resume with: {_shell_join([executable, run_path, '--repo', repo])}"
+    elif publication_blocked := sorted(assignment_id for assignment_id, value in task_states.items() if value.get("phase") == "needs-user" and _publication_retry_key(value.get("error"), assignment_id)):
+        validation_blocked = sorted({assignment_id for group in validation_groups.values() for assignment_id in group["ids"]})
+        arguments = [executable, run_path, "--repo", repo, "--recover"]
+        for assignment_id in validation_blocked:
+            arguments += ["--grant-attempt", assignment_id]
+        grants = f" and explicitly grant implementation attempts for {', '.join(validation_blocked)}" if validation_blocked else ""
+        next_line = f"Restore provider access, then preview safe publication recovery for {', '.join(publication_blocked)}{grants} with: {_shell_join(arguments)}"
     elif validation_groups:
         replayable = sorted(assignment_id for assignment_id, value in task_states.items() if value.get("phase") == "needs-user" and value.get("terminalValidationCandidateSha") and not value.get("terminalValidationReplayUsed"))
         if replayable:
@@ -3099,8 +3148,7 @@ def report_stopped(state: dict) -> None:
     groups: dict[tuple[str, str, str], list[str]] = {}
     for assignment_id, reason in blocked:
         category, compact = _blocker_detail(reason)
-        match = re.search(r"log:\s*([^\r\n]+)", reason)
-        log = match.group(1) if match else "not-recorded"
+        log = _blocker_log(state, reason)
         groups.setdefault((category, compact, log), []).append(assignment_id)
     for (category, reason, log), assignment_ids in sorted(groups.items()):
         stderr_event("BLOCKED", f"category={category} affected={','.join(sorted(assignment_ids))} reason={reason} log={log}")

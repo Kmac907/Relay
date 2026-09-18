@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-from run import parse_bugs, parse_tasks
+from run import _blocker_detail, _blocker_log, _publication_retry_key, parse_bugs, parse_tasks
 
 
 def parser() -> argparse.ArgumentParser:
@@ -79,11 +78,12 @@ def main(argv: list[str] | None = None) -> int:
     blockers += [(assignment_id, str(task.get("error") or task.get("providerStatus") or "needs-user")) for assignment_id, task in task_states.items() if task.get("phase") == "needs-user"]
     if blockers:
         print("\nBlockers")
+        groups = {}
         for assignment_id, reason in sorted(blockers):
-            match = re.search(r"log:\s*([^\r\n]+)", reason)
-            log = match.group(1) if match else "not-recorded"
-            concise = re.sub(r";?\s*log:\s*[^\r\n]+", "", " ".join(reason.splitlines())).strip()
-            print(f"  {assignment_id}: reason={concise} log={log}")
+            category, concise = _blocker_detail(reason)
+            groups.setdefault((category, concise, _blocker_log(state, reason)), []).append(assignment_id)
+        for (category, reason, log), assignment_ids in sorted(groups.items()):
+            print(f"  category={category} affected={','.join(assignment_ids)} reason={reason} log={log}")
 
     bugs = Counter(f"{item['severity']} {item['status']}" for item in ledger_bugs)
     provider = "Azure DevOps" if state.get("provider") == "azure-devops" else "GitHub" if state.get("provider") == "github" or state.get("githubRepository") else "not-detected"
@@ -120,7 +120,14 @@ def main(argv: list[str] | None = None) -> int:
     if recoverable:
         print("\nRecoverable assignments")
         for assignment_id in recoverable:
-            print(f"  {assignment_id}: inspect with run.py --recover and an explicit disposition")
+            task = task_states[assignment_id]
+            if _publication_retry_key(task.get("error"), assignment_id):
+                action = "restore provider access, then use safe publication recovery"
+            elif task.get("terminalValidationCandidateSha") and not task.get("terminalValidationReplayUsed"):
+                action = "correct the validation condition, then use the printed replay or explicit grant command"
+            else:
+                action = "inspect with run.py --recover and an explicit disposition"
+            print(f"  {assignment_id}: {action}")
     if bugs:
         print("\nBugs")
         for label, count in sorted(bugs.items()): print(f"  {label}: {count}")

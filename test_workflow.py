@@ -838,7 +838,7 @@ class DeterministicCoreTests(unittest.TestCase):
                 return subprocess.CompletedProcess([], 0, output, "")
             with patch("run.recovery_worktree", return_value=(Path(root), {"branch": "relay/TASK-0001"})), patch("run.git", side_effect=recovery_git):
                 actions = run.plan_recovery(store, [assignment], [], [])
-            self.assertEqual(actions, [{"action": "resume-publish", "assignmentId": assignment["id"], "candidateSha": "new"}])
+            self.assertEqual(actions, [{"action": "resume-publish", "assignmentId": assignment["id"], "candidateSha": "new", "headSha": "new", "branch": "relay/TASK-0001"}])
             self.assertEqual(store.path.read_bytes(), before)
             store.state["attemptCounters"][assignment["id"]] = store.state["taskAttemptLimit"]
             store.state["recoveryAttemptGrants"] = {assignment["id"]: 1}
@@ -847,6 +847,64 @@ class DeterministicCoreTests(unittest.TestCase):
             store.state["activeProcesses"].pop(process_id)
             with self.assertRaisesRegex(RuntimeError, "attempt limit"):
                 run._consume_agent_call(store, assignment["id"], "worker", "task", False, False)
+
+    def test_exhausted_publication_recovers_existing_candidates_without_worker_attempts(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            tasks = [ContractTests().task(f"TASK-{number:04d}") for number in range(1, 4)]
+            store.state.update(phase="needs-user", provider="azure-devops")
+            for assignment in tasks[:2]:
+                key = f"{assignment['id']}:pr-list"
+                store.state["taskStates"][assignment["id"]] = {
+                    "phase": "needs-user", "candidateSha": "abc", "pushedSha": "abc",
+                    "error": f"Azure DevOps operation exhausted attempts: {key}",
+                }
+                store.state["providerAttemptCounters"][key] = store.state["providerAttemptLimit"]
+            store.state["taskStates"]["TASK-0003"] = {
+                "phase": "needs-user", "terminalValidationCandidateSha": "abc",
+                "validationFailure": {"category": "campaign", "command": "build", "commandHash": "hash", "outcome": "exit:1"},
+            }
+            store.save()
+            before = store.path.read_bytes()
+
+            def worktree(_store, assignment_id):
+                return Path(root), {"branch": f"relay/test/{assignment_id}"}
+
+            def recovery_git(_repo, *args, **_kwargs):
+                output = "abc\n" if args[0] == "rev-parse" else "abc\trefs/heads/branch\n" if args[0] == "ls-remote" else ""
+                return subprocess.CompletedProcess([], 0, output, "")
+
+            with patch("run.recovery_worktree", side_effect=worktree), patch("run.git", side_effect=recovery_git):
+                actions = run.plan_recovery(store, tasks, [], ["TASK-0003"])
+                self.assertEqual(store.path.read_bytes(), before)
+                lines, next_line = run.campaign_summary(store.state, tasks, [])
+                self.assertTrue(any(line.startswith("- BLOCKED category=provider-publication affected=TASK-0001,TASK-0002 reason=Azure DevOps PR discovery exhausted attempts log=") for line in lines))
+                self.assertIn("--recover --grant-attempt TASK-0003", next_line)
+                with patch("run.stderr_event") as event:
+                    run.report_stopped(store.state)
+                self.assertTrue(any("affected=TASK-0001,TASK-0002" in call.args[1] for call in event.call_args_list))
+                run.apply_recovery(store, tasks, actions)
+
+            self.assertEqual([action["action"] for action in actions], ["resume-publish", "resume-publish", "grant-attempt"])
+            self.assertTrue(all(store.state["taskStates"][task_id]["phase"] == "push-and-open-pr" for task_id in ("TASK-0001", "TASK-0002")))
+            self.assertEqual(store.state["taskStates"]["TASK-0003"]["phase"], "ready")
+            self.assertFalse(any(key.endswith(":pr-list") for key in store.state["providerAttemptCounters"]))
+            self.assertEqual(store.state["attemptCounters"], {})
+
+    def test_status_groups_provider_publication_and_names_safe_recovery(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            key = "TASK-0001:pr-list"
+            store.state.update(phase="needs-user", provider="azure-devops")
+            store.state["taskStates"]["TASK-0001"] = {"phase": "needs-user", "error": f"Azure DevOps operation exhausted attempts: {key}"}
+            store.save()
+            output = io.StringIO()
+            with patch("sys.stdout", output):
+                self.assertEqual(status.main(["--repo", root]), 0)
+            shown = output.getvalue()
+            self.assertIn("category=provider-publication affected=TASK-0001", shown)
+            self.assertIn(str(Path(".relay") / "logs" / "provider.log"), shown)
+            self.assertIn("restore provider access, then use safe publication recovery", shown)
 
     def test_confirmed_defer_archives_rejected_repair_and_restores_candidate(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1085,7 +1143,7 @@ class DeterministicCoreTests(unittest.TestCase):
                 {"action": "resume-assignment-setup", "assignmentId": "TASK-0002", "baseSha": "0123456"},
             ])
             lines, next_line = run.campaign_summary(store.state, tasks, [])
-            self.assertIn("- BLOCKED category=worktree-setup affected=TASK-0001,TASK-0002 reason=Git could not create assignment worktrees before Worker launch", lines)
+            self.assertTrue(any(line.startswith("- BLOCKED category=worktree-setup affected=TASK-0001,TASK-0002 reason=Git could not create assignment worktrees before Worker launch") for line in lines))
             self.assertNotIn("non-zero exit status", "\n".join(lines))
             self.assertIn("Preview safe worktree setup recovery", next_line)
             with patch("run.stderr_event") as event:
@@ -1765,7 +1823,7 @@ class FakeEndToEndTests(unittest.TestCase):
             self.assertEqual((provider / ".create-attempts").read_text(), "3")
             self.assertEqual(state["taskStates"], {})
             self.assertNotIn("RECOVER", second.stderr)
-            self.assertIn("category=assignment affected=AGENTS reason=Azure DevOps operation exhausted attempts: AGENTS:pr-create", second.stderr)
+            self.assertIn("category=provider-publication affected=AGENTS reason=Azure DevOps PR creation exhausted attempts", second.stderr)
 
     def test_parallel_workers_reviews_prs_merge_one_audit_and_complete(self):
         with tempfile.TemporaryDirectory() as root:
