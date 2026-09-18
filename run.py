@@ -3112,6 +3112,7 @@ def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[
             arguments = [executable, run_path, "--repo", repo, "--recover"]
             for assignment_id in blocked:
                 arguments += ["--grant-attempt", assignment_id]
+            arguments.append("--confirm")
             next_line = f"Grant new implementation attempts explicitly with: {_shell_join(arguments)}"
     elif setup_blocked := sorted(assignment_id for assignment_id, value in task_states.items() if value.get("phase") == "needs-user" and _worktree_setup_failure(value.get("error"))):
         next_line = f"Preview safe worktree setup recovery for {', '.join(setup_blocked)} with: {_shell_join([executable, run_path, '--repo', repo, '--recover'])}"

@@ -679,6 +679,20 @@ class DeterministicCoreTests(unittest.TestCase):
         self.assertIn("backlog=1", lines[0])
         self.assertIn("BACKLOG.md", next_line)
 
+    def test_campaign_validation_recovery_next_command_confirms_attempt_grant(self):
+        task = ContractTests().task()
+        state = {
+            "repository": str(Path("repo").resolve()), "phase": "needs-user",
+            "campaignValidationCommands": ["build"],
+            "taskStates": {task["id"]: {
+                "phase": "needs-user",
+                "validationFailure": {"category": "campaign", "command": "build", "commandHash": "hash", "outcome": "exit:1"},
+                "validationLog": "validation.log",
+            }},
+        }
+        _lines, next_line = run.campaign_summary(state, [task], [])
+        self.assertIn("--recover --grant-attempt TASK-0001 --confirm", next_line)
+
     def test_schema_two_legacy_campaign_refuses_execution_without_baseline(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
