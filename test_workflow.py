@@ -1169,25 +1169,35 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(branch, "relay/campaign-123/TASK-0001")
             self.assertIn(("worktree", "add", "-b", branch, str(Path(root).resolve() / "relay-worktrees" / "campaign-123" / "TASK-0001"), "base"), calls)
 
-    def test_sparse_campaign_without_operation_fields_has_progress(self):
-        state = {"workerLimit": 3, "taskTotal": 1, "taskStates": {"TASK-0001": {"phase": "ready"}}, "activeProcesses": {}}
-        self.assertEqual(run.runtime_progress(state, 0), "0/1 complete | active 0/3")
+    def test_runtime_progress_is_compact_when_idle(self):
+        state = {"workerLimit": 3, "taskTotal": 5, "taskStates": {}, "activeProcesses": {}}
+        self.assertEqual(run.runtime_progress(state, []), "tasks 0/5 integrated | bugs 0 | agents 0/3 | idle")
 
-    def test_provider_progress_names_actual_pr_policy_and_deadline(self):
+    def test_runtime_progress_counts_running_and_queued_agents_once(self):
         state = {
-            "workerLimit": 3, "taskTotal": 1, "activeProcesses": {},
-            "pullRequests": {"TASK-0001": {"number": 25}},
-            "taskStates": {"TASK-0001": {
-                "phase": "provider-checks", "operation": "provider-checks",
-                "operationStartedAt": datetime.fromtimestamp(100, timezone.utc).isoformat(),
-                "operationDeadline": 3700, "providerPolicyCounts": {"queued": 2}, "nextAction": "poll",
-            }},
+            "workerLimit": 3, "taskTotal": 5,
+            "taskStates": {"TASK-0001": {"phase": "ready"}, "BUG-0001": {"phase": "integrated"}},
+            "activeProcesses": {
+                "one": {"assignmentId": "TASK-0001", "role": "contract-reviewer", "status": "running", "operationDeadline": 1},
+                "two": {"assignmentId": "TASK-0001", "role": "risk-reviewer", "status": "running", "operationDeadline": 1},
+                "three": {"assignmentId": "TASK-0003", "role": "triage-pm", "status": "running", "operationDeadline": 1},
+                "four": {"assignmentId": "TASK-0003", "role": "verification-reviewer", "status": "queued", "operationDeadline": 1},
+                "five": {"assignmentId": "TASK-0001", "role": "contract-reviewer", "status": "queued", "operationDeadline": 1},
+                "six": {"assignmentId": "TASK-0003", "role": "risk-reviewer", "status": "queued", "operationDeadline": 1},
+            },
         }
-        line = run.runtime_progress(state, 970)
-        self.assertIn("TASK-0001 provider-checks", line)
-        self.assertIn("PR #25", line)
-        self.assertIn("queued 2", line)
-        self.assertIn("next=poll", line)
+        line = run.runtime_progress(state, [])
+        self.assertEqual(line, "tasks 0/5 integrated | bugs 0 | agents 3/3 (+3 queued) | review TASK-0001,TASK-0003")
+        self.assertNotIn("deadline", line)
+
+    def test_runtime_progress_orders_nonzero_bug_states_and_ignores_bug_tasks(self):
+        state = {
+            "workerLimit": 1, "taskTotal": 1, "activeProcesses": {},
+            "taskStates": {"TASK-0001": {"phase": "integrated"}, "BUG-0001": {"phase": "integrated"}},
+        }
+        bugs = [{"status": status} for status in ("backlog", "resolved", "active", "needs-user", "waiting-provider", "resolved")]
+        line = run.runtime_progress(state, bugs)
+        self.assertEqual(line, "tasks 1/1 integrated | bugs active=1 needs-user=1 waiting-provider=1 resolved=2 backlog=1 | agents 0/1 | idle")
 
     def test_status_leads_with_approved_provider_wait(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1224,9 +1234,8 @@ class DeterministicCoreTests(unittest.TestCase):
                 "TASK-0002": {"phase": "approved", "operation": "merge-bypass"},
             },
         }
-        live = run.runtime_progress(state, 0)
-        self.assertIn("TASK-0001 provider-approve", live)
-        self.assertIn("TASK-0002 merge-bypass", live)
+        live = run.runtime_progress(state, [])
+        self.assertEqual(live, "tasks 0/2 integrated | bugs 0 | agents 0/2 | publish TASK-0001 | merge TASK-0002")
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
             store.state["taskStates"]["TASK-0001"] = {"phase": "waiting-provider", "providerStatus": "policy-waiting"}
