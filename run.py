@@ -436,54 +436,53 @@ def _operation_target(state: dict, assignment_id: str) -> dict | None:
     return state.get("taskStates", {}).get(assignment_id)
 
 
-def runtime_progress(state: dict, now: float | None = None) -> str:
-    now = time.time() if now is None else now
+def _progress_role(operation: str, mode: str | None = None) -> str:
+    if mode == "repair":
+        return "repair"
+    return {
+        "worker": "implement",
+        "contract-reviewer": "review",
+        "risk-reviewer": "review",
+        "triage-pm": "review",
+        "verification-reviewer": "review",
+        "audit-planner": "audit",
+        "provider-approve": "publish",
+        "provider-checks": "publish",
+        "merge-bypass": "merge",
+    }.get(operation, operation)
+
+
+def runtime_progress(state: dict, bugs: list[dict] | None = None) -> str:
     task_states = state.get("taskStates", {})
     total = state.get("taskTotal", len([key for key in task_states if key.startswith("TASK-")]))
     complete = sum(value.get("phase") == "integrated" for key, value in task_states.items() if key.startswith("TASK-"))
-    operations: list[tuple[str, str, dict]] = []
+    running = [process for process in state.get("activeProcesses", {}).values() if process.get("status") == "running"]
+    queued = sum(process.get("status") == "queued" for process in state.get("activeProcesses", {}).values())
+    operations: dict[str, set[str]] = {}
     active_assignments = set()
-    for process_id, process in state.get("activeProcesses", {}).items():
+    for process in state.get("activeProcesses", {}).values():
+        if process.get("status") not in {"running", "queued"}:
+            continue
         assignment_id = process.get("assignmentId", "unknown")
-        target = _operation_target(state, assignment_id) or {}
-        operations.append((assignment_id, process.get("role", "worker"), target | process))
+        operations.setdefault(_progress_role(process.get("role", "worker"), process.get("mode")), set()).add(assignment_id)
         active_assignments.add(assignment_id)
     bootstrap = state.get("agentsBootstrap")
     if bootstrap and bootstrap.get("operation") and "AGENTS" not in active_assignments:
-        operations.append(("AGENTS", bootstrap["operation"], bootstrap))
+        operations.setdefault(_progress_role(bootstrap["operation"]), set()).add("AGENTS")
     baseline = state.get("baselineValidation")
     if baseline and baseline.get("operation"):
-        operations.append(("BASELINE", baseline["operation"], baseline))
+        operations.setdefault(_progress_role(baseline["operation"]), set()).add("BASELINE")
     for assignment_id, task in task_states.items():
         if task.get("operation") and assignment_id not in active_assignments:
-            operations.append((assignment_id, task["operation"], task))
-    parts = [f"{complete}/{total} complete", f"active {len(operations)}/{state.get('workerLimit', 0)}"]
-    for assignment_id, operation, record in sorted(operations, key=lambda item: (item[0], item[1])):
-        detail = f"{assignment_id} {operation}"
-        started = record.get("operationStartedAt") or record.get("startedAt") or record.get("reservedAt")
-        if started:
-            detail += f" {_duration(now - datetime.fromisoformat(started).timestamp())}"
-        if operation == "worker":
-            detail += f" {state.get('attemptCounters', {}).get(assignment_id, 0)}/{state.get('taskAttemptLimit', 0)}"
-        elif operation == "validate" and record.get("validationPosition"):
-            detail += f" {record['validationPosition']}/{record.get('validationTotal', '?')}"
-        elif operation in {"review", "contract-reviewer", "risk-reviewer", "triage-pm", "verification-reviewer"}:
-            session = state.get("reviewSessions", {}).get(assignment_id, {})
-            detail += f" {session.get('reviewCallsStarted', 0)}/{session.get('reviewCallLimit', 0)}"
-        elif operation == "provider-checks":
-            pr = state.get("pullRequests", {}).get(assignment_id) or (record.get("pr") if assignment_id == "AGENTS" else {}) or {}
-            detail += f" PR #{pr.get('number', '?')}"
-            if record.get("providerStatus"):
-                detail += f" {record['providerStatus']}"
-            counts = record.get("providerPolicyCounts") or {}
-            if counts:
-                detail += " " + " ".join(f"{key} {value}" for key, value in sorted(counts.items()) if value)
-            if record.get("nextAction"):
-                detail += f" next={record['nextAction']}"
-        deadline = record.get("operationDeadline")
-        if deadline:
-            detail += f" / {_duration(deadline - now)} left"
-        parts.append(detail)
+            operations.setdefault(_progress_role(task["operation"]), set()).add(assignment_id)
+    bug_counts = Counter(bug["status"] for bug in (bugs or []))
+    bug_summary = " ".join(f"{status}={bug_counts[status]}" for status in ("active", "needs-user", "waiting-provider", "resolved", "backlog") if bug_counts[status])
+    parts = [f"tasks {complete}/{total} integrated", f"bugs {bug_summary or 0}", f"agents {len(running)}/{state.get('workerLimit', 0)}" + (f" (+{queued} queued)" if queued else "")]
+    if operations:
+        role_order = {role: index for index, role in enumerate(("implement", "review", "audit", "validate", "repair", "publish", "merge"))}
+        parts.extend(f"{role} {','.join(sorted(assignment_ids))}" for role, assignment_ids in sorted(operations.items(), key=lambda item: (role_order.get(item[0], len(role_order)), item[0])))
+    else:
+        parts.append("idle")
     return " | ".join(parts)
 
 
@@ -498,7 +497,7 @@ def start_operation(store: StateStore, assignment_id: str, operation: str, timeo
             if operation == "provider-checks" and assignment_id != "AGENTS":
                 target["phase"] = "provider-checks"
     store.update(change)
-    relay_console.update(runtime_progress(store.state, began.timestamp()))
+    relay_console.update(runtime_progress(store.state, load_bugs(store)))
 
 
 def clear_operation(store: StateStore, assignment_id: str, operation: str | None = None) -> None:
@@ -508,7 +507,7 @@ def clear_operation(store: StateStore, assignment_id: str, operation: str | None
             for field in OPERATION_FIELDS:
                 target.pop(field, None)
     store.update(change)
-    relay_console.update(runtime_progress(store.state, datetime.now(timezone.utc).timestamp()))
+    relay_console.update(runtime_progress(store.state, load_bugs(store)))
 
 
 @contextlib.contextmanager
@@ -1024,7 +1023,7 @@ def run_validations(store: StateStore, assignment: dict, worktree: Path, categor
             if assignment_id == "BASELINE":
                 target.update(phase="running", commandsStarted=count, currentCommand=command, startedAt=target.get("startedAt") or datetime.now(timezone.utc).isoformat(), deadline=target["operationDeadline"])
         store.update(consume)
-        relay_console.update(runtime_progress(store.state, datetime.now(timezone.utc).timestamp()))
+        relay_console.update(runtime_progress(store.state, load_bugs(store)))
         console("START", f"operation=validate category={category} assignment={assignment_id} command={command_number}/{len(commands)} attempt={started['number']} deadline={store.state['validationTimeoutSeconds']}s")
         shell = validation_command(command)
         middle = "" if category == "task" else f"-{category}"
@@ -1519,7 +1518,7 @@ def wait_for_checks(store: StateStore, assignment_id: str, pr: dict, reviewed_sh
             if target is not None:
                 target.update(providerStatus=status, providerPolicyCounts=counts or {}, nextAction=next_action)
         store.update(change)
-        relay_console.update(runtime_progress(store.state, datetime.now(timezone.utc).timestamp()))
+        relay_console.update(runtime_progress(store.state, load_bugs(store)))
 
     first = True
     while first or time.time() < deadline:
@@ -2844,10 +2843,10 @@ def reconcile(store: StateStore, allow_terminal_replay: bool = True) -> None:
 def heartbeat_loop(store: StateStore, stop: threading.Event) -> None:
     save_interval = min(30, max(1, store.state["agentTimeoutSeconds"] // 2))
     last_save = time.monotonic()
-    relay_console.update(runtime_progress(store.state))
+    relay_console.update(runtime_progress(store.state, load_bugs(store)))
     while not stop.wait(1):
         if relay_console.interactive():
-            relay_console.update(runtime_progress(store.state))
+            relay_console.update(runtime_progress(store.state, load_bugs(store)))
         if time.monotonic() - last_save >= save_interval:
             store.save()
             last_save = time.monotonic()
