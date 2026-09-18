@@ -771,6 +771,33 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertTrue(task_state["terminalValidationReplayUsed"])
             self.assertEqual(store.state["attemptCounters"], {})
 
+    def test_clean_changed_terminal_candidate_replays_without_attempt(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            store.state["taskStates"][assignment["id"]] = {
+                "phase": "needs-user", "terminalValidationCandidateSha": "old",
+                "validationFailure": {"category": "campaign", "command": "build", "commandHash": "hash", "outcome": "exit:1"},
+            }
+            store.state["worktrees"][assignment["id"]] = {"baseSha": "base"}
+
+            def replay_git(_repo, *args, **kwargs):
+                if args[0] == "rev-parse":
+                    return subprocess.CompletedProcess([], 0, "new\n", "")
+                if args[0] == "diff":
+                    return subprocess.CompletedProcess([], 0, "src/fixed.ps1\n", "")
+                if args[0] == "merge-base":
+                    return subprocess.CompletedProcess([], 0, "", "")
+                return subprocess.CompletedProcess([], 0, "", "")
+
+            with patch("run.recovery_worktree", return_value=(Path(root), store.state["worktrees"][assignment["id"]])), patch("run.git", side_effect=replay_git):
+                run.prepare_terminal_validation_replays(store)
+
+            task_state = store.state["taskStates"][assignment["id"]]
+            self.assertEqual((task_state["phase"], task_state["pendingWorkerSha"]), ("candidate-validation", "new"))
+            self.assertTrue(task_state["terminalValidationReplayUsed"])
+            self.assertEqual(store.state["attemptCounters"], {})
+
     def test_completed_repair_resumes_validation_then_verification(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)

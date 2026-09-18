@@ -2739,6 +2739,7 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
 
 def prepare_terminal_validation_replays(store: StateStore) -> None:
     changed = False
+    assignments = {task["id"]: task for task in load_tasks(store)}
     for assignment_id, task_state in sorted(store.state.get("taskStates", {}).items()):
         candidate = task_state.get("terminalValidationCandidateSha")
         if task_state.get("phase") != "needs-user" or not candidate or task_state.get("terminalValidationReplayUsed"):
@@ -2747,9 +2748,17 @@ def prepare_terminal_validation_replays(store: StateStore) -> None:
             worktree, record = recovery_worktree(store, assignment_id)
             head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
             dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout
-            ancestry = git(worktree, "merge-base", "--is-ancestor", record["baseSha"], candidate, timeout=store.state["validationTimeoutSeconds"], check=False)
-            if head != candidate or dirty or ancestry.returncode:
+            ancestry = git(worktree, "merge-base", "--is-ancestor", record["baseSha"], head, timeout=store.state["validationTimeoutSeconds"], check=False)
+            if dirty or ancestry.returncode:
                 raise RuntimeError("saved validation candidate changed")
+            if head != candidate:
+                assignment = assignments.get(assignment_id)
+                if not assignment:
+                    raise RuntimeError("saved validation candidate changed")
+                changed_paths = target_changes(store, worktree, record["baseSha"], head)
+                if any(not allowed_change(path, assignment_paths(store, assignment)) for path in changed_paths):
+                    raise RuntimeError("saved validation candidate changed")
+                candidate = head
             repair = task_state.get("terminalValidationReviewRepair")
             if repair is not None:
                 session = store.state.get("reviewSessions", {}).get(assignment_id)
