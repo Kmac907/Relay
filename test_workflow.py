@@ -1063,11 +1063,53 @@ class DeterministicCoreTests(unittest.TestCase):
             run.report_stopped(state)
         self.assertEqual(event.call_args_list, [
             unittest.mock.call("STOPPED", "phase=needs-user assignments=4"),
-            unittest.mock.call("BLOCKED", "assignment=AGENTS reason=bootstrap failed log=not-recorded"),
-            unittest.mock.call("BLOCKED", "assignment=CAMPAIGN reason=campaign failed log=not-recorded"),
-            unittest.mock.call("BLOCKED", "assignment=TASK-0001 reason=task failed log=not-recorded"),
-            unittest.mock.call("BLOCKED", "assignment=TASK-0002 reason=checks pending log=not-recorded"),
+            unittest.mock.call("BLOCKED", "category=assignment affected=AGENTS reason=bootstrap failed log=not-recorded"),
+            unittest.mock.call("BLOCKED", "category=assignment affected=CAMPAIGN reason=campaign failed log=not-recorded"),
+            unittest.mock.call("BLOCKED", "category=assignment affected=TASK-0002 reason=checks pending log=not-recorded"),
+            unittest.mock.call("BLOCKED", "category=assignment affected=TASK-0001 reason=task failed log=not-recorded"),
         ])
+
+    def test_worktree_setup_blockers_are_grouped_and_recoverable_without_an_attempt(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            tasks = [ContractTests().task("TASK-0001"), ContractTests().task("TASK-0002")]
+            error = "Command '['git', 'worktree', 'add']' returned non-zero exit status 255."
+            store.state.update(phase="needs-user", baselineValidation={"phase": "passed", "baseSha": "0123456"})
+            store.state["taskStates"] = {task["id"]: {"phase": "needs-user", "error": error} for task in tasks}
+            store.save()
+            before = store.path.read_bytes()
+            actions = run.plan_recovery(store, tasks, [], [])
+            self.assertEqual(store.path.read_bytes(), before)
+            self.assertEqual(actions, [
+                {"action": "resume-assignment-setup", "assignmentId": "TASK-0001", "baseSha": "0123456"},
+                {"action": "resume-assignment-setup", "assignmentId": "TASK-0002", "baseSha": "0123456"},
+            ])
+            lines, next_line = run.campaign_summary(store.state, tasks, [])
+            self.assertIn("- BLOCKED category=worktree-setup affected=TASK-0001,TASK-0002 reason=Git could not create assignment worktrees before Worker launch", lines)
+            self.assertNotIn("non-zero exit status", "\n".join(lines))
+            self.assertIn("Preview safe worktree setup recovery", next_line)
+            with patch("run.stderr_event") as event:
+                run.report_stopped(store.state)
+            self.assertEqual(event.call_args_list[-1], unittest.mock.call("BLOCKED", "category=worktree-setup affected=TASK-0001,TASK-0002 reason=Git could not create assignment worktrees before Worker launch log=not-recorded"))
+            run.apply_recovery(store, tasks, actions)
+            self.assertEqual(store.state["phase"], "build")
+            self.assertTrue(all(store.state["taskStates"][task["id"]] == {"phase": "ready"} for task in tasks))
+            self.assertEqual(store.state["attemptCounters"], {})
+
+    def test_create_worktree_uses_campaign_scoped_branch(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            store.state["campaignId"] = "campaign-123"
+            assignment = ContractTests().task()
+            calls = []
+            def fake_git(_repo, *args, **_kwargs):
+                calls.append(args)
+                output = "base\n" if args[:2] == ("rev-parse", "origin/main") else ""
+                return subprocess.CompletedProcess([], 0, output, "")
+            with patch("run.tempfile.gettempdir", return_value=root), patch("run.git_provider_with_retries"), patch("run.git", side_effect=fake_git):
+                _path, branch = run.create_worktree(store, assignment)
+            self.assertEqual(branch, "relay/campaign-123/TASK-0001")
+            self.assertIn(("worktree", "add", "-b", branch, str(Path(root).resolve() / "relay-worktrees" / "campaign-123" / "TASK-0001"), "base"), calls)
 
     def test_sparse_campaign_without_operation_fields_has_progress(self):
         state = {"workerLimit": 3, "taskTotal": 1, "taskStates": {"TASK-0001": {"phase": "ready"}}, "activeProcesses": {}}
@@ -1723,7 +1765,7 @@ class FakeEndToEndTests(unittest.TestCase):
             self.assertEqual((provider / ".create-attempts").read_text(), "3")
             self.assertEqual(state["taskStates"], {})
             self.assertNotIn("RECOVER", second.stderr)
-            self.assertIn("assignment=AGENTS reason=Azure DevOps operation exhausted attempts: AGENTS:pr-create", second.stderr)
+            self.assertIn("category=assignment affected=AGENTS reason=Azure DevOps operation exhausted attempts: AGENTS:pr-create", second.stderr)
 
     def test_parallel_workers_reviews_prs_merge_one_audit_and_complete(self):
         with tempfile.TemporaryDirectory() as root:
