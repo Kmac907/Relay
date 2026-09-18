@@ -958,12 +958,15 @@ def create_worktree(store: StateStore, assignment: dict) -> tuple[Path, str]:
         root = safe_within(campaign_root / assignment_id, campaign_root)
         path = safe_within(root / Path(store.state.get("repositoryPrefix", "")), root)
         root.parent.mkdir(parents=True, exist_ok=True)
-        branch = f"relay/{assignment_id}"
+        branch = f"relay/{store.state['campaignId']}/{assignment_id}"
         repository = Path(store.state["repository"])
         git_provider_with_retries(store, f"{assignment_id}:fetch", repository, "fetch", "origin", "main")
         remote_base = git(repository, "rev-parse", "origin/main", timeout=store.state["providerTimeoutSeconds"], check=False)
         assignment_base = remote_base.stdout.strip() if remote_base.returncode == 0 else store.state["baseSha"]
-        git(repository, "worktree", "add", "-b", branch, str(root), assignment_base, timeout=store.state["providerTimeoutSeconds"])
+        created = git(repository, "worktree", "add", "-b", branch, str(root), assignment_base, timeout=store.state["providerTimeoutSeconds"], check=False)
+        if created.returncode:
+            detail = " ".join((created.stderr or created.stdout).split()) or f"git exited {created.returncode}"
+            raise RuntimeError(f"worktree setup failed: {detail}")
         path.mkdir(parents=True, exist_ok=True)
         store.state["worktrees"][assignment_id] = {"path": str(path), "root": str(root), "branch": branch, "baseSha": assignment_base}
         store.save()
@@ -2358,6 +2361,13 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str], gra
             handled.add(assignment_id)
             continue
         error = str(task_state.get("error", ""))
+        if _worktree_setup_failure(error):
+            if assignment_id in store.state.get("worktrees", {}) or store.state.get("attemptCounters", {}).get(assignment_id) or task_state.get("candidateSha") or task_state.get("pendingWorkerSha") or assignment_id in store.state.get("reviewSessions", {}):
+                raise RuntimeError(f"worktree setup recovery state drifted: {assignment_id}")
+            verify_seed(store, assignment)
+            actions.append({"action": "resume-assignment-setup", "assignmentId": assignment_id, "baseSha": store.state["baseSha"]})
+            handled.add(assignment_id)
+            continue
         if assignment_id in bug_assignments and error.startswith("validation command ") and assignment_id not in store.state.get("auditBugValidationCommands", {}):
             worktree, record = recovery_worktree(store, assignment_id)
             head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
@@ -2624,7 +2634,13 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
             store.save()
             continue
         task_state = store.state["taskStates"][assignment_id]
-        if action["action"] == "grant-attempt":
+        if action["action"] == "resume-assignment-setup":
+            if action["baseSha"] != store.state["baseSha"] or assignment_id in store.state.get("worktrees", {}) or store.state.get("attemptCounters", {}).get(assignment_id):
+                raise RuntimeError(f"worktree setup recovery state changed: {assignment_id}")
+            verify_seed(store, by_id[assignment_id])
+            task_state.update(phase="ready")
+            task_state.pop("error", None)
+        elif action["action"] == "grant-attempt":
             worktree, _ = recovery_worktree(store, assignment_id)
             head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
             dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout.splitlines()
@@ -2921,11 +2937,23 @@ def _normalized_error(value: object) -> str:
     return re.sub(r";?\s*log:\s*[^\r\n]+$", "", text).strip()
 
 
+def _worktree_setup_failure(value: object) -> bool:
+    text = str(value or "")
+    return text.startswith("worktree setup failed:") or ("'worktree', 'add'" in text and "non-zero exit status" in text)
+
+
+def _blocker_detail(value: object) -> tuple[str, str]:
+    if _worktree_setup_failure(value):
+        return "worktree-setup", "Git could not create assignment worktrees before Worker launch"
+    return "assignment", _normalized_error(value)
+
+
 def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[list[str], str]:
     task_states = state.get("taskStates", {})
     interrupted = {item.get("assignmentId") for item in state.get("activeProcesses", {}).values() if item.get("interrupted")}
     counts = Counter()
     bullets = []
+    blocked_groups: dict[tuple[str, str], list[str]] = {}
     for task in sorted(tasks, key=lambda item: item["id"]):
         task_state = task_states.get(task["id"], {})
         phase = task_state.get("phase")
@@ -2963,7 +2991,11 @@ def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[
             unmet = [dependency for dependency in task["dependencies"] if task_states.get(dependency, {}).get("phase") != "integrated" and next((item for item in tasks if item["id"] == dependency), {}).get("status") != "satisfied"]
             detail = f"unmet dependencies: {', '.join(unmet)}" if unmet else "campaign stopped before launch"
         counts[status] += 1
-        bullets.append(f"- {task['id']} {status}: {task['title']} — {detail}")
+        if status == "blocked" and not task_state.get("validationFailure"):
+            category, reason = _blocker_detail(task_state.get("error") or task_state.get("providerStatus") or detail)
+            blocked_groups.setdefault((category, reason), []).append(task["id"])
+        else:
+            bullets.append(f"- {task['id']} {status}: {task['title']} — {detail}")
     bug_counts = Counter(bug["status"] for bug in bugs)
     lines = [f"tasks={counts['completed']}/{len(tasks)} completed blocked={counts['blocked']} waiting={counts['waiting']} satisfied={counts['satisfied']} not-run={counts['not-run']} bugs={len(bugs)} backlog={bug_counts['backlog']}"]
     baseline = state.get("baselineValidation")
@@ -2988,6 +3020,8 @@ def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[
         group["logs"].append(task_state.get("validationLog", "not-recorded"))
     for (category, _command_hash, outcome), group in sorted(validation_groups.items()):
         lines.append(f"- VALIDATION BLOCKER category={category} outcome={outcome} command={group['command']} affected={','.join(group['ids'])} required={group['required']} logs={','.join(group['logs'])}")
+    for (category, reason), assignment_ids in sorted(blocked_groups.items()):
+        lines.append(f"- BLOCKED category={category} affected={','.join(assignment_ids)} reason={reason}")
     lines.extend(bullets)
     for bug in sorted(bugs, key=lambda item: item["id"]):
         status = "waiting-provider" if task_states.get(bug["id"], {}).get("phase") == "waiting-provider" else bug["status"]
@@ -3031,6 +3065,8 @@ def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[
             for assignment_id in blocked:
                 arguments += ["--grant-attempt", assignment_id]
             next_line = f"Grant new implementation attempts explicitly with: {_shell_join(arguments)}"
+    elif setup_blocked := sorted(assignment_id for assignment_id, value in task_states.items() if value.get("phase") == "needs-user" and _worktree_setup_failure(value.get("error"))):
+        next_line = f"Preview safe worktree setup recovery for {', '.join(setup_blocked)} with: {_shell_join([executable, run_path, '--repo', repo, '--recover'])}"
     else:
         groups: dict[str, list[str]] = {}
         for assignment_id, reason in blocked_assignments(state):
@@ -3060,11 +3096,14 @@ def emit_campaign_summary(store: StateStore, tasks: list[dict]) -> None:
 def report_stopped(state: dict) -> None:
     blocked = blocked_assignments(state)
     stderr_event("STOPPED", f"phase={state.get('phase', 'unknown')} assignments={len(blocked)}")
+    groups: dict[tuple[str, str, str], list[str]] = {}
     for assignment_id, reason in blocked:
-        compact = " ".join(reason.splitlines())
+        category, compact = _blocker_detail(reason)
         match = re.search(r"log:\s*([^\r\n]+)", reason)
         log = match.group(1) if match else "not-recorded"
-        stderr_event("BLOCKED", f"assignment={assignment_id} reason={compact} log={log}")
+        groups.setdefault((category, compact, log), []).append(assignment_id)
+    for (category, reason, log), assignment_ids in sorted(groups.items()):
+        stderr_event("BLOCKED", f"category={category} affected={','.join(sorted(assignment_ids))} reason={reason} log={log}")
 
 
 def report_legacy_refusal(store: StateStore) -> None:
