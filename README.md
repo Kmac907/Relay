@@ -38,7 +38,9 @@ For Azure, install the official extension with `az extension add --name azure-de
 
 ## Quick start
 
-Create and publish a new repository:
+Run these commands from the Relay checkout. On Windows, `py -3.11` is an equivalent to `python`.
+
+1. Create and publish a new repository:
 
 ```powershell
 python repo.py `
@@ -55,7 +57,7 @@ python repo.py `
   --azure-devops ORGANIZATION PROJECT Example
 ```
 
-Write the requirements, then plan and run the campaign:
+2. For an existing repository, skip `repo.py`. Write the requirements in a Markdown file, then generate and review the bounded plan:
 
 ```powershell
 python plan.py `
@@ -64,7 +66,17 @@ python plan.py `
   --workers 3 `
   --task-attempts 3 `
   --fix-loops 2
+```
 
+Review `PLAN.md`, especially its campaign-validation commands, task dependencies, allowed paths, acceptance criteria, and limits. Validate it without creating campaign state:
+
+```powershell
+python run.py --repo C:\Code\Projects\Example --dry-run
+```
+
+3. Start the campaign with the same limits used by `plan.py`:
+
+```powershell
 python run.py `
   --repo C:\Code\Projects\Example `
   --workers 3 `
@@ -72,9 +84,68 @@ python run.py `
   --fix-loops 2
 ```
 
-`--task-attempts` and `--fix-loops` must match between planning and the first campaign run. Use the same `run.py --repo ...` command with no stdin or new `--plan` to resume an interrupted or provider-waiting campaign; Relay reloads the persisted limits.
+`--task-attempts` and `--fix-loops` must match between planning and the first campaign run. Observe progress at any time:
 
-For an existing repository, skip `repo.py` and run `plan.py` against its selected `HEAD`.
+```powershell
+python status.py --repo C:\Code\Projects\Example
+```
+
+Use the same `python run.py --repo ...` command with no stdin or new `--plan` to resume an interrupted or provider-waiting campaign; Relay reloads the persisted limits and provider identity.
+
+4. If Relay stops in `needs-user`, preview recovery before changing state:
+
+```powershell
+python run.py --repo C:\Code\Projects\Example --recover
+```
+
+Correct the external problem, then copy the printed command exactly. State-changing recovery requires `--confirm`:
+
+```powershell
+python run.py --repo C:\Code\Projects\Example --recover --confirm
+python run.py --repo C:\Code\Projects\Example --recover --grant-attempt TASK-0001 --confirm
+python run.py --repo C:\Code\Projects\Example --recover --defer-blocker BUG-0001 --confirm
+```
+
+The grant and deferral forms are used only when the preview identifies those actions as valid. Confirmation journals and applies recovery but does not launch Workers; run the printed `NEXT` command afterward.
+
+5. After completion, review `BACKLOG.md`, preview cleanup, and confirm it:
+
+```powershell
+python run.py --repo C:\Code\Projects\Example --cleanup
+python run.py --repo C:\Code\Projects\Example --cleanup --confirm
+```
+
+6. Start the next finite campaign from the published backlog:
+
+```powershell
+python plan.py `
+  --repo C:\Code\Projects\Example `
+  --requirements C:\Code\Projects\Example\BACKLOG.md
+python run.py --repo C:\Code\Projects\Example
+```
+
+Run the required deterministic regression suite:
+
+```powershell
+python -m unittest -v test_workflow.py
+```
+
+For an existing repository, `plan.py` plans against its selected `HEAD`; Relay refuses to start if that planned base no longer matches `HEAD`.
+
+## Project Architecture
+
+Relay stays as directly executable scripts plus one small console helper:
+
+| File | Responsibility |
+| --- | --- |
+| `repo.py` | Create a local `main` repository, add generic target instructions, and optionally publish it to GitHub or Azure DevOps Services. |
+| `plan.py` | Inspect the repository, run read-only scouting, produce a bounded task plan, run contract and risk reviews, and validate the plan before writing `PLAN.md`. |
+| `run.py` | Coordinate campaign state transitions, dependency-aware Workers, worktree validation, reviews, repairs, recovery, provider PR operations, audit, backlog publication, and cleanup. |
+| `status.py` | Read-only inspection of campaign phases, operations, budgets, provider waits, blockers, bugs, worktrees, and PRs. |
+| `relay_console.py` | Emit deterministic console events and progress output without mixing raw agent or provider logs into coordinator output. |
+| `test_workflow.py` | Run the deterministic regression suite for transitions, retries, recovery, PR handling, concurrency, and cleanup. |
+
+`run.py` owns active ledgers and runtime state. `.relay/state.json` is the resume authority; `tasks.md` tracks task execution; `bugs.md` tracks review and audit findings; `BACKLOG.md` carries deferred work between campaigns; and `.relay/logs/` stores raw agent, provider, and validation logs. Isolated worktrees and branches keep candidate changes separate from the target's integration branch.
 
 ## Workflow
 
@@ -136,10 +207,89 @@ The campaign becomes `complete` when no active audit bugs remain. Before complet
 Use a completed campaign's backlog directly as the next requirements input:
 
 ```powershell
-uv run .\plan.py `
+python plan.py `
   --repo C:\path\to\target `
   --requirements C:\path\to\target\BACKLOG.md
 ```
+
+## Workflow Architecture
+
+Each campaign follows one finite lifecycle:
+
+1. Read requirements and inspect the repository.
+2. Scout read-only scopes and produce a bounded plan.
+3. Review the plan for contract and technical risk, then validate it.
+4. Run mandatory campaign validation on the planned base.
+5. Bootstrap a generic `AGENTS.md` through an isolated PR when needed.
+6. Execute dependency-aware Worker assignments in isolated worktrees.
+7. Run focused validation and mandatory campaign validation on candidates.
+8. Run independent reviews and triage findings.
+9. Apply bounded repairs and verification reviews.
+10. Run provider PR checks and merge approved candidates.
+11. Run one finite audit with explicit scopes and commands.
+12. Fix accepted bugs within the same bounded workflow and publish deferred work to `BACKLOG.md`.
+13. Reach `complete` and offer confirmed cleanup.
+
+```mermaid
+flowchart TD
+    R[Requirements and repository inspection] --> P[Read-only scouting and bounded planning]
+    P --> PR[Plan and technical review]
+    PR --> B[Baseline campaign validation]
+    B -->|pass| AP[Optional AGENTS.md bootstrap]
+    B -->|failure| NU[needs-user]
+    AP --> W[Dependency-aware parallel Workers]
+    W --> V[Focused and campaign validation]
+    V --> RV[Independent reviews and triage]
+    RV -->|repair budget remains| RP[Bounded repair and verification]
+    RP --> V
+    RV --> PP[Provider PR checks]
+    PP -->|waiting| WP[waiting-provider]
+    PP -->|pass| M[Merge approved PRs]
+    M --> A[One finite audit]
+    A -->|accepted bugs| BF[Bug Workers and scope validation]
+    BF --> PP
+    A -->|no active bugs| C[complete]
+    NU --> REC[Preview and confirm recovery]
+    WP --> REC
+    REC -->|persisted phase| B
+    REC -->|persisted phase| AP
+    REC -->|persisted phase| W
+    REC -->|persisted phase| RV
+    REC -->|persisted phase| PP
+```
+
+Recovery resumes the persisted phase that is safe for the recorded worktree, SHA, provider operation, or baseline result. Recovery does not restart planning, create recursive audits, or silently grant attempts.
+
+## Agents
+
+Agents receive explicit prompts and validated structured-output schemas. Raw stdout and stderr are captured separately from coordinator output. Attempts, review calls, repair loops, provider operations, and deadlines are persisted and mechanically bounded. Agents do not perform provider operations, create recursive work, or modify coordinator-owned state unless the assigned role explicitly permits it.
+
+| Agent type | Responsibility | Write access |
+| --- | --- | --- |
+| Scout | Read-only repository inspection for planning | None |
+| Planning PM | Produce bounded tasks and campaign validation commands | None |
+| Contract reviewer | Check requirements, acceptance criteria, and candidate regressions | None |
+| Risk reviewer | Check correctness, regressions, security, data loss, and tests | None |
+| Triage PM | Classify findings as blocker, backlog, discard, or needs-user | None |
+| Worker | Implement one assigned task, bug, or repair and commit a candidate | Assigned worktree only |
+| Verification reviewer | Verify only the accepted repair delta | None |
+| Audit planner | Define one finite set of audit scopes and commands | None |
+| Audit worker | Inspect one assigned audit scope and report evidence | None |
+
+## Validation and failure behavior
+
+Campaign-validation commands are mandatory. Relay runs them on the planned base and on every candidate; passing focused validation never bypasses campaign validation. Validation failures preserve the exact command and log path. Where supported, Relay automatically replays a clean terminal candidate once. A `needs-user` recovery always requires an explicit preview followed by a confirmed action. Copy printed `NEXT` commands exactly, including `--confirm` when it is present.
+
+| Situation | Behavior and operator action |
+| --- | --- |
+| Baseline validation failure | Relay stops before Worker attempts. Fix the baseline condition, inspect the recorded command and `.relay/logs/` path, then use the printed replay or `--recover` preview. |
+| Candidate validation failure | The candidate remains recorded with its exact command and log. Fix or review the condition; a terminal candidate may be replayed once, otherwise use an explicit recovery or grant when offered. |
+| Provider wait | The campaign is `waiting-provider`; use `status.py`, restore or approve the external check, then resume with `python run.py --repo ...`. |
+| Provider publication failure | Restore provider access, run `python run.py --repo ... --recover` to preview safe publication recovery, confirm it, then run the printed resume command. |
+| Worktree setup failure | Relay preserves the bounded state and stops in `needs-user`. Inspect the worktree and path/SHA evidence, then use only the recovery action shown by the preview. |
+| Review or repair exhaustion | The shared review/fix-loop budget is preserved. Defer an eligible blocker with `--defer-blocker BUG-NNNN`, grant a separately-accounted task attempt with `--grant-attempt TASK-NNNN`, or resolve the blocker and follow the preview. |
+| Legacy campaign migration | Run `python run.py --repo ... --recover` to preview migration. Confirm only the offered archive-and-handoff action; then create the modern plan from the printed `HANDOFF.md` requirements command. |
+| Cleanup refusal | Cleanup requires a complete inactive campaign, no worktrees, and no open Relay PRs. Resolve those conditions, preview again, then use `--cleanup --confirm`. |
 
 ## Campaign files
 
