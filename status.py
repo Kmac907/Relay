@@ -8,7 +8,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-from run import _blocker_detail, _blocker_log, _publication_retry_key, parse_bugs, parse_tasks
+from run import _blocker_detail, _blocker_log, _publication_retry_key, parse_bugs, parse_tasks, repair_attempts_started, review_call_limit
 
 
 def parser() -> argparse.ArgumentParser:
@@ -95,10 +95,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nTasks\n  Total: {len(tasks)}\n  Ready: {ready}")
     phases = Counter(value.get("phase", "unknown") for key, value in task_states.items() if key in task_ids)
     for phase, count in sorted(phases.items()): print(f"  {phase}: {count}")
-    if state.get("attemptCounters") or state.get("providerDeadlines"):
+    budget_ids = set(state.get("attemptCounters", {})) | {assignment_id for assignment_id, task in task_states.items() if task.get("validationRepairAttemptsStarted") or task.get("validationRepairCallsStarted")}
+    if budget_ids or state.get("providerDeadlines"):
         print("\nBudgets and deadlines")
-        for assignment_id, count in sorted(state.get("attemptCounters", {}).items()):
-            print(f"  {assignment_id}: attempts={count}/{state['taskAttemptLimit']} validations={state.get('validationCommandsStarted', {}).get(assignment_id, 0)} agent={state['agentTimeoutSeconds']}s validation={state['validationTimeoutSeconds']}s")
+        for assignment_id in sorted(budget_ids):
+            session = state.get("reviewSessions", {}).get(assignment_id)
+            calls = session.get("reviewCallsStarted", 0) if session else task_states.get(assignment_id, {}).get("validationRepairCallsStarted", 0)
+            call_limit = session.get("reviewCallLimit") if session else review_call_limit(state["fixLoopLimit"], state["formatRetryAllowance"])
+            print(f"  {assignment_id}: attempts={state.get('attemptCounters', {}).get(assignment_id, 0)}/{state['taskAttemptLimit']} fixes={repair_attempts_started(state, assignment_id)}/{state['fixLoopLimit']} review-calls={calls}/{call_limit} validations={state.get('validationCommandsStarted', {}).get(assignment_id, 0)} agent={state['agentTimeoutSeconds']}s validation={state['validationTimeoutSeconds']}s")
         for assignment_id, deadline in sorted(state.get("providerDeadlines", {}).items()): print(f"  {assignment_id}: provider-check-deadline-in={max(0, int(deadline - now))}s")
     if state.get("reviewSessions"):
         print("\nReview sessions")

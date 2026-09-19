@@ -159,6 +159,13 @@ class ContractTests(unittest.TestCase):
             run.transition_review(session, phase, 2)
         self.assertEqual(session["phase"], "approved")
 
+    def test_pre_review_repair_advances_the_shared_fix_sequence(self):
+        session = {"phase": "triage", "repairAttemptsStarted": 1}
+        with self.assertRaises(ValueError):
+            run.transition_review(session, "repair-1", 2)
+        run.transition_review(session, "repair-2", 2)
+        self.assertEqual(session["phase"], "repair-2")
+
     def test_worker_cannot_change_mode(self):
         value = {"mode": "repair", "assignmentId": "TASK-0001", "status": "candidate", "candidateSha": "abc", "validation": [], "summary": ""}
         with self.assertRaises(ValueError):
@@ -725,6 +732,164 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertIn("first.log", prompts[1])
             self.assertEqual(store.state["taskStates"][assignment["id"]]["error"], "validation command 1 exited with code 2; log: second.log")
 
+    def test_validation_circuit_routes_to_automatic_repair_before_initial_review(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            store.state["baselineValidation"]["phase"] = "passed"
+            assignment = ContractTests().task()
+            attempts = []
+            def worker(*args, **kwargs):
+                store.state["attemptCounters"][assignment["id"]] = store.state["attemptCounters"].get(assignment["id"], 0) + 1
+                attempts.append(1)
+                return {"candidateSha": "same"}
+            def validate(*args):
+                store.state["taskStates"][assignment["id"]].update(
+                    validationCandidateSha="same",
+                    validationFailure={"category": "campaign", "command": "build", "commandHash": "hash", "outcome": "exit:1"},
+                )
+                raise RuntimeError("campaign validation command 1 exited with code 1; log: failed.log")
+            def approved(*args):
+                store.state["reviewSessions"][assignment["id"]] = {"phase": "approved", "reviewedSha": "repaired"}
+                return True
+            with patch("run.create_worktree", return_value=(Path(root), "branch")), patch("run.invoke_with_replacements", side_effect=worker), patch("run.validate_candidate", side_effect=validate), patch("run.repair_failed_validation", return_value="repaired") as repair, patch("run.publish_candidate", return_value={"number": 1}), patch("run.run_review", side_effect=approved), patch("run.merge_assignment", return_value=True), patch("run.cleanup_worktree"):
+                self.assertTrue(run.process_assignment(store, threading.Semaphore(1), assignment, "task"))
+            self.assertEqual((len(attempts), store.state["attemptCounters"][assignment["id"]]), (2, 2))
+            repair.assert_called_once()
+
+    def test_validation_repair_covers_focused_campaign_and_audit_assignments(self):
+        for assignment_id, category in (("TASK-0001", "task"), ("TASK-0001", "campaign"), ("BUG-0001", "task")):
+            with self.subTest(assignment=assignment_id, category=category), tempfile.TemporaryDirectory() as root:
+                target = make_git_repository(Path(root))
+                base = git_output(target, "rev-parse", "HEAD").strip()
+                (target / "src").mkdir()
+                (target / "src" / "value.txt").write_text("bad\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(target), "add", "src/value.txt"], check=True)
+                subprocess.run(["git", "-C", str(target), "commit", "-m", "candidate"], check=True, capture_output=True)
+                candidate = git_output(target, "rev-parse", "HEAD").strip()
+                store = self.state_store(target)
+                run.exclude_relay_files(target)
+                assignment = ContractTests().task(assignment_id)
+                store.state["baselineValidation"]["phase"] = "passed"
+                store.state["worktrees"][assignment_id] = {"baseSha": base}
+                store.state["taskStates"][assignment_id] = {
+                    "phase": "candidate-validation", "validationCandidateSha": candidate,
+                    "terminalValidationCandidateSha": candidate, "validationRepairAttemptsStarted": 0,
+                    "validationRepairCallsStarted": 0, "validationLog": "failed.log",
+                    "validationFailure": {"category": category, "command": "failed command", "commandHash": "hash", "outcome": "exit:1"},
+                }
+                calls = []
+                def agent(*args, **kwargs):
+                    number, process_id = run._consume_agent_call(store, assignment_id, "worker", "repair", False, False, True)
+                    persisted = json.loads(store.path.read_text(encoding="utf-8"))["taskStates"][assignment_id]
+                    self.assertEqual((persisted["validationRepairAttemptsStarted"], persisted["validationRepairCallsStarted"]), (1, 1))
+                    self.assertIn("failed command", args[5])
+                    self.assertIn("failed.log", args[5])
+                    (target / "src" / "value.txt").write_text("good\n", encoding="utf-8")
+                    subprocess.run(["git", "-C", str(target), "commit", "-am", "repair"], check=True, capture_output=True)
+                    repaired = git_output(target, "rev-parse", "HEAD").strip()
+                    store.state["activeProcesses"].pop(process_id)
+                    return {"candidateSha": repaired, "summary": "repaired validation"}
+                with patch("run.invoke_agent", side_effect=agent), patch("run.run_validations", side_effect=lambda *args, **kwargs: calls.append(args[3])):
+                    repaired = run.repair_failed_validation(store, threading.Semaphore(1), assignment, target)
+                self.assertNotEqual(repaired, candidate)
+                self.assertEqual(calls, ["task", "campaign"])
+                session = run.ensure_review_session(store, assignment_id, repaired)
+                self.assertEqual((session["phase"], session["initialCandidateSha"], session["repairAttemptsStarted"], session["reviewCallsStarted"]), ("initial-review", repaired, 1, 1))
+
+    def test_validation_timeout_replays_once_before_worker_repair(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = make_git_repository(Path(root))
+            base = git_output(target, "rev-parse", "HEAD").strip()
+            (target / "src").mkdir()
+            (target / "src" / "value.txt").write_text("bad\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", "src/value.txt"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "candidate"], check=True, capture_output=True)
+            candidate = git_output(target, "rev-parse", "HEAD").strip()
+            store = self.state_store(target)
+            run.exclude_relay_files(target)
+            assignment = ContractTests().task()
+            assignment.update(allowedPaths=["src"], validationCommands=[])
+            store.state["baselineValidation"]["phase"] = "passed"
+            store.state["worktrees"][assignment["id"]] = {"baseSha": base}
+            failure = {"category": "campaign", "command": "hang", "commandHash": "timeout-hash", "outcome": "timeout"}
+            store.state["taskStates"][assignment["id"]] = {"phase": "candidate-validation", "validationCandidateSha": candidate, "terminalValidationCandidateSha": candidate, "validationFailure": failure, "validationRepairAttemptsStarted": 0, "validationRepairCallsStarted": 0}
+            events = []
+            def validate(_store, _assignment, _worktree, result):
+                events.append(("validate", result["candidateSha"]))
+                if result["candidateSha"] == candidate:
+                    self.assertEqual(store.state["taskStates"][assignment["id"]]["validationTimeoutReplayIdentity"], {"candidateSha": candidate, "commandHash": "timeout-hash"})
+                    store.state["taskStates"][assignment["id"]]["validationFailure"] = failure
+                    raise RuntimeError("campaign validation command 1 timed out after 1s; log: timeout.log")
+                return result["candidateSha"]
+            def agent(*args, **kwargs):
+                events.append(("worker", candidate))
+                number, process_id = run._consume_agent_call(store, assignment["id"], "worker", "repair", False, False, True)
+                (target / "src" / "value.txt").write_text("good\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(target), "commit", "-am", "repair"], check=True, capture_output=True)
+                repaired = git_output(target, "rev-parse", "HEAD").strip()
+                store.state["activeProcesses"].pop(process_id)
+                return {"candidateSha": repaired}
+            with patch("run.validate_candidate", side_effect=validate), patch("run.invoke_agent", side_effect=agent):
+                repaired = run.repair_failed_validation(store, threading.Semaphore(1), assignment, target)
+            self.assertEqual([event[0] for event in events], ["validate", "worker", "validate"])
+            self.assertNotEqual(repaired, candidate)
+
+    def test_completed_validation_repair_resumes_without_free_attempt(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = make_git_repository(Path(root))
+            base = git_output(target, "rev-parse", "HEAD").strip()
+            (target / "src").mkdir()
+            (target / "src" / "value.txt").write_text("bad\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", "src/value.txt"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "candidate"], check=True, capture_output=True)
+            candidate = git_output(target, "rev-parse", "HEAD").strip()
+            (target / "src" / "value.txt").write_text("good\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "commit", "-am", "completed repair"], check=True, capture_output=True)
+            repaired = git_output(target, "rev-parse", "HEAD").strip()
+            store = self.state_store(target)
+            run.exclude_relay_files(target)
+            assignment = ContractTests().task()
+            assignment.update(allowedPaths=["src"], validationCommands=[])
+            store.state.update(campaignValidationCommands=[])
+            store.state["baselineValidation"]["phase"] = "passed"
+            store.state["worktrees"][assignment["id"]] = {"baseSha": base}
+            store.state["taskStates"][assignment["id"]] = {
+                "phase": "validation-repair-1", "validationCandidateSha": candidate,
+                "validationFailure": {"category": "task", "command": "test", "commandHash": "hash", "outcome": "exit:1"},
+                "validationRepairAttemptsStarted": 1, "validationRepairCallsStarted": 1,
+                "validationRepairInProgress": {"baseSha": candidate, "failure": {}},
+            }
+            with patch("run.invoke_with_replacements") as worker, patch("run.validate_candidate", return_value=repaired) as validate:
+                self.assertEqual(run.repair_failed_validation(store, threading.Semaphore(1), assignment, target), repaired)
+            worker.assert_not_called()
+            validate.assert_called_once()
+            self.assertEqual((store.state["taskStates"][assignment["id"]]["validationRepairAttemptsStarted"], store.state["taskStates"][assignment["id"]]["validationRepairCallsStarted"]), (1, 1))
+
+    def test_validation_repair_zero_budget_and_unsafe_candidate_need_user(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = make_git_repository(Path(root))
+            base = git_output(target, "rev-parse", "HEAD").strip()
+            (target / "src").mkdir()
+            (target / "src" / "value.txt").write_text("bad\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", "src/value.txt"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "candidate"], check=True, capture_output=True)
+            candidate = git_output(target, "rev-parse", "HEAD").strip()
+            assignment = ContractTests().task()
+            assignment.update(allowedPaths=["src"], validationCommands=[])
+            store = self.state_store(target, fix_loops=0)
+            run.exclude_relay_files(target)
+            store.state["baselineValidation"]["phase"] = "passed"
+            store.state["worktrees"][assignment["id"]] = {"baseSha": base}
+            store.state["taskStates"][assignment["id"]] = {"validationCandidateSha": candidate, "validationFailure": {"category": "task", "commandHash": "hash", "outcome": "exit:1"}}
+            with patch("run.invoke_with_replacements") as worker:
+                self.assertIsNone(run.repair_failed_validation(store, threading.Semaphore(1), assignment, target))
+            worker.assert_not_called()
+            store.state["fixLoopLimit"] = 1
+            (target / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+            with patch("run.invoke_with_replacements") as worker:
+                self.assertIsNone(run.repair_failed_validation(store, threading.Semaphore(1), assignment, target))
+            worker.assert_not_called()
+
     def test_repair_validation_failures_consume_shared_fix_budget(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root, fix_loops=2)
@@ -890,6 +1055,24 @@ class DeterministicCoreTests(unittest.TestCase):
             store.state["activeProcesses"].pop(process_id)
             with self.assertRaisesRegex(RuntimeError, "attempt limit"):
                 run._consume_agent_call(store, assignment["id"], "worker", "task", False, False)
+
+    def test_granted_task_attempt_preserves_validation_repair_budgets(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            store.state.update(phase="needs-user")
+            store.state["taskStates"][assignment["id"]] = {
+                "phase": "needs-user", "validationRepairAttemptsStarted": 1,
+                "validationRepairCallsStarted": 2, "terminalValidationCandidateSha": "head",
+            }
+            action = {"action": "grant-attempt", "assignmentId": assignment["id"], "grant": 1, "headSha": "head", "dirty": [], "interruptionCause": "none"}
+            def recovery_git(_repo, *args, **kwargs):
+                return subprocess.CompletedProcess([], 0, "head\n" if args[0] == "rev-parse" else "", "")
+            with patch("run.recovery_worktree", return_value=(Path(root), {"baseSha": "base"})), patch("run.git", side_effect=recovery_git):
+                run.apply_recovery(store, [assignment], [action])
+            task_state = store.state["taskStates"][assignment["id"]]
+            self.assertEqual((task_state["validationRepairAttemptsStarted"], task_state["validationRepairCallsStarted"]), (1, 2))
+            self.assertEqual(store.state["recoveryAttemptGrants"][assignment["id"]], 1)
 
     def test_exhausted_publication_recovers_existing_candidates_without_worker_attempts(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1215,6 +1398,16 @@ class DeterministicCoreTests(unittest.TestCase):
     def test_runtime_progress_is_compact_when_idle(self):
         state = {"workerLimit": 3, "taskTotal": 5, "taskStates": {}, "activeProcesses": {}}
         self.assertEqual(run.runtime_progress(state, []), "tasks 0/5 integrated | bugs 0 | agents 0/3 | idle")
+
+    def test_status_shows_pre_review_repairs_in_shared_budgets(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            store.state["taskStates"]["TASK-0001"] = {"phase": "validation-repair-1", "validationRepairAttemptsStarted": 1, "validationRepairCallsStarted": 2}
+            store.save()
+            output = io.StringIO()
+            with patch("sys.stdout", output):
+                self.assertEqual(status.main(["--repo", root]), 0)
+            self.assertIn("fixes=1/2 review-calls=2/9", output.getvalue())
 
     def test_runtime_progress_counts_running_and_queued_agents_once(self):
         state = {
