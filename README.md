@@ -170,7 +170,7 @@ Relay honors existing tracked or untracked `AGENTS.md`. Its generic template lim
 
 ### Build and review
 
-`run.py` initializes the active ledgers and state and excludes coordinator runtime files from Git. Ready tasks run concurrently only after dependencies complete and only when allowed paths do not overlap. Each Worker is the sole write-capable role in its isolated branch and worktree and must commit locally. Relay checks ancestry, reported SHA, and changed paths, then runs focused validation once followed by campaign validation once. Repeating the same stable failure twice for one candidate trips a circuit breaker.
+`run.py` initializes the active ledgers and state and excludes coordinator runtime files from Git. Ready tasks run concurrently only after dependencies complete and only when allowed paths do not overlap. Each Worker is the sole write-capable role in its isolated branch and worktree and must commit locally. Relay checks ancestry, reported SHA, and changed paths, then runs focused validation once followed by campaign validation once. After ordinary attempts are exhausted, or the same stable failure repeats twice, Relay automatically repairs a clean candidate within the remaining shared fix-loop budget. A timed-out command first replays once on the unchanged candidate.
 
 Relay pushes a validated candidate, creates or recovers one PR, runs two independent read-only reviews, and makes one triage decision. Accepted blockers enter bounded Worker repair and focused verification. The reviewed SHA must remain unchanged and provider checks and approvals must pass before merge. Completed worktrees and local branches are removed.
 
@@ -243,7 +243,7 @@ Copy the exact printed `NEXT` command after inspecting its cited evidence; it in
 | Situation | Action |
 | --- | --- |
 | Baseline failure | Fix the recorded external condition and use the printed replay. No Worker attempt was consumed. |
-| Candidate validation failure | Inspect the exact command and log; use the printed replay, recovery, or grant action. |
+| Candidate validation failure | Relay spends ordinary attempts first, then remaining shared repairs; a timeout replays once before repair. After exhaustion, inspect the exact command and log and use the printed recovery or grant action. |
 | Provider wait | Use `status.py`, satisfy the external check or approval, then run the printed resume command. |
 | Provider publication failure | Restore access, preview the printed publication recovery, confirm it, then follow `NEXT`. |
 | Worktree setup failure | Inspect the path/SHA evidence and use only the previewed recovery action. |
@@ -251,7 +251,7 @@ Copy the exact printed `NEXT` command after inspecting its cited evidence; it in
 | Legacy campaign | Preview migration, confirm only the offered archive-and-handoff, then plan from the printed `HANDOFF.md` command. |
 | Cleanup refusal | Resolve active worktrees or open Relay PRs, then follow the printed cleanup preview and confirmation. |
 
-Validation failures record the command, category, outcome, affected assignments, required external change, and `.relay/logs/` path. A failed initial validation consumes its task-attempt budget; repair validation consumes the shared repair budget. Blockers are grouped by category, command hash, and outcome.
+Validation failures record the command, category, outcome, affected assignments, required external change, and `.relay/logs/` path. A failed initial validation consumes its task-attempt budget; automatic validation repair consumes the same shared fix-loop and review-call budgets used by review, integration, and provider repairs. Blockers are grouped by category, command hash, and outcome.
 
 Schema-v2 campaigns without campaign validation are readable but cannot execute. Migration runs each shared validation command once at the historical base and offers archive-and-handoff only for a confirmed baseline defect. Confirmation creates immutable `relay/archive/<campaign>/<task>` refs, verifies a byte-stable archive and managed `HANDOFF.md`, then removes old worktrees and active ledgers. Relay validates markers, hashes, ancestry, and refs, preserves seed metadata, promotes the shared full-build command, and requires seeded Workers to reapply archived diffs onto a newly planned base.
 
