@@ -1,5 +1,9 @@
 # Relay
 
+<p align="center">
+  <img src="assets/relay-icon.png" alt="Relay" width="180">
+</p>
+
 Relay is a bounded, resumable coordinator that turns requirements into isolated GitHub or Azure DevOps Services pull requests. It plans work, dispatches constrained coding agents, validates their commits, reviews candidates, merges approved PRs, and runs one finite post-build audit.
 
 Relay is four directly executable Python scripts. It uses only the Python 3.11 standard library and shells out to `git`, `codex`, and either `gh` or `az`.
