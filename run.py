@@ -3088,17 +3088,21 @@ def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[
     executable = sys.executable
     run_path = str(Path(__file__).resolve())
     repo = state["repository"]
+    def recovery_commands(*extra: str) -> tuple[str, str]:
+        command = [executable, run_path, "--repo", repo, "--recover", *extra]
+        return _shell_join(command), _shell_join([*command, "--confirm"])
     baseline = state.get("baselineValidation") or {}
     if baseline.get("phase") == "blocked":
         if baseline.get("automaticReplayUsed"):
-            recover = _shell_join([executable, run_path, "--repo", repo, "--recover"])
-            next_line = f"Baseline command {baseline.get('currentCommand')} failed after its safe replay; inspect {baseline.get('log') or baseline.get('validationLog') or 'the baseline log'}. No task attempts were consumed. Preview an explicit replay with: {recover}"
+            recover, confirm = recovery_commands()
+            next_line = f"Baseline command {baseline.get('currentCommand')} failed after its safe replay; inspect {baseline.get('log') or baseline.get('validationLog') or 'the baseline log'}. No task attempts were consumed. Preview an explicit replay with: {recover}; then confirm with: {confirm}"
         else:
             resume = _shell_join([executable, run_path, "--repo", repo])
             next_line = f"Baseline command {baseline.get('currentCommand')} failed; inspect {baseline.get('log') or baseline.get('validationLog') or 'the baseline log'}. No task attempts were consumed. Correct the external baseline defect, then replay once with: {resume}"
     elif state.get("phase") == "complete":
         cleanup = _shell_join([executable, run_path, "--repo", repo, "--cleanup"])
-        next_line = f"Review {Path(repo) / 'BACKLOG.md'}, then preview cleanup with: {cleanup}" if bug_counts["backlog"] else f"Preview cleanup with: {cleanup}"
+        confirm_cleanup = _shell_join([executable, run_path, "--repo", repo, "--cleanup", "--confirm"])
+        next_line = f"Review {Path(repo) / 'BACKLOG.md'}, then preview cleanup with: {cleanup}; then confirm with: {confirm_cleanup}" if bug_counts["backlog"] else f"Preview cleanup with: {cleanup}; then confirm with: {confirm_cleanup}"
     elif state.get("phase") == "waiting-provider":
         pending = sorted(assignment_id for assignment_id, value in task_states.items() if value.get("phase") == "waiting-provider")
         resume = _shell_join([executable, run_path, "--repo", repo])
@@ -3107,11 +3111,12 @@ def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[
         next_line = f"Resume with: {_shell_join([executable, run_path, '--repo', repo])}"
     elif publication_blocked := sorted(assignment_id for assignment_id, value in task_states.items() if value.get("phase") == "needs-user" and _publication_retry_key(value.get("error"), assignment_id)):
         validation_blocked = sorted({assignment_id for group in validation_groups.values() for assignment_id in group["ids"]})
-        arguments = [executable, run_path, "--repo", repo, "--recover"]
+        arguments = []
         for assignment_id in validation_blocked:
             arguments += ["--grant-attempt", assignment_id]
         grants = f" and explicitly grant implementation attempts for {', '.join(validation_blocked)}" if validation_blocked else ""
-        next_line = f"Restore provider access, then preview safe publication recovery for {', '.join(publication_blocked)}{grants} with: {_shell_join(arguments)}"
+        preview, confirm = recovery_commands(*arguments)
+        next_line = f"Restore provider access, then preview safe publication recovery for {', '.join(publication_blocked)}{grants} with: {preview}; then confirm with: {confirm}"
     elif validation_groups:
         replayable = sorted(assignment_id for assignment_id, value in task_states.items() if value.get("phase") == "needs-user" and value.get("terminalValidationCandidateSha") and not value.get("terminalValidationReplayUsed"))
         if replayable:
@@ -3124,13 +3129,15 @@ def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[
             arguments.append("--confirm")
             next_line = f"Grant new implementation attempts explicitly with: {_shell_join(arguments)}"
     elif setup_blocked := sorted(assignment_id for assignment_id, value in task_states.items() if value.get("phase") == "needs-user" and _worktree_setup_failure(value.get("error"))):
-        next_line = f"Preview safe worktree setup recovery for {', '.join(setup_blocked)} with: {_shell_join([executable, run_path, '--repo', repo, '--recover'])}"
+        preview, confirm = recovery_commands()
+        next_line = f"Preview safe worktree setup recovery for {', '.join(setup_blocked)} with: {preview}; then confirm with: {confirm}"
     else:
         groups: dict[str, list[str]] = {}
         for assignment_id, reason in blocked_assignments(state):
             groups.setdefault(_normalized_error(reason), []).append(assignment_id)
         blockers = "; ".join(f"{reason}: {', '.join(sorted(ids))}" for reason, ids in sorted(groups.items()))
-        next_line = f"Inspect blockers ({blockers}) and preview recovery with: {_shell_join([executable, run_path, '--repo', repo, '--recover'])}"
+        preview, confirm = recovery_commands()
+        next_line = f"Inspect blockers ({blockers}) and preview recovery with: {preview}; then confirm with: {confirm}"
     return lines, next_line
 
 
@@ -3170,7 +3177,8 @@ def report_legacy_refusal(store: StateStore) -> None:
     for group in groups:
         stderr_event("BLOCKED", f"category={group['category']} command={group['command']} outcome={group['outcome']} assignments={','.join(group['assignmentIds'])}")
     command = _shell_join([sys.executable, str(Path(__file__).resolve()), "--repo", store.state["repository"], "--recover"])
-    stderr_event("NEXT", f"Preview legacy migration with: {command}")
+    confirm = _shell_join([sys.executable, str(Path(__file__).resolve()), "--repo", store.state["repository"], "--recover", "--confirm"])
+    stderr_event("NEXT", f"Preview legacy migration with: {command}; then confirm with: {confirm}")
 
 
 def permanent_cleanup(repo: Path, confirm: bool) -> int:

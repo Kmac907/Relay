@@ -678,6 +678,8 @@ class DeterministicCoreTests(unittest.TestCase):
         self.assertLess(next(index for index, line in enumerate(lines) if "TASK-0001" in line), next(index for index, line in enumerate(lines) if "TASK-0002" in line))
         self.assertIn("backlog=1", lines[0])
         self.assertIn("BACKLOG.md", next_line)
+        self.assertIn("then confirm with:", next_line)
+        self.assertIn("--cleanup --confirm", next_line)
 
     def test_campaign_validation_recovery_next_command_confirms_attempt_grant(self):
         task = ContractTests().task()
@@ -1823,6 +1825,8 @@ class FakeEndToEndTests(unittest.TestCase):
             self.assertIn("SUMMARY    tasks=1/1 completed", completed.stderr)
             self.assertIn("SUMMARY    - BASELINE passed:", completed.stderr)
             self.assertIn("NEXT       Preview cleanup with:", completed.stderr)
+            self.assertIn("then confirm with:", completed.stderr)
+            self.assertIn("--cleanup --confirm", completed.stderr)
             self.assertFalse((target / "BACKLOG.md").exists())
             self.assertEqual(len(list(provider.glob("*.json"))), 2)
             records = [json.loads(path.read_text()) for path in provider.glob("*.json")]
