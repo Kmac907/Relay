@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import shutil
+import site
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,7 @@ TERMINAL_REVIEW_PHASES = {"approved", "needs-user"}
 CHILD_LOCK = threading.Lock()
 ACTIVE_CHILDREN: set[subprocess.Popen] = set()
 STATE_SCHEMA_VERSION = 2
+ORIGINAL_PYTHON_USER_SITE = site.getusersitepackages()
 
 AGENT_SCHEMAS = {
     "worker": {"mode": str, "assignmentId": str, "status": str, "candidateSha": str, "validation": list, "summary": str},
@@ -584,9 +586,9 @@ def validation_command(command: str) -> list[str]:
     return ["/bin/sh", "-c", command]
 
 
-def run_validation_command(command: list[str], *, timeout: int, cwd: Path | None = None) -> subprocess.CompletedProcess:
+def run_validation_command(command: list[str], *, timeout: int, cwd: Path | None = None, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     with tempfile.TemporaryDirectory(prefix="relay-validation-") as temporary:
-        environment = os.environ.copy()
+        environment = (os.environ if env is None else env).copy()
         environment.update(TEMP=temporary, TMP=temporary, TMPDIR=temporary)
         return bounded_run(command, cwd=cwd, env=environment, check=False, timeout=timeout)
 
@@ -616,6 +618,47 @@ def safe_within(path: Path, root: Path) -> Path:
     if resolved != resolved_root and resolved_root not in resolved.parents:
         raise ValueError(f"path escapes safe root: {resolved}")
     return resolved
+
+
+def campaign_temp_root(state: dict) -> Path:
+    root = Path(tempfile.gettempdir()).resolve() / "relay-worktrees"
+    return safe_within(root / state["campaignId"], root)
+
+
+def assignment_environment(store: StateStore, assignment_id: str) -> dict[str, str]:
+    campaign_root = campaign_temp_root(store.state)
+    user_base = safe_within(campaign_root / ".python-user-bases" / assignment_id, campaign_root)
+    user_base.mkdir(parents=True, exist_ok=True)
+    worktree_root = Path(tempfile.gettempdir()).resolve() / "relay-worktrees"
+    existing = os.environ.get("PYTHONPATH")
+    entries = [ORIGINAL_PYTHON_USER_SITE, *(existing.split(os.pathsep) if existing is not None else [])]
+    python_path = []
+    for entry in entries:
+        if not entry:
+            python_path.append(entry)
+            continue
+        resolved = Path(entry).resolve()
+        if resolved == worktree_root or worktree_root in resolved.parents:
+            continue
+        if os.path.normcase(str(resolved)) not in {os.path.normcase(str(Path(item).resolve())) for item in python_path if item}:
+            python_path.append(entry)
+    environment = os.environ.copy()
+    environment.update(PYTHONUSERBASE=str(user_base), PYTHONPATH=os.pathsep.join(python_path))
+    return environment
+
+
+def cleanup_assignment_environment(store: StateStore, assignment_id: str) -> None:
+    campaign_root = campaign_temp_root(store.state)
+    user_base = safe_within(campaign_root / ".python-user-bases" / assignment_id, campaign_root)
+    if user_base.exists():
+        shutil.rmtree(user_base)
+
+
+def cleanup_campaign_environment(state: dict) -> None:
+    campaign_root = campaign_temp_root(state)
+    environments = safe_within(campaign_root / ".python-user-bases", campaign_root)
+    if environments.exists():
+        shutil.rmtree(environments)
 
 
 def repository_layout(repo: Path, timeout: int = 300) -> tuple[Path, str]:
@@ -957,7 +1000,7 @@ def invoke_agent(store: StateStore, semaphore: threading.Semaphore, repo: Path, 
             store.update(lambda state: state["activeProcesses"][process_id].update(status="running", startedAt=datetime.now(timezone.utc).isoformat()))
             start_operation(store, assignment_id, operation, store.state["agentTimeoutSeconds"])
             console("START", f"operation={operation}" + (f" mode={mode}" if mode else "") + f" assignment={assignment_id} call={number} deadline={store.state['agentTimeoutSeconds']}s")
-            completed = bounded_run(command, input=prompt, timeout=store.state["agentTimeoutSeconds"])
+            completed = bounded_run(command, input=prompt, timeout=store.state["agentTimeoutSeconds"], env=assignment_environment(store, assignment_id))
         atomic_write(log, completed.stdout + ("\n--- stderr ---\n" + completed.stderr if completed.stderr else ""))
         if completed.returncode or not output.is_file():
             raise RuntimeError(f"{role} failed with exit code {completed.returncode}; log: {log}")
@@ -1084,7 +1127,7 @@ def run_validations(store: StateStore, assignment: dict, worktree: Path, categor
         middle = "" if category == "task" else f"-{category}"
         log = store.path.parent / "logs" / f"{assignment_id}{middle}-validation-{started['number']}.log"
         try:
-            completed = run_validation_command(shell, cwd=worktree, timeout=store.state["validationTimeoutSeconds"])
+            completed = run_validation_command(shell, cwd=worktree, timeout=store.state["validationTimeoutSeconds"], env=assignment_environment(store, assignment_id))
             exit_code, stdout, stderr = str(completed.returncode), completed.stdout, completed.stderr
         except subprocess.TimeoutExpired as error:
             exit_code, stdout, stderr = "timeout", _output(error.stdout), _output(error.stderr)
@@ -1532,17 +1575,71 @@ def update_pr_metadata(store: StateStore, assignment: dict, pr: dict, sha: str) 
     return pr
 
 
+def persist_pr_inspection(store: StateStore, assignment_id: str, pr: dict) -> None:
+    def persist(state: dict) -> None:
+        task_state = state["taskStates"][assignment_id]
+        task_state["pr"] = pr
+        state["pullRequests"][assignment_id] = pr
+        if pr["headRefOid"] == task_state.get("pushedSha"):
+            task_state["publicationProof"] = {"candidateSha": pr["headRefOid"], "providerRecord": pr}
+        else:
+            task_state.pop("publicationProof", None)
+    store.update(persist)
+
+
+def inspect_pr_head(store: StateStore, assignment_id: str, identifier: str | int, sha: str, key: str) -> dict:
+    target = _operation_target(store.state, assignment_id) or {}
+    deadline = target.get("operationDeadline", time.time() + store.state["providerTimeoutSeconds"])
+    while True:
+        pr = pr_inspect(store, key, identifier)
+        persist_pr_inspection(store, assignment_id, pr)
+        if pr["headRefOid"] == sha:
+            return pr
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise RuntimeError("provider pull request source commit does not match candidate")
+        time.sleep(min(1, remaining))
+
+
+def inspect_merged_pr(store: StateStore, assignment_id: str, identifier: str | int, sha: str) -> dict:
+    target = _operation_target(store.state, assignment_id) or {}
+    deadline = target.get("operationDeadline", time.time() + store.state["providerTimeoutSeconds"])
+    key = f"{assignment_id}:merge-proof:{sha}"
+    while True:
+        pr = pr_inspect(store, key, identifier)
+        persist_pr_inspection(store, assignment_id, pr)
+        if pr["headRefOid"] != sha:
+            raise RuntimeError("provider pull request source commit does not match candidate")
+        if pr["state"] == "MERGED":
+            return pr
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise RuntimeError("provider merge proof deadline expired")
+        time.sleep(min(1, remaining))
+
+
+def validate_publication_proof(store: StateStore, assignment: dict, sha: str, *, merged: bool = False) -> dict:
+    assignment_id = assignment["id"]
+    task_state = store.state["taskStates"][assignment_id]
+    title, _body, metadata_hash = canonical_pr_metadata(store.state, assignment, sha)
+    metadata = task_state.get("prMetadata")
+    proof = task_state.get("publicationProof")
+    record = proof.get("providerRecord") if isinstance(proof, dict) else None
+    expected = {"hash": metadata_hash, "candidateSha": sha, "sourceRef": assignment.get("sourceRef"), "title": title}
+    if not isinstance(proof, dict) or task_state.get("pushedSha") != sha or metadata != expected or proof.get("candidateSha") != sha:
+        raise RuntimeError("provider publication proof does not match reviewed candidate")
+    if not isinstance(record, dict) or record.get("headRefOid") != sha or (merged and record.get("state") != "MERGED"):
+        raise RuntimeError("provider publication proof does not match reviewed candidate")
+    return record
+
+
 def mark_integrated(store: StateStore, assignment: dict, pr: dict, reviewed_sha: str, provider_status: str) -> None:
     assignment_id = assignment["id"]
-    title, _body, metadata_hash = canonical_pr_metadata(store.state, assignment, reviewed_sha)
+    _title, _body, metadata_hash = canonical_pr_metadata(store.state, assignment, reviewed_sha)
     _subject, _merge_body, merge_hash = canonical_merge_metadata(store.state, assignment, reviewed_sha)
-    task_state = store.state["taskStates"][assignment_id]
-    metadata = task_state.get("prMetadata")
-    current_pr = task_state.get("pr") or store.state["pullRequests"].get(assignment_id) or pr
-    expected = {"hash": metadata_hash, "candidateSha": reviewed_sha, "sourceRef": assignment.get("sourceRef"), "title": title}
-    if metadata != expected or current_pr.get("headRefOid") != reviewed_sha:
-        raise RuntimeError("provider metadata does not match reviewed candidate")
-    record = {**current_pr, "state": "MERGED", "headRefOid": reviewed_sha}
+    record = validate_publication_proof(store, assignment, reviewed_sha, merged=True)
+    if pr.get("number") != record.get("number"):
+        raise RuntimeError("provider publication proof does not match reviewed candidate")
     proof = {
         "finalCandidate": reviewed_sha, "sourceRef": assignment.get("sourceRef"),
         "prMetadataHash": metadata_hash, "mergeMetadataHash": merge_hash, "mergedProviderRecord": record,
@@ -1563,11 +1660,9 @@ def publish_candidate(store: StateStore, assignment: dict, worktree: Path, branc
         store.update(lambda state: state["taskStates"][assignment_id].update(pushed=True, pushedSha=sha))
         console("DONE", f"operation=publish assignment={assignment_id} branch={branch}")
     if task_state.get("pr"):
-        pr = pr_inspect(store, f"{assignment_id}:pr-refresh:{sha}", task_state["pr"]["number"])
-        if pr["headRefOid"] != sha:
-            raise RuntimeError("provider pull request source commit does not match candidate")
-        store.update(lambda state: (state["taskStates"][assignment_id].__setitem__("pr", pr), state["pullRequests"].__setitem__(assignment_id, pr)))
+        pr = inspect_pr_head(store, assignment_id, task_state["pr"]["number"], sha, f"{assignment_id}:pr-refresh:{sha}")
         update_pr_metadata(store, assignment, pr, sha)
+        validate_publication_proof(store, assignment, sha)
         clear_operation(store, assignment_id, "publish")
         return pr
     body = store.path.parent / f".{assignment_id}-pr.md"
@@ -1581,10 +1676,9 @@ def publish_candidate(store: StateStore, assignment: dict, worktree: Path, branc
             raise RuntimeError("provider pull request source commit does not match candidate")
         if pr is None:
             pr = pr_create(store, f"{assignment_id}:pr-create", branch, title, body)
-        if pr["headRefOid"] != sha:
-            raise RuntimeError("provider pull request source commit does not match candidate")
-        store.update(lambda state: (state["taskStates"][assignment_id].__setitem__("pr", pr), state["pullRequests"].__setitem__(assignment_id, pr)))
+        pr = inspect_pr_head(store, assignment_id, pr["number"], sha, f"{assignment_id}:pr-refresh:{sha}")
         update_pr_metadata(store, assignment, pr, sha)
+        validate_publication_proof(store, assignment, sha)
         console("DONE", f"operation=pull-request assignment={assignment_id} pr={pr.get('number')}")
         clear_operation(store, assignment_id, "publish")
         return pr
@@ -1806,6 +1900,8 @@ def wait_for_checks(store: StateStore, assignment_id: str, pr: dict, reviewed_sh
             continue
         data = _provider_json(view)
         current = normalize_pr(store.state, data) if store.state.get("provider") == "azure-devops" else data
+        if assignment_id in store.state.get("taskStates", {}):
+            persist_pr_inspection(store, assignment_id, current)
         if current.get("headRefOid") != reviewed_sha:
             progress("sha-drift", next_action="repair")
             return "sha-drift"
@@ -1924,7 +2020,7 @@ def merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignme
             result = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt("repair", assignment, reviewed_sha, blocker, store.state["taskStates"][assignment_id].get("error", "")), mode="repair", review=True)
             store.update(lambda state: state["taskStates"][assignment_id].update(**({"workerSummary": result["summary"]} if result.get("summary") is not None else {}), pendingWorkerSha=result["candidateSha"]))
             replacement = validate_candidate(store, assignment, worktree, result)
-            publish_candidate(store, assignment, worktree, branch, replacement)
+            pr = publish_candidate(store, assignment, worktree, branch, replacement)
             verification = invoke_with_replacements(store, semaphore, worktree, assignment_id, "verification-reviewer", role_prompt("verification-reviewer", assignment, replacement, {"previousCandidate": reviewed_sha, "repairDiff": f"{reviewed_sha}..{replacement}", "providerFailure": status}), review=True)
             if verification["candidateSha"] != replacement:
                 raise ValueError("verification reviewer changed candidate SHA")
@@ -1951,6 +2047,8 @@ def merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignme
         provider_approve(store, assignment_id, pr, reviewed_sha)
         status = wait_for_checks(store, assignment_id, pr, reviewed_sha)
     if status == "merged":
+        current = store.state["taskStates"][assignment_id]["pr"]
+        update_pr_metadata(store, assignment, current, reviewed_sha)
         mark_integrated(store, assignment, pr, reviewed_sha, "passed")
         console("DONE", f"operation=merge assignment={assignment_id} pr={pr['number']} source=provider")
         clear_operation(store, assignment_id)
@@ -1960,14 +2058,16 @@ def merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignme
         start_operation(store, assignment_id, "merge-bypass", store.state["providerTimeoutSeconds"])
         console("START", f"operation=merge-bypass assignment={assignment_id} pr={pr['number']} deadline={store.state['providerTimeoutSeconds']}s")
         try:
+            validate_publication_proof(store, assignment, reviewed_sha)
             pr_merge(store, f"{assignment_id}:merge-bypass:{reviewed_sha}", pr["number"], reviewed_sha, merge_subject, merge_body)
+            merged_pr = inspect_merged_pr(store, assignment_id, pr["number"], reviewed_sha)
         except (RuntimeError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
             provider_status = f"merge-bypass-denied; log: {log}"
             store.update(lambda state: state["taskStates"][assignment_id].update(phase="waiting-provider", providerStatus=provider_status))
             console("BLOCKED", f"operation=merge-bypass assignment={assignment_id} pr={pr['number']} reason=denied log={log}")
             clear_operation(store, assignment_id, "merge-bypass")
             return False
-        mark_integrated(store, assignment, pr, reviewed_sha, "bypassed")
+        mark_integrated(store, assignment, merged_pr, reviewed_sha, "bypassed")
         console("DONE", f"operation=merge-bypass assignment={assignment_id} pr={pr['number']}")
         clear_operation(store, assignment_id, "merge-bypass")
         return True
@@ -1978,8 +2078,16 @@ def merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignme
         return False
     start_operation(store, assignment_id, "merge", store.state["providerTimeoutSeconds"])
     console("START", f"operation=merge assignment={assignment_id} pr={pr['number']} deadline={store.state['providerTimeoutSeconds']}s")
+    validate_publication_proof(store, assignment, reviewed_sha)
     pr_merge(store, f"{assignment_id}:merge", pr["number"], subject=merge_subject, body=merge_body)
-    mark_integrated(store, assignment, pr, reviewed_sha, "passed")
+    try:
+        merged_pr = inspect_merged_pr(store, assignment_id, pr["number"], reviewed_sha)
+    except (RuntimeError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
+        provider_status = f"merge-proof-pending; log: {store.path.parent / 'logs' / 'provider.log'}"
+        store.update(lambda state: state["taskStates"][assignment_id].update(phase="waiting-provider", providerStatus=provider_status))
+        clear_operation(store, assignment_id, "merge")
+        return False
+    mark_integrated(store, assignment, merged_pr, reviewed_sha, "passed")
     console("DONE", f"operation=merge assignment={assignment_id} pr={pr['number']}")
     clear_operation(store, assignment_id, "merge")
     return True
@@ -1993,8 +2101,11 @@ def cleanup_worktree(store: StateStore, assignment_id: str) -> None:
         root = Path(tempfile.gettempdir()).resolve() / "relay-worktrees" / store.state["campaignId"]
         path = safe_within(Path(record.get("root", record["path"])), root)
         repository = Path(store.state["repository"])
-        git(repository, "worktree", "remove", "--force", str(path), timeout=store.state["providerTimeoutSeconds"], check=False)
+        removed = git(repository, "worktree", "remove", "--force", str(path), timeout=store.state["providerTimeoutSeconds"], check=False)
+        if removed.returncode and path.exists():
+            return
         git(repository, "branch", "-D", record["branch"], timeout=store.state["providerTimeoutSeconds"], check=False)
+        cleanup_assignment_environment(store, assignment_id)
         store.state["worktrees"].pop(assignment_id, None)
         store.save()
 
@@ -2012,6 +2123,7 @@ def cleanup_baseline_worktree(store: StateStore) -> None:
         removed = git(repository_root, "worktree", "remove", "--force", str(root), timeout=store.state["validationTimeoutSeconds"], check=False)
         if removed.returncode and root.exists():
             return
+        cleanup_assignment_environment(store, "BASELINE")
         store.state.get("worktrees", {}).pop("BASELINE", None)
         store.save()
 
@@ -2154,11 +2266,10 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
             clear_operation(store, assignment_id)
             return False
         session = store.state["reviewSessions"][assignment_id]
+        pr = publish_candidate(store, assignment, worktree, branch, session["reviewedSha"])
         task_state["phase"] = "approved"
         store.save()
         console("DONE", f"operation=internal-review assignment={assignment_id} result=approved sha={session['reviewedSha'][:12]}")
-        if task_state.get("pushedSha") != session["reviewedSha"]:
-            pr = publish_candidate(store, assignment, worktree, branch, session["reviewedSha"])
         if not merge_assignment(store, semaphore, assignment, worktree, branch, pr, session["reviewedSha"]):
             return False
         if mode == "task":
@@ -2615,6 +2726,24 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str], gra
         if assignment_id not in by_id or task_state.get("phase") != "needs-user":
             continue
         assignment = by_id[assignment_id]
+        session = store.state.get("reviewSessions", {}).get(assignment_id)
+        repair = task_state.get("terminalValidationReviewRepair")
+        failure = task_state.get("validationFailure")
+        candidate = task_state.get("terminalValidationCandidateSha")
+        if session and session.get("phase") == "needs-user" and isinstance(repair, int) and isinstance(failure, dict) and candidate:
+            if task_state.get("reviewValidationReplayIdentity"):
+                continue
+            worktree, _ = recovery_worktree(store, assignment_id)
+            head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
+            dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout
+            if head != candidate or dirty or session.get("repairAttemptsStarted") != repair or not session.get("previousCandidateSha"):
+                raise RuntimeError(f"cannot resume review validation: {assignment_id}")
+            actions.append({
+                "action": "resume-review-validation", "assignmentId": assignment_id,
+                "headSha": head, "repair": repair, "commandHash": failure.get("commandHash"),
+            })
+            handled.add(assignment_id)
+            continue
         if assignment_id in grants:
             worktree, _ = recovery_worktree(store, assignment_id)
             head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
@@ -2672,7 +2801,6 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str], gra
                 actions.append({"action": "adopt-user-deletions", "assignmentId": assignment_id, "headSha": head, "paths": outside})
                 handled.add(assignment_id)
                 continue
-        session = store.state.get("reviewSessions", {}).get(assignment_id)
         if not session:
             continue
         accepted = set(session.get("acceptedBlockerIds", []))
@@ -2861,6 +2989,7 @@ def archive_and_handoff(store: StateStore, action: dict) -> Path:
         removed = git(repository_root, "worktree", "remove", "--force", str(root), timeout=timeout, check=False)
         if removed.returncode and root.exists():
             raise RuntimeError(f"failed to remove archived worktree: {assignment_id}")
+        cleanup_assignment_environment(store, assignment_id)
         store.state["worktrees"].pop(assignment_id, None)
         store.save()
     for ledger in (repo / "tasks.md", repo / "bugs.md"):
@@ -2875,6 +3004,7 @@ def finish_archive_cleanup(store: StateStore) -> None:
     repo = Path(store.state["repository"]).resolve()
     relay = safe_within(store.path.parent, repo)
     if relay.exists():
+        cleanup_campaign_environment(store.state)
         shutil.rmtree(relay)
 
 
@@ -2945,6 +3075,21 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
             store.state["reviewSessions"][assignment_id]["phase"] = f"repair-{action['repair']}"
             task_state.update(phase=f"repair-{action['repair']}")
             task_state.pop("error", None)
+        elif action["action"] == "resume-review-validation":
+            worktree, _ = recovery_worktree(store, assignment_id)
+            head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
+            dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout
+            session = store.state["reviewSessions"][assignment_id]
+            failure = task_state.get("validationFailure") or {}
+            identity = {"candidateSha": action["headSha"], "commandHash": action["commandHash"], "repairNumber": action["repair"]}
+            if head != action["headSha"] or dirty or session.get("phase") != "needs-user" or session.get("repairAttemptsStarted") != action["repair"] or failure.get("commandHash") != action["commandHash"] or task_state.get("reviewValidationReplayIdentity"):
+                raise RuntimeError(f"review validation recovery state changed: {assignment_id}")
+            task_state["reviewValidationReplayIdentity"] = identity
+            store.save()
+            validate_candidate(store, by_id[assignment_id], worktree, {"candidateSha": head})
+            session.update(phase=f"verify-{action['repair']}", currentCandidateSha=head, pendingRepairSha=head, pendingRepairNumber=action["repair"])
+            task_state.update(phase=f"verify-{action['repair']}")
+            task_state.pop("error", None)
         elif action["action"] == "resume-audit-validation":
             worktree, _ = recovery_worktree(store, assignment_id)
             head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
@@ -3010,6 +3155,8 @@ def prepare_terminal_validation_replays(store: StateStore) -> None:
         candidate = task_state.get("terminalValidationCandidateSha")
         if task_state.get("phase") != "needs-user" or not candidate or task_state.get("terminalValidationReplayUsed"):
             continue
+        if task_state.get("terminalValidationReviewRepair") is not None:
+            continue
         try:
             worktree, record = recovery_worktree(store, assignment_id)
             head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
@@ -3030,16 +3177,8 @@ def prepare_terminal_validation_replays(store: StateStore) -> None:
                 task_state["terminalValidationReplayUsed"] = True
                 changed = True
                 continue
-            repair = task_state.get("terminalValidationReviewRepair")
-            if repair is not None:
-                session = store.state.get("reviewSessions", {}).get(assignment_id)
-                if not session or session.get("phase") != "needs-user":
-                    raise RuntimeError("saved repair validation session changed")
-                session.update(phase=f"repair-{repair}", pendingWorkerSha=candidate)
-                task_state.update(phase=f"repair-{repair}", terminalValidationReplayUsed=True)
-            else:
-                task_state.update(phase="candidate-validation", pendingWorkerSha=candidate, terminalValidationReplayUsed=True, terminalValidationReplayInProgress=True)
-                task_state.pop("validationCircuitBroken", None)
+            task_state.update(phase="candidate-validation", pendingWorkerSha=candidate, terminalValidationReplayUsed=True, terminalValidationReplayInProgress=True)
+            task_state.pop("validationCircuitBroken", None)
         except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
             task_state["error"] = f"terminal candidate replay blocked: {error}"
         changed = True
@@ -3389,6 +3528,8 @@ def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[
     def recovery_commands(*extra: str) -> tuple[str, str]:
         command = [executable, run_path, "--repo", repo, "--recover", *extra]
         return _shell_join(command), _shell_join([*command, "--confirm"])
+    review_validation = sorted(assignment_id for assignment_id, value in task_states.items() if value.get("phase") == "needs-user" and value.get("terminalValidationReviewRepair") is not None)
+    review_replayable = [assignment_id for assignment_id in review_validation if not task_states[assignment_id].get("reviewValidationReplayIdentity")]
     baseline = state.get("baselineValidation") or {}
     if baseline.get("phase") == "blocked":
         if baseline.get("automaticReplayUsed"):
@@ -3408,7 +3549,7 @@ def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[
     elif state.get("phase") == "interrupted":
         next_line = f"Resume with: {_shell_join([executable, run_path, '--repo', repo])}"
     elif publication_blocked := sorted(assignment_id for assignment_id, value in task_states.items() if value.get("phase") == "needs-user" and _publication_retry_key(value.get("error"), assignment_id)):
-        validation_blocked = sorted({assignment_id for group in validation_groups.values() for assignment_id in group["ids"]})
+        validation_blocked = sorted({assignment_id for group in validation_groups.values() for assignment_id in group["ids"]} - set(review_validation))
         arguments = []
         for assignment_id in validation_blocked:
             arguments += ["--grant-attempt", assignment_id]
@@ -3416,8 +3557,12 @@ def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[
         preview, confirm = recovery_commands(*arguments)
         next_line = f"Restore provider access, then preview safe publication recovery for {', '.join(publication_blocked)}{grants} with: {preview}; then confirm with: {confirm}"
     elif validation_groups:
-        replayable = sorted(assignment_id for assignment_id, value in task_states.items() if value.get("phase") == "needs-user" and value.get("terminalValidationCandidateSha") and not value.get("terminalValidationReplayUsed"))
-        if replayable:
+        if review_replayable:
+            preview, confirm = recovery_commands()
+            next_line = f"Preview preserved review validation recovery for {', '.join(review_replayable)} with: {preview}; then confirm with: {confirm}"
+        elif review_validation:
+            next_line = f"Review validation recovery is exhausted for {', '.join(review_validation)}; inspect the validation log and preserved candidate."
+        elif replayable := sorted(assignment_id for assignment_id, value in task_states.items() if value.get("phase") == "needs-user" and value.get("terminalValidationCandidateSha") and not value.get("terminalValidationReplayUsed")):
             next_line = f"Replay preserved validation for {', '.join(replayable)} with: {_shell_join([executable, run_path, '--repo', repo])}"
         else:
             blocked = sorted({assignment_id for group in validation_groups.values() for assignment_id in group["ids"]})
@@ -3542,6 +3687,7 @@ def permanent_cleanup(repo: Path, confirm: bool) -> int:
     bugs.unlink()
     for plan in plans:
         plan.unlink()
+    cleanup_campaign_environment(state)
     shutil.rmtree(relay)
     prefix = state.get("repositoryPrefix", "")
     found = git(root, "rev-parse", "--git-path", "info/exclude", check=False)

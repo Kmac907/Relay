@@ -622,7 +622,7 @@ class DeterministicCoreTests(unittest.TestCase):
     def provider_metadata(self, store, assignment, sha, pr):
         title, _body, digest = run.canonical_pr_metadata(store.state, assignment, sha)
         task_state = store.state["taskStates"].setdefault(assignment["id"], {})
-        task_state.update(candidateSha=sha, pr=pr, prMetadata={"hash": digest, "candidateSha": sha, "sourceRef": assignment.get("sourceRef"), "title": title})
+        task_state.update(candidateSha=sha, pushedSha=sha, pr=pr, publicationProof={"candidateSha": sha, "providerRecord": pr}, prMetadata={"hash": digest, "candidateSha": sha, "sourceRef": assignment.get("sourceRef"), "title": title})
         store.state["pullRequests"][assignment["id"]] = pr
 
     def test_validation_uses_explicit_platform_shells(self):
@@ -646,6 +646,59 @@ class DeterministicCoreTests(unittest.TestCase):
             run.run_validation_command(["shell", "second"], timeout=1)
         self.assertEqual(len(set(seen)), 2)
         self.assertTrue(all(not path.exists() for path in seen))
+
+    def test_assignment_python_environments_are_scoped_shared_and_do_not_mutate_parent(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            store.state["taskStates"][assignment["id"]] = {"phase": "implementing"}
+            user_site, outside = root / "user-site", root / "outside"
+            leaked = root / "relay-worktrees" / "other" / "TASK-9999"
+            for path in (user_site, outside, leaked):
+                path.mkdir(parents=True)
+            original = os.environ.copy()
+            captured = {}
+
+            def agent(command, **kwargs):
+                captured["worker"] = kwargs["env"]
+                output = Path(command[command.index("--output-last-message") + 1])
+                output.write_text(json.dumps({"mode": "task", "assignmentId": assignment["id"], "status": "candidate", "candidateSha": "abc", "validation": [], "summary": ""}), encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            def validation(_command, **kwargs):
+                captured["validation"] = kwargs["env"]
+                return subprocess.CompletedProcess([], 0, "", "")
+
+            with patch("run.tempfile.gettempdir", return_value=str(root)), patch.object(run, "ORIGINAL_PYTHON_USER_SITE", str(user_site)), patch.dict(os.environ, {"PYTHONPATH": os.pathsep.join((str(outside), str(leaked)))}, clear=False):
+                with patch("run.bounded_run", side_effect=agent):
+                    run.invoke_agent(store, threading.Semaphore(1), root, assignment["id"], "worker", "prompt", mode="task")
+                with patch("run.validation_command", return_value=["shell"]), patch("run.run_validation_command", side_effect=validation):
+                    run.run_validations(store, assignment, root, commands=["test"])
+                other = run.assignment_environment(store, "TASK-0002")
+                self.assertEqual(captured["worker"]["PYTHONUSERBASE"], captured["validation"]["PYTHONUSERBASE"])
+                self.assertNotEqual(captured["worker"]["PYTHONUSERBASE"], other["PYTHONUSERBASE"])
+                self.assertEqual(captured["worker"]["PYTHONPATH"].split(os.pathsep), [str(user_site), str(outside)])
+                run.cleanup_assignment_environment(store, assignment["id"])
+                self.assertFalse(Path(captured["worker"]["PYTHONUSERBASE"]).exists())
+            self.assertEqual(os.environ, original)
+
+    def test_original_user_site_is_importable_without_executing_editable_pth(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            store = self.state_store(root)
+            user_site, editable = root / "user-site", root / "editable"
+            user_site.mkdir(); editable.mkdir()
+            (user_site / "operator_tool.py").write_text("VALUE = 7\n", encoding="utf-8")
+            (editable / "sibling_assignment.py").write_text("LEAKED = True\n", encoding="utf-8")
+            (user_site / "sibling-editable.pth").write_text(str(editable) + "\n", encoding="utf-8")
+            with patch("run.tempfile.gettempdir", return_value=str(root)), patch.object(run, "ORIGINAL_PYTHON_USER_SITE", str(user_site)), patch.dict(os.environ, {"PYTHONPATH": ""}, clear=False):
+                environment = run.assignment_environment(store, "TASK-0001")
+                completed = run.run_validation_command([
+                    sys.executable, "-c",
+                    "import importlib.util, operator_tool; assert operator_tool.VALUE == 7; assert importlib.util.find_spec('sibling_assignment') is None",
+                ], timeout=10, cwd=root, env=environment)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_all_coordinator_validation_paths_use_isolated_runner(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1174,6 +1227,53 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual((task_state["phase"], task_state["pendingWorkerSha"]), ("candidate-validation", "candidate"))
             self.assertTrue(task_state["terminalValidationReplayUsed"])
             self.assertEqual(store.state["attemptCounters"], {})
+
+    def test_terminal_review_validation_recovery_replays_candidate_without_worker_or_budget_changes(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            store.state["phase"] = "needs-user"
+            store.state["attemptCounters"][assignment["id"]] = 3
+            store.state["recoveryAttemptGrants"] = {assignment["id"]: 1}
+            store.state["recoveryAttemptsStarted"] = {assignment["id"]: 0}
+            store.state["taskStates"][assignment["id"]] = {
+                "phase": "needs-user", "candidateSha": "old", "validationCandidateSha": "new",
+                "terminalValidationCandidateSha": "new", "terminalValidationReviewRepair": 2,
+                "validationFailure": {"category": "campaign", "command": "build", "commandHash": "hash", "outcome": "exit:1"},
+                "validationRepairAttemptsStarted": 0, "validationRepairCallsStarted": 0,
+            }
+            history = {"contract-reviewer": {"findings": []}}
+            store.state["reviewSessions"][assignment["id"]] = {
+                "phase": "needs-user", "initialCandidateSha": "old", "currentCandidateSha": "old", "previousCandidateSha": "old",
+                "acceptedBlockerIds": [], "repairAttemptsStarted": 2, "reviewCallsStarted": 5, "reviewCallLimit": 9,
+                "initialResults": history,
+            }
+            store.state["worktrees"][assignment["id"]] = {"baseSha": "base", "branch": "branch", "path": root}
+            counters = (dict(store.state["attemptCounters"]), dict(store.state["recoveryAttemptGrants"]), dict(store.state["recoveryAttemptsStarted"]), 2, 5)
+
+            def recovery_git(_repo, *args, **_kwargs):
+                return subprocess.CompletedProcess([], 0, "new\n" if args[0] == "rev-parse" else "", "")
+
+            with patch("run.recovery_worktree", return_value=(Path(root), store.state["worktrees"][assignment["id"]])), patch("run.git", side_effect=recovery_git):
+                actions = run.plan_recovery(store, [assignment], [], [assignment["id"]])
+                _lines, next_line = run.campaign_summary(store.state, [assignment], [])
+                self.assertNotIn("grant-attempt", next_line)
+                self.assertEqual(actions, [{"action": "resume-review-validation", "assignmentId": assignment["id"], "headSha": "new", "repair": 2, "commandHash": "hash"}])
+                with patch("run.validate_candidate", return_value="new") as validate, patch("run.invoke_with_replacements") as worker:
+                    run.apply_recovery(store, [assignment], actions)
+                validate.assert_called_once_with(store, assignment, Path(root), {"candidateSha": "new"})
+                worker.assert_not_called()
+
+            task_state = store.state["taskStates"][assignment["id"]]
+            session = store.state["reviewSessions"][assignment["id"]]
+            self.assertEqual((task_state["phase"], session["phase"], session["pendingRepairSha"]), ("verify-2", "verify-2", "new"))
+            self.assertEqual(task_state["reviewValidationReplayIdentity"], {"candidateSha": "new", "commandHash": "hash", "repairNumber": 2})
+            self.assertEqual((store.state["attemptCounters"], store.state["recoveryAttemptGrants"], store.state["recoveryAttemptsStarted"], session["repairAttemptsStarted"], session["reviewCallsStarted"]), counters)
+            self.assertEqual(session["initialResults"], history)
+
+            store.state["phase"] = task_state["phase"] = session["phase"] = "needs-user"
+            with patch("run.recovery_worktree", return_value=(Path(root), store.state["worktrees"][assignment["id"]])), patch("run.git", side_effect=recovery_git), self.assertRaisesRegex(RuntimeError, "explicit disposition"):
+                run.plan_recovery(store, [assignment], [], [assignment["id"]])
 
     def test_clean_changed_terminal_candidate_replays_without_attempt(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1790,7 +1890,8 @@ class DeterministicCoreTests(unittest.TestCase):
             store.state["reviewSessions"][assignment["id"]] = {"phase": "approved", "reviewedSha": "abc", "repairAttemptsStarted": 0, "reviewCallsStarted": 3, "reviewCallLimit": 9}
             self.provider_metadata(store, assignment, "abc", {"number": 7, "state": "OPEN", "url": "x", "headRefOid": "abc"})
             merged = subprocess.CompletedProcess([], 0, "{}", "")
-            with patch("run.provider_with_retries", side_effect=[RuntimeError("vote denied"), merged]) as provider, patch("run.wait_for_checks", return_value="passed"), patch("run.invoke_with_replacements") as worker:
+            merged_pr = {"number": 7, "state": "MERGED", "url": "x", "headRefOid": "abc"}
+            with patch("run.provider_with_retries", side_effect=[RuntimeError("vote denied"), merged]) as provider, patch("run.pr_inspect", return_value=merged_pr), patch("run.wait_for_checks", return_value="passed"), patch("run.invoke_with_replacements") as worker:
                 self.assertTrue(run.merge_assignment(store, threading.Semaphore(1), assignment, Path(root), "branch", {"number": 7}, "abc"))
             self.assertIn("set-vote", provider.call_args_list[0].args)
             self.assertIn("update", provider.call_args_list[1].args)
@@ -1828,7 +1929,8 @@ class DeterministicCoreTests(unittest.TestCase):
             store.state["pullRequests"][assignment["id"]] = {"number": 1, "state": "OPEN"}
             store.state["reviewSessions"][assignment["id"]] = {"phase": "approved", "reviewedSha": "abc", "repairAttemptsStarted": 0, "reviewCallsStarted": 3, "reviewCallLimit": 9}
             self.provider_metadata(store, assignment, "abc", {"number": 1, "state": "OPEN", "url": "x", "headRefOid": "abc"})
-            with patch("run.wait_for_checks", return_value="bypassable"), patch("run.provider_with_retries", return_value=subprocess.CompletedProcess([], 0, "", "")) as provider:
+            merged_pr = {"number": 1, "state": "MERGED", "url": "x", "headRefOid": "abc"}
+            with patch("run.wait_for_checks", return_value="bypassable"), patch("run.pr_inspect", return_value=merged_pr), patch("run.provider_with_retries", return_value=subprocess.CompletedProcess([], 0, "", "")) as provider:
                 self.assertTrue(run.merge_assignment(store, threading.Semaphore(1), assignment, Path(root), "branch", {"number": 1}, "abc"))
             self.assertIn("--admin", provider.call_args.args)
             self.assertEqual(provider.call_args.args[provider.call_args.args.index("--match-head-commit") + 1], "abc")
@@ -1982,7 +2084,7 @@ class DeterministicCoreTests(unittest.TestCase):
                 if role == "worker":
                     return {"mode": "repair", "assignmentId": assignment["id"], "status": "candidate", "candidateSha": "new", "validation": [], "summary": ""}
                 return {"assignmentId": assignment["id"], "candidateSha": "new", "status": "resolved"}
-            with patch("run.wait_for_checks", side_effect=["failed", "passed"]), patch("run.git", return_value=completed), patch("run.invoke_with_replacements", side_effect=agent), patch("run.validate_candidate", return_value="new"), patch("run.publish_candidate"), patch("run.provider_with_retries", return_value=completed), patch("run.mark_integrated"):
+            with patch("run.wait_for_checks", side_effect=["failed", "passed"]), patch("run.git", return_value=completed), patch("run.invoke_with_replacements", side_effect=agent), patch("run.validate_candidate", return_value="new"), patch("run.publish_candidate"), patch("run.validate_publication_proof"), patch("run.inspect_merged_pr", return_value={"number": 1, "state": "MERGED", "url": "x", "headRefOid": "new"}), patch("run.provider_with_retries", return_value=completed), patch("run.mark_integrated"):
                 self.assertTrue(run.merge_assignment(store, __import__("threading").Semaphore(1), assignment, Path(root), "relay/TASK-0001", {"number": 1}, "old"))
             session = store.state["reviewSessions"][assignment["id"]]
             self.assertEqual((session["repairAttemptsStarted"], session["reviewCallsStarted"], session["reviewedSha"]), (1, 5, "new"))
@@ -2000,9 +2102,46 @@ class DeterministicCoreTests(unittest.TestCase):
             with patch("run.pr_inspect", return_value=pr), patch("run.provider_call") as provider:
                 self.assertIs(run.publish_candidate(store, assignment, Path(root), "branch", "sha"), pr)
                 provider.assert_not_called()
-            with patch("run.wait_for_checks", return_value="merged"), patch("run.provider_with_retries") as merge:
+            merged = pr | {"state": "MERGED"}
+            def already_merged(*_args):
+                run.persist_pr_inspection(store, assignment["id"], merged)
+                return "merged"
+            with patch("run.wait_for_checks", side_effect=already_merged), patch("run.provider_with_retries") as merge:
                 self.assertTrue(run.merge_assignment(store, __import__("threading").Semaphore(1), assignment, Path(root), "branch", pr, "sha"))
                 merge.assert_not_called()
+
+    def test_publication_proof_is_rejected_before_provider_merge(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            pr = {"number": 1, "state": "OPEN", "url": "x", "headRefOid": "abc"}
+            store.state["taskStates"][assignment["id"]] = {"phase": "approved"}
+            store.state["reviewSessions"][assignment["id"]] = {"phase": "approved", "reviewedSha": "abc", "repairAttemptsStarted": 0, "reviewCallsStarted": 3, "reviewCallLimit": 9}
+            self.provider_metadata(store, assignment, "abc", pr)
+            store.state["taskStates"][assignment["id"]]["publicationProof"]["candidateSha"] = "stale"
+            with patch("run.wait_for_checks", return_value="passed"), patch("run.pr_merge") as merge, patch("run.mark_integrated") as integrated, self.assertRaisesRegex(RuntimeError, "publication proof"):
+                run.merge_assignment(store, threading.Semaphore(1), assignment, Path(root), "branch", pr, "abc")
+            merge.assert_not_called()
+            integrated.assert_not_called()
+
+    def test_provider_already_merged_is_refreshed_and_reconciled_without_merge(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            opened = {"number": 9, "state": "OPEN", "url": "x", "headRefOid": "abc"}
+            merged = opened | {"state": "MERGED"}
+            store.state["taskStates"][assignment["id"]] = {"phase": "approved"}
+            store.state["reviewSessions"][assignment["id"]] = {"phase": "approved", "reviewedSha": "abc", "repairAttemptsStarted": 0, "reviewCallsStarted": 3, "reviewCallLimit": 9}
+            self.provider_metadata(store, assignment, "abc", opened)
+            store.state["taskStates"][assignment["id"]].pop("prMetadata")
+            def provider_merged(*_args):
+                run.persist_pr_inspection(store, assignment["id"], merged)
+                return "merged"
+            with patch("run.wait_for_checks", side_effect=provider_merged), patch("run.pr_edit") as edit, patch("run.pr_merge") as merge:
+                self.assertTrue(run.merge_assignment(store, threading.Semaphore(1), assignment, Path(root), "branch", opened, "abc"))
+            edit.assert_called_once()
+            merge.assert_not_called()
+            self.assertEqual(store.state["taskStates"][assignment["id"]]["providerProof"]["mergedProviderRecord"], merged)
 
     def test_canonical_pr_metadata_is_qualified_and_idempotent(self):
         with tempfile.TemporaryDirectory() as root:
@@ -2036,7 +2175,7 @@ class DeterministicCoreTests(unittest.TestCase):
                 store.state["taskStates"][assignment["id"]] = {"pushedSha": candidate_sha, "phase": "approved"}
                 old = {"number": number, "state": "MERGED", "url": "old", "headRefOid": historical_sha}
                 new = {"number": number + 7, "state": "OPEN", "url": "new", "headRefOid": candidate_sha}
-                with patch("run.pr_discover", return_value=[old]), patch("run.pr_create", return_value=new) as create, patch("run.pr_edit"):
+                with patch("run.pr_discover", return_value=[old]), patch("run.pr_create", return_value=new) as create, patch("run.pr_inspect", return_value=new), patch("run.pr_edit"):
                     self.assertEqual(run.publish_candidate(store, assignment, Path(root), "relay/TASK-0001", candidate_sha), new)
                 create.assert_called_once()
 
@@ -2054,6 +2193,39 @@ class DeterministicCoreTests(unittest.TestCase):
             edit.assert_called_once()
             self.assertEqual(store.state["taskStates"][assignment["id"]]["prMetadata"]["candidateSha"], "60d09d4a")
             self.assertIn("--force-with-lease=refs/heads/relay/TASK-0001:f63189a5", git_provider.call_args_list[1].args)
+
+    def test_publication_polls_stale_head_and_persists_each_live_inspection(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            stale = {"number": 30, "state": "OPEN", "url": "x", "headRefOid": "old"}
+            fresh = stale | {"headRefOid": "new"}
+            store.state["taskStates"][assignment["id"]] = {"pushedSha": "new", "pr": stale, "phase": "approved"}
+            persisted = []
+            original = run.persist_pr_inspection
+            def persist(*args):
+                original(*args)
+                persisted.append(store.state["taskStates"][assignment["id"]]["pr"])
+            with patch("run.pr_inspect", side_effect=[stale, fresh]) as inspect, patch("run.persist_pr_inspection", side_effect=persist), patch("run.pr_edit"), patch("run.time.sleep"):
+                self.assertEqual(run.publish_candidate(store, assignment, Path(root), "branch", "new"), fresh)
+            self.assertEqual(inspect.call_count, 2)
+            self.assertEqual(persisted, [stale, fresh])
+            self.assertEqual(store.state["taskStates"][assignment["id"]]["publicationProof"], {"candidateSha": "new", "providerRecord": fresh})
+
+    def test_matching_pushed_sha_still_refreshes_stale_publication_proof(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            stale = {"number": 4, "state": "OPEN", "url": "x", "headRefOid": "old"}
+            fresh = stale | {"headRefOid": "new"}
+            store.state["taskStates"][assignment["id"]] = {
+                "pushedSha": "new", "pr": stale, "phase": "approved",
+                "publicationProof": {"candidateSha": "old", "providerRecord": stale},
+            }
+            with patch("run.git_provider_with_retries") as push, patch("run.pr_inspect", return_value=fresh) as inspect, patch("run.pr_edit"):
+                self.assertEqual(run.publish_candidate(store, assignment, Path(root), "branch", "new"), fresh)
+            push.assert_not_called()
+            inspect.assert_called_once()
 
     def test_push_before_pr_refresh_resumes_refresh_without_repush(self):
         with tempfile.TemporaryDirectory() as root:
@@ -2089,7 +2261,7 @@ class DeterministicCoreTests(unittest.TestCase):
             with patch("run.bounded_run", side_effect=timeout) as command, self.assertRaises(RuntimeError):
                 run.invoke_agent(store, __import__("threading").Semaphore(1), Path(root), "TASK-0001", "worker", "prompt", mode="task")
             self.assertTrue(command.call_args.kwargs["input"].startswith("Target repository instructions:\ncustom target rules\n\n"))
-            self.assertNotIn("env", command.call_args.kwargs)
+            self.assertNotEqual(command.call_args.kwargs["env"].get("PYTHONUSERBASE"), os.environ.get("PYTHONUSERBASE"))
             self.assertEqual(store.state["attemptCounters"]["TASK-0001"], 1)
             self.assertEqual(store.state["activeProcesses"], {})
             with patch("run.run_tool", side_effect=subprocess.TimeoutExpired("gh", 1)), self.assertRaises(subprocess.TimeoutExpired):
