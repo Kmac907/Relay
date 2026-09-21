@@ -653,32 +653,43 @@ class DeterministicCoreTests(unittest.TestCase):
             store = self.state_store(root)
             assignment = ContractTests().task()
             store.state["taskStates"][assignment["id"]] = {"phase": "implementing"}
+            worktree, other_worktree = root / "active", root / "other"
             user_site, outside = root / "user-site", root / "outside"
             leaked = root / "relay-worktrees" / "other" / "TASK-9999"
-            for path in (user_site, outside, leaked):
+            for path in (worktree, other_worktree, user_site, outside, leaked):
                 path.mkdir(parents=True)
             original = os.environ.copy()
             captured = {}
 
             def agent(command, **kwargs):
-                captured["worker"] = kwargs["env"]
                 output = Path(command[command.index("--output-last-message") + 1])
-                output.write_text(json.dumps({"mode": "task", "assignmentId": assignment["id"], "status": "candidate", "candidateSha": "abc", "validation": [], "summary": ""}), encoding="utf-8")
+                if "contract-reviewer" in output.name:
+                    captured["reviewer"] = kwargs["env"]
+                    result = {"assignmentId": assignment["id"], "candidateSha": "abc", "findings": []}
+                else:
+                    captured["worker"] = kwargs["env"]
+                    result = {"mode": "task", "assignmentId": assignment["id"], "status": "candidate", "candidateSha": "abc", "validation": [], "summary": ""}
+                output.write_text(json.dumps(result), encoding="utf-8")
                 return subprocess.CompletedProcess(command, 0, "", "")
 
             def validation(_command, **kwargs):
                 captured["validation"] = kwargs["env"]
                 return subprocess.CompletedProcess([], 0, "", "")
 
-            with patch("run.tempfile.gettempdir", return_value=str(root)), patch.object(run, "ORIGINAL_PYTHON_USER_SITE", str(user_site)), patch.dict(os.environ, {"PYTHONPATH": os.pathsep.join((str(outside), str(leaked)))}, clear=False):
+            operator_path = os.pathsep.join((str(outside), str(user_site), str(leaked), str(outside), str(worktree / "src")))
+            with patch("run.tempfile.gettempdir", return_value=str(root)), patch.object(run, "ORIGINAL_PYTHON_USER_SITE", str(user_site)), patch.dict(os.environ, {"PYTHONPATH": operator_path}, clear=False):
                 with patch("run.bounded_run", side_effect=agent):
-                    run.invoke_agent(store, threading.Semaphore(1), root, assignment["id"], "worker", "prompt", mode="task")
+                    run.invoke_agent(store, threading.Semaphore(1), worktree, assignment["id"], "worker", "prompt", mode="task")
+                    run.ensure_review_session(store, assignment["id"], "abc")
+                    run.invoke_agent(store, threading.Semaphore(1), worktree, assignment["id"], "contract-reviewer", "prompt", review=True)
                 with patch("run.validation_command", return_value=["shell"]), patch("run.run_validation_command", side_effect=validation):
-                    run.run_validations(store, assignment, root, commands=["test"])
-                other = run.assignment_environment(store, "TASK-0002")
+                    run.run_validations(store, assignment, worktree, commands=["test"])
+                other = run.assignment_environment(store, "TASK-0002", other_worktree)
                 self.assertEqual(captured["worker"]["PYTHONUSERBASE"], captured["validation"]["PYTHONUSERBASE"])
+                self.assertEqual(captured["worker"], captured["reviewer"])
                 self.assertNotEqual(captured["worker"]["PYTHONUSERBASE"], other["PYTHONUSERBASE"])
-                self.assertEqual(captured["worker"]["PYTHONPATH"].split(os.pathsep), [str(user_site), str(outside)])
+                self.assertEqual(captured["worker"]["PYTHONPATH"].split(os.pathsep), [str(worktree.resolve() / "src"), str(user_site), str(outside)])
+                self.assertEqual(other["PYTHONPATH"].split(os.pathsep)[0], str(other_worktree.resolve() / "src"))
                 run.cleanup_assignment_environment(store, assignment["id"])
                 self.assertFalse(Path(captured["worker"]["PYTHONUSERBASE"]).exists())
             self.assertEqual(os.environ, original)
@@ -693,10 +704,13 @@ class DeterministicCoreTests(unittest.TestCase):
             (editable / "sibling_assignment.py").write_text("LEAKED = True\n", encoding="utf-8")
             (user_site / "sibling-editable.pth").write_text(str(editable) + "\n", encoding="utf-8")
             with patch("run.tempfile.gettempdir", return_value=str(root)), patch.object(run, "ORIGINAL_PYTHON_USER_SITE", str(user_site)), patch.dict(os.environ, {"PYTHONPATH": ""}, clear=False):
-                environment = run.assignment_environment(store, "TASK-0001")
+                environment = run.assignment_environment(store, "TASK-0001", root)
+                package = root / "src" / "active_assignment"
+                package.mkdir(parents=True)
+                (package / "__init__.py").write_text("VALUE = 9\n", encoding="utf-8")
                 completed = run.run_validation_command([
                     sys.executable, "-c",
-                    "import importlib.util, operator_tool; assert operator_tool.VALUE == 7; assert importlib.util.find_spec('sibling_assignment') is None",
+                    "import importlib.util, active_assignment, operator_tool; assert active_assignment.VALUE == 9; assert operator_tool.VALUE == 7; assert importlib.util.find_spec('sibling_assignment') is None",
                 ], timeout=10, cwd=root, env=environment)
             self.assertEqual(completed.returncode, 0, completed.stderr)
 
@@ -712,9 +726,12 @@ class DeterministicCoreTests(unittest.TestCase):
                 baseline = store.state["baselineValidation"]
                 run.run_validations(store, {"id": "BASELINE", "validationCommands": ["baseline"]}, Path(root), "baseline", ["baseline"], baseline)
             self.assertEqual(isolated.call_count, 4)
-            with patch("run.require_validation_shell"), patch("run.git", return_value=subprocess.CompletedProcess([], 0, "", "")), patch("run.run_validation_command", return_value=completed) as isolated:
+            for call in isolated.call_args_list:
+                self.assertEqual(call.kwargs["env"]["PYTHONPATH"].split(os.pathsep)[0], str(Path(call.kwargs["cwd"]).resolve() / "src"))
+            with patch("run.require_validation_shell"), patch("run.git", return_value=subprocess.CompletedProcess([], 0, "", "")), patch("run.run_validation_command", return_value=completed) as recovery:
                 self.assertEqual(run._check_legacy_baseline(store, [{"command": "legacy"}]), [])
-            isolated.assert_called_once()
+            recovery.assert_called_once()
+            self.assertEqual(recovery.call_args.kwargs["env"]["PYTHONPATH"].split(os.pathsep)[0], str(Path(recovery.call_args.kwargs["cwd"]).resolve() / "src"))
 
     def test_unlaunchable_validation_shell_fails_preflight(self):
         with patch("run.validation_command", return_value=["missing-shell"]), patch("run.os.path.isfile", return_value=False), patch("run.shutil.which", return_value=None), patch("run.bounded_run") as launch, self.assertRaisesRegex(RuntimeError, "validation shell is unavailable"):

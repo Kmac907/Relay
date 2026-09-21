@@ -625,23 +625,25 @@ def campaign_temp_root(state: dict) -> Path:
     return safe_within(root / state["campaignId"], root)
 
 
-def assignment_environment(store: StateStore, assignment_id: str) -> dict[str, str]:
+def assignment_environment(store: StateStore, assignment_id: str, worktree: Path) -> dict[str, str]:
     campaign_root = campaign_temp_root(store.state)
     user_base = safe_within(campaign_root / ".python-user-bases" / assignment_id, campaign_root)
     user_base.mkdir(parents=True, exist_ok=True)
     worktree_root = Path(tempfile.gettempdir()).resolve() / "relay-worktrees"
     existing = os.environ.get("PYTHONPATH")
-    entries = [ORIGINAL_PYTHON_USER_SITE, *(existing.split(os.pathsep) if existing is not None else [])]
+    entries = [str(worktree.resolve() / "src"), ORIGINAL_PYTHON_USER_SITE, *(existing.split(os.pathsep) if existing else [])]
     python_path = []
-    for entry in entries:
+    seen = set()
+    for index, entry in enumerate(entries):
         if not entry:
-            python_path.append(entry)
             continue
         resolved = Path(entry).resolve()
-        if resolved == worktree_root or worktree_root in resolved.parents:
+        if index > 1 and (resolved == worktree_root or worktree_root in resolved.parents):
             continue
-        if os.path.normcase(str(resolved)) not in {os.path.normcase(str(Path(item).resolve())) for item in python_path if item}:
+        key = os.path.normcase(str(resolved))
+        if key not in seen:
             python_path.append(entry)
+            seen.add(key)
     environment = os.environ.copy()
     environment.update(PYTHONUSERBASE=str(user_base), PYTHONPATH=os.pathsep.join(python_path))
     return environment
@@ -1000,7 +1002,7 @@ def invoke_agent(store: StateStore, semaphore: threading.Semaphore, repo: Path, 
             store.update(lambda state: state["activeProcesses"][process_id].update(status="running", startedAt=datetime.now(timezone.utc).isoformat()))
             start_operation(store, assignment_id, operation, store.state["agentTimeoutSeconds"])
             console("START", f"operation={operation}" + (f" mode={mode}" if mode else "") + f" assignment={assignment_id} call={number} deadline={store.state['agentTimeoutSeconds']}s")
-            completed = bounded_run(command, input=prompt, timeout=store.state["agentTimeoutSeconds"], env=assignment_environment(store, assignment_id))
+            completed = bounded_run(command, input=prompt, timeout=store.state["agentTimeoutSeconds"], env=assignment_environment(store, assignment_id, repo))
         atomic_write(log, completed.stdout + ("\n--- stderr ---\n" + completed.stderr if completed.stderr else ""))
         if completed.returncode or not output.is_file():
             raise RuntimeError(f"{role} failed with exit code {completed.returncode}; log: {log}")
@@ -1127,7 +1129,7 @@ def run_validations(store: StateStore, assignment: dict, worktree: Path, categor
         middle = "" if category == "task" else f"-{category}"
         log = store.path.parent / "logs" / f"{assignment_id}{middle}-validation-{started['number']}.log"
         try:
-            completed = run_validation_command(shell, cwd=worktree, timeout=store.state["validationTimeoutSeconds"], env=assignment_environment(store, assignment_id))
+            completed = run_validation_command(shell, cwd=worktree, timeout=store.state["validationTimeoutSeconds"], env=assignment_environment(store, assignment_id, worktree))
             exit_code, stdout, stderr = str(completed.returncode), completed.stdout, completed.stderr
         except subprocess.TimeoutExpired as error:
             exit_code, stdout, stderr = "timeout", _output(error.stdout), _output(error.stderr)
@@ -2643,7 +2645,7 @@ def _check_legacy_baseline(store: StateStore, groups: list[dict]) -> list[dict]:
             failures = []
             for group in groups:
                 try:
-                    result = run_validation_command(validation_command(group["command"]), cwd=worktree, timeout=store.state["validationTimeoutSeconds"])
+                    result = run_validation_command(validation_command(group["command"]), cwd=worktree, timeout=store.state["validationTimeoutSeconds"], env=assignment_environment(store, "BASELINE", worktree))
                     outcome = f"exit:{result.returncode}"
                 except subprocess.TimeoutExpired:
                     outcome = "timeout"
