@@ -97,8 +97,8 @@ def stderr_event(event: str, detail: str) -> None:
     relay_console.emit(event, detail)
 
 
-def bounded_run(command, *, timeout: int, cwd: Path | None = None, check: bool = True, input: str | None = None, shell: bool = False) -> subprocess.CompletedProcess:
-    process = subprocess.Popen(command, cwd=cwd, shell=shell, stdin=subprocess.PIPE if input is not None else None, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", errors="replace", text=True)
+def bounded_run(command, *, timeout: int, cwd: Path | None = None, check: bool = True, input: str | None = None, shell: bool = False, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    process = subprocess.Popen(command, cwd=cwd, env=env, shell=shell, stdin=subprocess.PIPE if input is not None else None, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", errors="replace", text=True)
     with CHILD_LOCK:
         ACTIVE_CHILDREN.add(process)
     try:
@@ -584,12 +584,19 @@ def validation_command(command: str) -> list[str]:
     return ["/bin/sh", "-c", command]
 
 
+def run_validation_command(command: list[str], *, timeout: int, cwd: Path | None = None) -> subprocess.CompletedProcess:
+    with tempfile.TemporaryDirectory(prefix="relay-validation-") as temporary:
+        environment = os.environ.copy()
+        environment.update(TEMP=temporary, TMP=temporary, TMPDIR=temporary)
+        return bounded_run(command, cwd=cwd, env=environment, check=False, timeout=timeout)
+
+
 def require_validation_shell(timeout: int = 30) -> None:
     executable = validation_command("")[0]
     if not os.path.isfile(executable) and not shutil.which(executable):
         raise RuntimeError(f"validation shell is unavailable: {executable}")
     try:
-        completed = bounded_run(validation_command("$null" if os.name == "nt" else ":"), timeout=min(timeout, 30), check=False)
+        completed = run_validation_command(validation_command("$null" if os.name == "nt" else ":"), timeout=min(timeout, 30))
     except (OSError, subprocess.TimeoutExpired) as error:
         raise RuntimeError(f"validation shell is unavailable: {executable}") from error
     if completed.returncode:
@@ -1077,7 +1084,7 @@ def run_validations(store: StateStore, assignment: dict, worktree: Path, categor
         middle = "" if category == "task" else f"-{category}"
         log = store.path.parent / "logs" / f"{assignment_id}{middle}-validation-{started['number']}.log"
         try:
-            completed = bounded_run(shell, cwd=worktree, check=False, timeout=store.state["validationTimeoutSeconds"])
+            completed = run_validation_command(shell, cwd=worktree, timeout=store.state["validationTimeoutSeconds"])
             exit_code, stdout, stderr = str(completed.returncode), completed.stdout, completed.stderr
         except subprocess.TimeoutExpired as error:
             exit_code, stdout, stderr = "timeout", _output(error.stdout), _output(error.stderr)
@@ -1247,6 +1254,7 @@ def repair_failed_validation(store: StateStore, semaphore: threading.Semaphore, 
                 worker_prompt("repair", assignment, candidate, [context], task_state.get("error", "")),
                 mode="repair", validation_repair=True,
             )
+            candidate_integrity(store, assignment, worktree, repair, candidate)
         except (RuntimeError, ValueError, json.JSONDecodeError) as error:
             task_state["error"] = str(error)
             store.save()
@@ -2524,7 +2532,7 @@ def _check_legacy_baseline(store: StateStore, groups: list[dict]) -> list[dict]:
             failures = []
             for group in groups:
                 try:
-                    result = bounded_run(validation_command(group["command"]), cwd=worktree, check=False, timeout=store.state["validationTimeoutSeconds"])
+                    result = run_validation_command(validation_command(group["command"]), cwd=worktree, timeout=store.state["validationTimeoutSeconds"])
                     outcome = f"exit:{result.returncode}"
                 except subprocess.TimeoutExpired:
                     outcome = "timeout"
@@ -3084,6 +3092,18 @@ def reconcile(store: StateStore, allow_terminal_replay: bool = True) -> None:
     for task_state in store.state.get("taskStates", {}).values():
         task_state.setdefault("validationRepairAttemptsStarted", 0)
         task_state.setdefault("validationRepairCallsStarted", 0)
+        in_progress = task_state.get("validationRepairInProgress")
+        pending = task_state.get("validationRepairPendingSha")
+        if (
+            isinstance(task_state.get("validationFailure"), dict)
+            and isinstance(in_progress, dict)
+            and isinstance(pending, str)
+            and pending == in_progress.get("baseSha") == task_state.get("validationCandidateSha")
+        ):
+            task_state.update(phase="candidate-validation", pendingWorkerSha=pending)
+            task_state.pop("validationRepairPendingSha", None)
+            task_state.pop("validationRepairInProgress", None)
+            task_state.pop("validationCircuitBroken", None)
         if task_state.get("phase") == "waiting-provider":
             task_state["phase"] = "resume-provider"
         for field in OPERATION_FIELDS:
