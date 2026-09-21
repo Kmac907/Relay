@@ -160,7 +160,7 @@ flowchart TD
 
 `plan.py` reads the requirements, tracked tree, base SHA, and target instructions. For nontrivial repositories it runs fixed read-only scout scopes concurrently, then a read-only Planning PM creates tasks and campaign validation. A contract review checks requirement and task consistency; a risk review checks feasibility, regression risk, security, data loss, tests, exact commands, platforms, and paths. Relay validates every structured result before changing state. Blocking findings get one planning repair and a verification review; unresolved findings fail without writing `PLAN.md`, and a clean draft skips both.
 
-Successful planning creates `PLAN.md`, then `AGENTS.md` only if it is still missing; all other entries are preserved. `PLAN.md` fixes each task's dependencies, allowed paths, acceptance criteria, focused commands, attempt limit, shared fix-loop limit, and mandatory campaign commands. Planner `START`, `WAIT`, `DONE`, `RETRY`, and `FAILED` events go to stderr, raw agent output remains separate, stdout contains the generated path, and stderr ends with deterministic `SUMMARY` and executable `NEXT` lines.
+Successful planning creates `PLAN.md`, then `AGENTS.md` only if it is still missing; all other entries are preserved. `PLAN.md` fixes each task's dependencies, allowed paths, acceptance criteria, focused commands, attempt limit, shared fix-loop limit, and mandatory campaign commands. Relay-owned backlogs are parsed structurally and require exactly one task per `<origin-campaign>/<BUG-NNNN>` source reference, a declared test path, and a runnable regression command. Ordinary prose requirements and existing schema-v2 plans remain compatible. Planner `START`, `WAIT`, `DONE`, `RETRY`, and `FAILED` events go to stderr, raw agent output remains separate, stdout contains the generated path, and stderr ends with deterministic `SUMMARY` and executable `NEXT` lines.
 
 ### Baseline and bootstrap
 
@@ -170,13 +170,13 @@ Relay honors existing tracked or untracked `AGENTS.md`. Its generic template lim
 
 ### Build and review
 
-`run.py` initializes the active ledgers and state and excludes coordinator runtime files from Git. Ready tasks run concurrently only after dependencies complete and only when allowed paths do not overlap. Each Worker is the sole write-capable role in its isolated branch and worktree and must commit locally. Relay checks ancestry, reported SHA, and changed paths, then runs focused validation once followed by campaign validation once. After ordinary attempts are exhausted, or the same stable failure repeats twice, Relay automatically repairs a clean candidate within the remaining shared fix-loop budget. A timed-out command first replays once on the unchanged candidate.
+`run.py` initializes the active ledgers and state and excludes coordinator runtime files from Git. Ready tasks run concurrently only after dependencies complete and only when allowed paths do not overlap. Each Worker is the sole write-capable role in its isolated branch and worktree and must commit locally. Relay checks ancestry, reported SHA, and changed paths; backlog candidates must change a declared test path. It then runs focused validation, including the mandatory regression command, followed by campaign validation. After ordinary attempts are exhausted, or the same stable failure repeats twice, Relay automatically repairs a clean candidate within the remaining shared fix-loop budget. A timed-out command first replays once on the unchanged candidate.
 
-Relay pushes a validated candidate, creates or recovers one PR, runs two independent read-only reviews, and makes one triage decision. Accepted blockers enter bounded Worker repair and focused verification. The reviewed SHA must remain unchanged and provider checks and approvals must pass before merge. Completed worktrees and local branches are removed.
+Relay pushes a validated candidate, creates or recovers one PR, and refreshes its canonical campaign-qualified title and multiline body after every repaired push. The body records the source reference, current SHA, paths, criteria, focused/regression commands, and campaign validation. Two independent read-only reviews and one triage decision follow. Accepted blockers enter bounded Worker repair and focused verification. The reviewed SHA must remain unchanged and provider checks and approvals must pass before merge. Squash/merge messages carry Relay campaign, assignment, optional source, and candidate trailers; GitHub rebase keeps the updated PR as the durable authority. Completed worktrees and local branches are removed.
 
 ### Audit and backlog
 
-After planned tasks merge, Relay fast-forwards local `main` and plans exactly one audit. Read-only Audit Workers inspect finite scopes with explicit commands, and triage classifies their reproduction evidence once. Accepted P0/P1 findings become bounded bug assignments validated by their originating scope commands; P2 findings may be deferred. Fixes never plan another audit. Relay atomically publishes deferred bugs to `BACKLOG.md`, then reaches `complete` when no active bugs remain. Provider checks may produce `waiting-provider`; blockers needing judgment produce `needs-user`.
+After planned tasks merge, Relay fast-forwards local `main` and plans exactly one audit. Read-only Audit Workers inspect finite scopes with explicit commands, and triage classifies their reproduction evidence once. Accepted P0/P1 findings become bounded bug assignments validated by their originating scope commands; P2 findings may be deferred. Fixes never plan another audit. Relay atomically publishes deferred bugs to `BACKLOG.md`, never deletes an existing backlog merely because the new campaign found none, then reaches `complete` when no active bugs remain. Provider checks may produce `waiting-provider`; blockers needing judgment produce `needs-user`.
 
 ### Recovery
 
@@ -230,11 +230,11 @@ Recovery resumes only a phase safe for the recorded base, worktree, SHA, provide
 | | GitHub | Azure DevOps Services |
 | --- | --- | --- |
 | Origin | Canonical GitHub HTTPS or SSH | Canonical Azure HTTPS or SSH, including `visualstudio.com` |
-| PR text | Body file | Single-line description for Windows `az.cmd` compatibility |
+| PR text | Multiline body file plus idempotent `pr edit` | Multiline Markdown description plus idempotent `repos pr update` |
 | Merge | `squash`, `merge`, or `rebase` | `squash` or standard no-fast-forward `merge`; `rebase` fails preflight |
 | Gate | Required checks and approvals | Blocking branch policies: approved/not-applicable pass, queued/running wait within deadline, rejected/broken fail |
 
-Relay never bypasses policies. It persists normalized provider identity, PR number, URL, source SHA, and state. Push, PR creation, checks, merge, reconciliation, and bootstrap resume without intentionally repeating completed operations.
+Relay never bypasses policies. It persists normalized provider identity, PR number, URL, source SHA, state, desired metadata hash, and final merge proof. Push, PR creation, metadata refresh, checks, merge, reconciliation, and bootstrap resume without intentionally repeating completed operations.
 
 ## Troubleshooting and reference notes
 
@@ -257,6 +257,6 @@ Schema-v2 campaigns without campaign validation are readable but cannot execute.
 
 When `--repo` points to a repository subdirectory, Relay preserves that prefix in bootstrap and Worker worktrees and rejects changes outside it. Campaign state versions are strict; unsupported state requires a newly reviewed plan rather than heuristic recovery.
 
-Cleanup is permanent and allowed only for a complete, inactive campaign with no worktrees or open Relay PRs. It removes `tasks.md`, `bugs.md`, Relay-format root plan files, and `.relay`; it preserves `.relay-archive/`, `BACKLOG.md`, human-authored plans, `AGENTS.md`, source, and Git history. Paths are resolved and validated before removal.
+Cleanup is permanent and allowed only for a complete, inactive campaign with no worktrees or open Relay PRs. Every integrated task and audit bug must also have matching proof of its final candidate, source reference, PR metadata hash, and merged provider record. Cleanup removes `tasks.md`, `bugs.md`, Relay-format root plan files, and `.relay`; it preserves `.relay-archive/`, `BACKLOG.md`, human-authored plans, `AGENTS.md`, source, and Git history. Paths are resolved and validated before removal.
 
 Exit codes are `0` for completion, `1` for operational or validation failure, `2` when user or provider action is required, and `130` when interrupted. Every terminal wave prints validated task, baseline, bug, and next-step summaries; a stop emits one `STOPPED` event, then sorted `BLOCKED` events, and targeted recovery emits `RECOVER`. Run any script with `--help` for every limit, deadline, merge method, and path option. See `PLAN.md` for the full behavioral specification.

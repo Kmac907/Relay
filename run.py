@@ -31,6 +31,7 @@ BUG_MARKER = re.compile(r"<!-- relay: campaign=([A-Za-z0-9._-]+) repository=([0-
 BACKLOG_MARKER = re.compile(r"<!-- relay: backlog campaign=([A-Za-z0-9._-]+) repository=([0-9a-f]{12}) -->")
 HANDOFF_MARKER = re.compile(r"<!-- relay: handoff campaign=([A-Za-z0-9._-]+) repository=([0-9a-f]{12}) manifest=([0-9a-f]{64}) -->")
 TASK_FIELDS = ("Status", "Priority", "Dependencies", "Allowed paths", "Acceptance criteria", "Validation", "Attempt", "Fix loop", "Branch", "Pull request", "Candidate")
+PROVENANCE_FIELDS = ("Source ref", "Test paths", "Regression validation")
 SEED_FIELDS = ("Original base", "Candidate SHA", "Archive ref", "Worker summary")
 WORKER_MODES = {"task", "bug", "repair"}
 TERMINAL_REVIEW_PHASES = {"approved", "needs-user"}
@@ -234,6 +235,15 @@ def parse_tasks(text: str, runtime: bool = False) -> tuple[dict, list[dict]]:
             "attempt": int(attempt.group(1)), "attemptLimit": int(attempt.group(2)),
             "fixLoop": int(fix_loop.group(1)), "fixLoopLimit": int(fix_loop.group(2)),
         })
+        provenance_present = [field for field in PROVENANCE_FIELDS if (f"- {field}:" in block if field != "Source ref" else any(line.startswith("- Source ref:") for line in block))]
+        if provenance_present:
+            if set(provenance_present) != set(PROVENANCE_FIELDS):
+                raise ValueError(f"incomplete provenance metadata for {match.group(1)}")
+            tasks[-1].update(
+                sourceRef=_field(block, "Source ref"),
+                testPaths=_sublist(block, "Test paths"),
+                regressionValidationCommands=_sublist(block, "Regression validation"),
+            )
         seed_values = {field: _field(block, f"Seed {field}") for field in SEED_FIELDS if any(line.startswith(f"- Seed {field}:") for line in block)}
         if seed_values:
             if set(seed_values) != set(SEED_FIELDS):
@@ -259,6 +269,16 @@ def parse_tasks(text: str, runtime: bool = False) -> tuple[dict, list[dict]]:
             raise ValueError(f"empty contract for {task['id']}")
         if any(not valid_relative_path(path) for path in task["allowedPaths"]):
             raise ValueError(f"unsafe allowed path for {task['id']}")
+        if task.get("sourceRef"):
+            if not re.fullmatch(r"[A-Za-z0-9._-]+/BUG-\d{4}", task["sourceRef"]):
+                raise ValueError(f"invalid source reference for {task['id']}")
+            if not task["testPaths"] or any(not valid_relative_path(path) for path in task["testPaths"]):
+                raise ValueError(f"invalid test paths for {task['id']}")
+            allowed = {path.replace("\\", "/").strip("/") for path in task["allowedPaths"]}
+            if any(path.replace("\\", "/").strip("/") not in allowed for path in task["testPaths"]):
+                raise ValueError(f"test path outside allowed paths for {task['id']}")
+            if not task["regressionValidationCommands"] or any(command not in task["validationCommands"] for command in task["regressionValidationCommands"]):
+                raise ValueError(f"invalid regression validation for {task['id']}")
         if task["attemptLimit"] <= 0 or task["fixLoopLimit"] < 0 or task["attempt"] > task["attemptLimit"] or task["fixLoop"] > task["fixLoopLimit"]:
             raise ValueError(f"invalid task counters for {task['id']}")
         if not runtime and (task["attempt"] or task["fixLoop"]):
@@ -280,6 +300,9 @@ def parse_tasks(text: str, runtime: bool = False) -> tuple[dict, list[dict]]:
     fix_loop_limits = {task["fixLoopLimit"] for task in tasks}
     if len(attempt_limits) != 1 or len(fix_loop_limits) != 1:
         raise ValueError("task limits must be consistent")
+    source_refs = [task["sourceRef"] for task in tasks if task.get("sourceRef")]
+    if len(source_refs) != len(set(source_refs)):
+        raise ValueError("duplicate task source reference")
     return {
         "baseSha": marker.group(1), "requirementsHash": marker.group(2),
         "taskAttemptLimit": attempt_limits.pop(), "fixLoopLimit": fix_loop_limits.pop(),
@@ -380,7 +403,7 @@ def initial_state(repo: Path, metadata: dict, args: argparse.Namespace) -> dict:
         "reviewSessions": {}, "pullRequests": {}, "providerAttemptCounters": {}, "providerOperationsStarted": 0, "providerDeadlines": {},
         "auditPlanStarted": False, "auditPlanCompleted": False, "auditCallsStarted": 0,
         "auditCallLimit": 0, "auditScopes": {}, "pendingLedgerOperation": None,
-        "targetInstructions": "", "agentsBootstrap": None,
+        "targetInstructions": "", "agentsBootstrap": None, "taskProvenance": {},
         "campaignValidationCommands": campaign_commands,
         "baselineValidation": {
             "baseSha": metadata["baseSha"], "commandsHash": commands_hash(campaign_commands),
@@ -469,7 +492,7 @@ def runtime_progress(state: dict, bugs: list[dict] | None = None) -> str:
         if process.get("status") not in {"running", "queued"}:
             continue
         assignment_id = process.get("assignmentId", "unknown")
-        operations.setdefault(_progress_role(process.get("role", "worker"), process.get("mode")), set()).add(assignment_id)
+        operations.setdefault(_progress_role(process.get("role", "worker"), process.get("mode")), set()).add(display_assignment(state, assignment_id))
         active_assignments.add(assignment_id)
     bootstrap = state.get("agentsBootstrap")
     if bootstrap and bootstrap.get("operation") and "AGENTS" not in active_assignments:
@@ -479,7 +502,7 @@ def runtime_progress(state: dict, bugs: list[dict] | None = None) -> str:
         operations.setdefault(_progress_role(baseline["operation"]), set()).add("BASELINE")
     for assignment_id, task in task_states.items():
         if task.get("operation") and assignment_id not in active_assignments:
-            operations.setdefault(_progress_role(task["operation"]), set()).add(assignment_id)
+            operations.setdefault(_progress_role(task["operation"]), set()).add(display_assignment(state, assignment_id))
     bug_counts = Counter(bug["status"] for bug in (bugs or []))
     bug_summary = " ".join(f"{status}={bug_counts[status]}" for status in ("active", "needs-user", "waiting-provider", "resolved", "backlog") if bug_counts[status])
     parts = [f"tasks {complete}/{total} integrated", f"bugs {bug_summary or 0}", f"agents {len(running)}/{state.get('workerLimit', 0)}" + (f" (+{queued} queued)" if queued else "")]
@@ -675,6 +698,9 @@ def _validate_ledger(store: StateStore, name: str, text: str) -> None:
         seeds = {task["id"]: task["seed"] for task in tasks if task.get("seed")}
         if "taskSeeds" in store.state and seeds != store.state["taskSeeds"]:
             raise RuntimeError("tasks.md seed metadata does not match campaign state")
+        provenance = {task["id"]: {key: task[key] for key in ("sourceRef", "testPaths", "regressionValidationCommands")} for task in tasks if task.get("sourceRef")}
+        if "taskProvenance" in store.state and provenance != store.state["taskProvenance"]:
+            raise RuntimeError("tasks.md provenance metadata does not match campaign state")
     elif name == "bugs.md":
         metadata, _ = parse_bugs(text)
         expected = hashlib.sha256(str(repo.resolve()).encode()).hexdigest()[:12]
@@ -764,8 +790,6 @@ def publish_backlog(store: StateStore, bugs: list[dict]) -> Path | None:
     if backlog:
         atomic_write(path, render_backlog(store.state["campaignId"], repo, backlog))
         return path
-    if os.path.lexists(path):
-        path.unlink()
     return None
 
 
@@ -803,6 +827,9 @@ Do not edit tasks.md, bugs.md, or .relay; do not push, create/merge PRs, change 
 Allowed paths: {json.dumps(assignment['allowedPaths'])}
 Acceptance criteria: {json.dumps(assignment['acceptanceCriteria'])}
 Validation commands: {json.dumps(assignment['validationCommands'])}
+Source reference: {assignment.get('sourceRef', 'none')}
+Test paths: {json.dumps(assignment.get('testPaths', []))}
+Regression validation: {json.dumps(assignment.get('regressionValidationCommands', []))}
 Current candidate: {candidate_sha or 'none'}
 Repair blockers: {json.dumps(blockers or [])}
 Previous validation failure: {previous_failure or 'none'}
@@ -1098,6 +1125,8 @@ def candidate_integrity(store: StateStore, assignment: dict, worktree: Path, res
     outside = sorted(item for item in changed if not allowed_change(item, assignment_paths(store, assignment)))
     if outside:
         raise ValueError(f"candidate changed paths outside assignment scope: {', '.join(outside)}")
+    if assignment.get("sourceRef") and not any(allowed_change(path, assignment["testPaths"]) for path in changed):
+        raise ValueError("backlog candidate did not change a declared test path")
     return sha
 
 
@@ -1365,19 +1394,31 @@ def pr_inspect(store: StateStore, key: str, identifier: str | int) -> dict:
 
 def pr_create(store: StateStore, key: str, branch: str, title: str, body: Path) -> dict:
     if store.state.get("provider") == "azure-devops":
-        args = ["repos", "pr", "create", "--source-branch", branch, "--target-branch", "main", "--title", title, "--description", " ".join(body.read_text(encoding="utf-8").splitlines()), *_azure_context(store.state), "--output", "json"]
+        args = ["repos", "pr", "create", "--source-branch", branch, "--target-branch", "main", "--title", title, "--description", body.read_text(encoding="utf-8"), *_azure_context(store.state), "--output", "json"]
         return normalize_pr(store.state, _provider_json(provider_with_retries(store, key, *args)))
     provider_with_retries(store, key, "pr", "create", "--base", "main", "--head", branch, "--title", title, "--body-file", str(body), "--repo", store.state.get("githubRepository", "fake/relay"))
     return pr_inspect(store, key.replace("pr-create", "pr-view"), branch)
 
 
-def pr_merge(store: StateStore, key: str, number: int, bypass_sha: str | None = None) -> None:
+def pr_edit(store: StateStore, key: str, number: int, title: str, body: Path) -> None:
     if store.state.get("provider") == "azure-devops":
-        provider_with_retries(store, key, "repos", "pr", "update", "--id", str(number), "--status", "completed", "--squash", "true" if store.state["mergeMethod"] == "squash" else "false", "--delete-source-branch", "true", *_azure_context(store.state, repository=False, project=False), "--output", "json")
+        provider_with_retries(store, key, "repos", "pr", "update", "--id", str(number), "--title", title, "--description", body.read_text(encoding="utf-8"), *_azure_context(store.state, repository=False, project=False), "--output", "json")
+    else:
+        provider_with_retries(store, key, "pr", "edit", str(number), "--title", title, "--body-file", str(body), "--repo", store.state.get("githubRepository", "fake/relay"))
+
+
+def pr_merge(store: StateStore, key: str, number: int, bypass_sha: str | None = None, subject: str | None = None, body: str | None = None) -> None:
+    if store.state.get("provider") == "azure-devops":
+        args = ["repos", "pr", "update", "--id", str(number), "--status", "completed", "--squash", "true" if store.state["mergeMethod"] == "squash" else "false", "--delete-source-branch", "true"]
+        if subject is not None:
+            args += ["--merge-commit-message", subject + (f"\n\n{body}" if body else "")]
+        provider_with_retries(store, key, *args, *_azure_context(store.state, repository=False, project=False), "--output", "json")
     else:
         args = ["pr", "merge", str(number), f"--{store.state['mergeMethod']}", "--delete-branch", "--repo", store.state.get("githubRepository", "fake/relay")]
         if bypass_sha:
             args += ["--admin", "--match-head-commit", bypass_sha]
+        if subject is not None and store.state["mergeMethod"] != "rebase":
+            args += ["--subject", subject, "--body", body or ""]
         provider_with_retries(store, key, *args)
 
 
@@ -1422,6 +1463,85 @@ def git_provider_with_retries(store: StateStore, key: str, repo: Path, *args: st
     raise RuntimeError(f"Git provider operation exhausted attempts: {key}; log: {store.path.parent / 'logs' / 'provider.log'}")
 
 
+def qualified_assignment(state: dict, assignment_id: str) -> str:
+    return f"{state['campaignId']}/{assignment_id}"
+
+
+def display_assignment(state: dict, assignment_id: str) -> str:
+    return qualified_assignment(state, assignment_id) if state.get("campaignId") and re.fullmatch(r"(?:TASK|BUG)-\d{4}", assignment_id) else assignment_id
+
+
+def canonical_pr_metadata(state: dict, assignment: dict, sha: str) -> tuple[str, str, str]:
+    qualified = qualified_assignment(state, assignment["id"])
+    source = assignment.get("sourceRef")
+    title = f"{qualified}{f' [source {source}]' if source else ''}: {assignment['title']}"
+    sections = (
+        ("Acceptance criteria", assignment["acceptanceCriteria"]),
+        ("Allowed paths", assignment["allowedPaths"]),
+        ("Test paths", assignment.get("testPaths", [])),
+        ("Focused validation", assignment["validationCommands"]),
+        ("Regression validation", assignment.get("regressionValidationCommands", [])),
+        ("Campaign validation", state.get("campaignValidationCommands", [])),
+    )
+    lines = [
+        f"Campaign: `{state['campaignId']}`", f"Qualified assignment: `{qualified}`",
+        f"Source reference: `{source or 'none'}`", f"Current candidate SHA: `{sha}`", "",
+    ]
+    for heading, values in sections:
+        lines += [f"## {heading}", "", *([f"- `{value}`" for value in values] or ["- none"]), ""]
+    body = "\n".join(lines).rstrip() + "\n"
+    digest = hashlib.sha256((title + "\n" + body).encode()).hexdigest()
+    return title, body, digest
+
+
+def canonical_merge_metadata(state: dict, assignment: dict, sha: str) -> tuple[str, str, str]:
+    title, _body, _digest = canonical_pr_metadata(state, assignment, sha)
+    trailers = [
+        f"Relay-Campaign: {state['campaignId']}",
+        f"Relay-Assignment: {qualified_assignment(state, assignment['id'])}",
+        *([f"Relay-Source: {assignment['sourceRef']}"] if assignment.get("sourceRef") else []),
+        f"Relay-Candidate: {sha}",
+    ]
+    body = "\n".join(trailers)
+    return title, body, hashlib.sha256((title + "\n" + body).encode()).hexdigest()
+
+
+def update_pr_metadata(store: StateStore, assignment: dict, pr: dict, sha: str) -> dict:
+    assignment_id = assignment["id"]
+    if pr["headRefOid"] != sha:
+        raise RuntimeError("provider pull request source commit does not match candidate")
+    title, content, digest = canonical_pr_metadata(store.state, assignment, sha)
+    proof = store.state["taskStates"][assignment_id].get("prMetadata")
+    if proof == {"hash": digest, "candidateSha": sha, "sourceRef": assignment.get("sourceRef"), "title": title}:
+        return pr
+    body = store.path.parent / f".{assignment_id}-pr.md"
+    atomic_write(body, content)
+    try:
+        pr_edit(store, f"{assignment_id}:pr-edit:{sha}", pr["number"], title, body)
+    finally:
+        body.unlink(missing_ok=True)
+    store.update(lambda state: state["taskStates"][assignment_id].__setitem__("prMetadata", {"hash": digest, "candidateSha": sha, "sourceRef": assignment.get("sourceRef"), "title": title}))
+    return pr
+
+
+def mark_integrated(store: StateStore, assignment: dict, pr: dict, reviewed_sha: str, provider_status: str) -> None:
+    assignment_id = assignment["id"]
+    title, _body, metadata_hash = canonical_pr_metadata(store.state, assignment, reviewed_sha)
+    _subject, _merge_body, merge_hash = canonical_merge_metadata(store.state, assignment, reviewed_sha)
+    task_state = store.state["taskStates"][assignment_id]
+    metadata = task_state.get("prMetadata")
+    current_pr = task_state.get("pr") or store.state["pullRequests"].get(assignment_id) or pr
+    expected = {"hash": metadata_hash, "candidateSha": reviewed_sha, "sourceRef": assignment.get("sourceRef"), "title": title}
+    if metadata != expected or current_pr.get("headRefOid") != reviewed_sha:
+        raise RuntimeError("provider metadata does not match reviewed candidate")
+    record = {**current_pr, "state": "MERGED", "headRefOid": reviewed_sha}
+    proof = {
+        "finalCandidate": reviewed_sha, "sourceRef": assignment.get("sourceRef"),
+        "prMetadataHash": metadata_hash, "mergeMetadataHash": merge_hash, "mergedProviderRecord": record,
+    }
+    store.update(lambda state: (state["taskStates"][assignment_id].update(phase="integrated", merged=True, providerStatus=provider_status, providerProof=proof), state["pullRequests"].__setitem__(assignment_id, record)))
+
+
 def publish_candidate(store: StateStore, assignment: dict, worktree: Path, branch: str, sha: str) -> dict:
     assignment_id, task_state = assignment["id"], store.state["taskStates"][assignment["id"]]
     start_operation(store, assignment_id, "publish", store.state["providerTimeoutSeconds"])
@@ -1435,16 +1555,16 @@ def publish_candidate(store: StateStore, assignment: dict, worktree: Path, branc
         store.update(lambda state: state["taskStates"][assignment_id].update(pushed=True, pushedSha=sha))
         console("DONE", f"operation=publish assignment={assignment_id} branch={branch}")
     if task_state.get("pr"):
-        refresh = pushed or task_state["pr"].get("headRefOid") != sha
-        pr = pr_inspect(store, f"{assignment_id}:pr-refresh:{sha}", task_state["pr"]["number"]) if refresh else task_state["pr"]
+        pr = pr_inspect(store, f"{assignment_id}:pr-refresh:{sha}", task_state["pr"]["number"])
         if pr["headRefOid"] != sha:
             raise RuntimeError("provider pull request source commit does not match candidate")
-        if refresh:
-            store.update(lambda state: (state["taskStates"][assignment_id].__setitem__("pr", pr), state["pullRequests"].__setitem__(assignment_id, pr)))
+        store.update(lambda state: (state["taskStates"][assignment_id].__setitem__("pr", pr), state["pullRequests"].__setitem__(assignment_id, pr)))
+        update_pr_metadata(store, assignment, pr, sha)
         clear_operation(store, assignment_id, "publish")
         return pr
     body = store.path.parent / f".{assignment_id}-pr.md"
-    atomic_write(body, f"Relay assignment {assignment_id}\n\nCandidate: {sha}\n")
+    title, content, _digest = canonical_pr_metadata(store.state, assignment, sha)
+    atomic_write(body, content)
     try:
         matches = pr_discover(store, f"{assignment_id}:pr-list", branch)
         matching = [pr for pr in matches if pr["headRefOid"] == sha]
@@ -1452,10 +1572,11 @@ def publish_candidate(store: StateStore, assignment: dict, worktree: Path, branc
         if pr is None and any(pr["state"] == "OPEN" for pr in matches):
             raise RuntimeError("provider pull request source commit does not match candidate")
         if pr is None:
-            pr = pr_create(store, f"{assignment_id}:pr-create", branch, f"{assignment_id}: {assignment['title']}", body)
+            pr = pr_create(store, f"{assignment_id}:pr-create", branch, title, body)
         if pr["headRefOid"] != sha:
             raise RuntimeError("provider pull request source commit does not match candidate")
         store.update(lambda state: (state["taskStates"][assignment_id].__setitem__("pr", pr), state["pullRequests"].__setitem__(assignment_id, pr)))
+        update_pr_metadata(store, assignment, pr, sha)
         console("DONE", f"operation=pull-request assignment={assignment_id} pr={pr.get('number')}")
         clear_operation(store, assignment_id, "publish")
         return pr
@@ -1775,6 +1896,7 @@ def wait_for_checks(store: StateStore, assignment_id: str, pr: dict, reviewed_sh
 def merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignment: dict, worktree: Path, branch: str, pr: dict, reviewed_sha: str) -> bool:
     assignment_id = assignment["id"]
     session = store.state["reviewSessions"][assignment_id]
+    merge_subject, merge_body, _merge_hash = canonical_merge_metadata(store.state, assignment, reviewed_sha)
     provider_approve(store, assignment_id, pr, reviewed_sha)
     status = wait_for_checks(store, assignment_id, pr, reviewed_sha)
     while status in {"failed", "repair-required"}:
@@ -1815,12 +1937,13 @@ def merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignme
             continue
         reviewed_sha = replacement
         session["reviewedSha"] = replacement
+        merge_subject, merge_body, _merge_hash = canonical_merge_metadata(store.state, assignment, reviewed_sha)
         store.state["providerDeadlines"].pop(assignment_id, None)
         store.save()
         provider_approve(store, assignment_id, pr, reviewed_sha)
         status = wait_for_checks(store, assignment_id, pr, reviewed_sha)
     if status == "merged":
-        store.update(lambda state: (state["taskStates"][assignment_id].update(phase="integrated", merged=True, providerStatus="passed"), state["pullRequests"][assignment_id].update(state="MERGED")))
+        mark_integrated(store, assignment, pr, reviewed_sha, "passed")
         console("DONE", f"operation=merge assignment={assignment_id} pr={pr['number']} source=provider")
         clear_operation(store, assignment_id)
         return True
@@ -1829,14 +1952,14 @@ def merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignme
         start_operation(store, assignment_id, "merge-bypass", store.state["providerTimeoutSeconds"])
         console("START", f"operation=merge-bypass assignment={assignment_id} pr={pr['number']} deadline={store.state['providerTimeoutSeconds']}s")
         try:
-            pr_merge(store, f"{assignment_id}:merge-bypass:{reviewed_sha}", pr["number"], reviewed_sha)
+            pr_merge(store, f"{assignment_id}:merge-bypass:{reviewed_sha}", pr["number"], reviewed_sha, merge_subject, merge_body)
         except (RuntimeError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
             provider_status = f"merge-bypass-denied; log: {log}"
             store.update(lambda state: state["taskStates"][assignment_id].update(phase="waiting-provider", providerStatus=provider_status))
             console("BLOCKED", f"operation=merge-bypass assignment={assignment_id} pr={pr['number']} reason=denied log={log}")
             clear_operation(store, assignment_id, "merge-bypass")
             return False
-        store.update(lambda state: (state["taskStates"][assignment_id].update(phase="integrated", merged=True, providerStatus="bypassed"), state["pullRequests"][assignment_id].update(state="MERGED")))
+        mark_integrated(store, assignment, pr, reviewed_sha, "bypassed")
         console("DONE", f"operation=merge-bypass assignment={assignment_id} pr={pr['number']}")
         clear_operation(store, assignment_id, "merge-bypass")
         return True
@@ -1847,8 +1970,8 @@ def merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignme
         return False
     start_operation(store, assignment_id, "merge", store.state["providerTimeoutSeconds"])
     console("START", f"operation=merge assignment={assignment_id} pr={pr['number']} deadline={store.state['providerTimeoutSeconds']}s")
-    pr_merge(store, f"{assignment_id}:merge", pr["number"])
-    store.update(lambda state: (state["taskStates"][assignment_id].update(phase="integrated", merged=True, providerStatus="passed"), state["pullRequests"][assignment_id].update(state="MERGED")))
+    pr_merge(store, f"{assignment_id}:merge", pr["number"], subject=merge_subject, body=merge_body)
+    mark_integrated(store, assignment, pr, reviewed_sha, "passed")
     console("DONE", f"operation=merge assignment={assignment_id} pr={pr['number']}")
     clear_operation(store, assignment_id, "merge")
     return True
@@ -2413,11 +2536,14 @@ def _check_legacy_baseline(store: StateStore, groups: list[dict]) -> list[dict]:
 
 
 def _archive_contract(task: dict) -> dict:
-    return {
+    contract = {
         "id": task["id"], "title": task["title"], "status": "ready", "priority": task["priority"],
         "dependencies": list(task["dependencies"]), "allowedPaths": list(task["allowedPaths"]),
         "acceptanceCriteria": list(task["acceptanceCriteria"]), "validationCommands": list(task["validationCommands"]),
     }
+    if task.get("sourceRef"):
+        contract.update({key: task[key] for key in ("sourceRef", "testPaths", "regressionValidationCommands")})
+    return contract
 
 
 def plan_legacy_migration(store: StateStore, tasks: list[dict]) -> list[dict]:
@@ -2930,6 +3056,9 @@ def reconcile(store: StateStore, allow_terminal_replay: bool = True) -> None:
     seeds = {task["id"]: task["seed"] for task in ledger_tasks if task.get("seed")}
     if seeds != store.state.get("taskSeeds", {}):
         raise RuntimeError("tasks.md seed metadata does not match campaign state")
+    provenance = {task["id"]: {key: task[key] for key in ("sourceRef", "testPaths", "regressionValidationCommands")} for task in ledger_tasks if task.get("sourceRef")}
+    if provenance != store.state.get("taskProvenance", {}):
+        raise RuntimeError("tasks.md provenance metadata does not match campaign state")
     baseline = store.state.get("baselineValidation")
     if allow_terminal_replay and store.state.get("phase") == "needs-user" and baseline and baseline.get("phase") == "blocked" and not baseline.get("automaticReplayUsed"):
         baseline.update(phase="pending", currentCommand=None, deadline=None, error=None, log=None, automaticReplayUsed=True)
@@ -3114,7 +3243,7 @@ def _publication_retry_key(value: object, assignment_id: str) -> str | None:
     if not failure or not failure[1].startswith(f"{assignment_id}:"):
         return None
     operation = failure[1][len(assignment_id) + 1:]
-    return failure[1] if operation in {"pr-list", "pr-create"} or re.fullmatch(r"pr-refresh:[0-9a-f]+", operation) else None
+    return failure[1] if operation in {"pr-list", "pr-create"} or re.fullmatch(r"pr-(?:refresh|edit):[0-9a-f]+", operation) else None
 
 
 def _blocker_detail(value: object) -> tuple[str, str]:
@@ -3123,7 +3252,7 @@ def _blocker_detail(value: object) -> tuple[str, str]:
     provider = _provider_exhaustion(value)
     if provider:
         operation = provider[1].split(":", 1)[-1].split(":", 1)[0]
-        labels = {"pr-list": "PR discovery", "pr-create": "PR creation", "pr-refresh": "PR refresh"}
+        labels = {"pr-list": "PR discovery", "pr-create": "PR creation", "pr-refresh": "PR refresh", "pr-edit": "PR metadata update"}
         if operation in labels:
             return "provider-publication", f"{provider[0]} {labels[operation]} exhausted attempts"
     return "assignment", _normalized_error(value)
@@ -3144,6 +3273,7 @@ def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[
     blocked_groups: dict[tuple[str, str, str], list[str]] = {}
     for task in sorted(tasks, key=lambda item: item["id"]):
         task_state = task_states.get(task["id"], {})
+        label = display_assignment(state, task["id"])
         phase = task_state.get("phase")
         if task["status"] == "satisfied":
             status = "satisfied"
@@ -3181,13 +3311,16 @@ def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[
         fixes = repair_attempts_started(state, task["id"])
         if fixes:
             detail += f"; fix loop {fixes}/{state.get('fixLoopLimit', fixes)}"
+        if task.get("sourceRef"):
+            detail += f"; sourceRef {task['sourceRef']}"
         counts[status] += 1
         if status == "blocked" and not task_state.get("validationFailure"):
             blocker = task_state.get("error") or task_state.get("providerStatus") or detail
             category, reason = _blocker_detail(blocker)
-            blocked_groups.setdefault((category, reason, _blocker_log(state, blocker)), []).append(task["id"])
+            blocked_groups.setdefault((category, reason, _blocker_log(state, blocker)), []).append(label)
         else:
             bullets.append(f"- {task['id']} {status}: {task['title']} — {detail}")
+    bullets = [re.sub(r"^- ((?:TASK|BUG)-\d{4}) ", lambda match: f"- {display_assignment(state, match.group(1))} ", line) for line in bullets]
     bug_counts = Counter(bug["status"] for bug in bugs)
     lines = [f"tasks={counts['completed']}/{len(tasks)} completed blocked={counts['blocked']} waiting={counts['waiting']} satisfied={counts['satisfied']} not-run={counts['not-run']} bugs={len(bugs)} backlog={bug_counts['backlog']}"]
     baseline = state.get("baselineValidation")
@@ -3211,7 +3344,7 @@ def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[
         group["ids"].append(assignment_id)
         group["logs"].append(task_state.get("validationLog", "not-recorded"))
     for (category, _command_hash, outcome), group in sorted(validation_groups.items()):
-        lines.append(f"- VALIDATION BLOCKER category={category} outcome={outcome} command={group['command']} affected={','.join(group['ids'])} required={group['required']} logs={','.join(group['logs'])}")
+        lines.append(f"- VALIDATION BLOCKER category={category} outcome={outcome} command={group['command']} affected={','.join(display_assignment(state, assignment_id) for assignment_id in group['ids'])} required={group['required']} logs={','.join(group['logs'])}")
     for (category, reason, log), assignment_ids in sorted(blocked_groups.items()):
         lines.append(f"- BLOCKED category={category} affected={','.join(assignment_ids)} reason={reason} log={log}")
     lines.extend(bullets)
@@ -3229,7 +3362,7 @@ def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[
         fixes = repair_attempts_started(state, bug["id"])
         if fixes:
             detail += f"; fix loop {fixes}/{state.get('fixLoopLimit', fixes)}"
-        lines.append(f"- {bug['id']} {status}: {detail}")
+        lines.append(f"- {display_assignment(state, bug['id'])} {status}: {detail}")
     executable = sys.executable
     run_path = str(Path(__file__).resolve())
     repo = state["repository"]
@@ -3249,7 +3382,7 @@ def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[
         confirm_cleanup = _shell_join([executable, run_path, "--repo", repo, "--cleanup", "--confirm"])
         next_line = f"Review {Path(repo) / 'BACKLOG.md'}, then preview cleanup with: {cleanup}; then confirm with: {confirm_cleanup}" if bug_counts["backlog"] else f"Preview cleanup with: {cleanup}; then confirm with: {confirm_cleanup}"
     elif state.get("phase") == "waiting-provider":
-        pending = sorted(assignment_id for assignment_id, value in task_states.items() if value.get("phase") == "waiting-provider")
+        pending = sorted(display_assignment(state, assignment_id) for assignment_id, value in task_states.items() if value.get("phase") == "waiting-provider")
         resume = _shell_join([executable, run_path, "--repo", repo])
         next_line = f"Resolve pending checks or approvals for {', '.join(pending) or 'the provider'}, then resume with: {resume}"
     elif state.get("phase") == "interrupted":
@@ -3326,6 +3459,32 @@ def report_legacy_refusal(store: StateStore) -> None:
     stderr_event("NEXT", f"Preview legacy migration with: {command}; then confirm with: {confirm}")
 
 
+def validate_cleanup_provider_proof(state: dict, assignment_id: str) -> None:
+    task_state = state.get("taskStates", {}).get(assignment_id, {})
+    candidate = task_state.get("candidateSha")
+    provenance = state.get("taskProvenance", {}).get(assignment_id, {})
+    source_ref = provenance.get("sourceRef")
+    metadata = task_state.get("prMetadata")
+    proof = task_state.get("providerProof")
+    if not candidate or not isinstance(metadata, dict) or not isinstance(proof, dict):
+        raise RuntimeError(f"cleanup requires provider proof for {assignment_id}")
+    record = proof.get("mergedProviderRecord")
+    persisted = state.get("pullRequests", {}).get(assignment_id)
+    if (
+        proof.get("finalCandidate") != candidate
+        or proof.get("sourceRef") != source_ref
+        or proof.get("prMetadataHash") != metadata.get("hash")
+        or metadata.get("candidateSha") != candidate
+        or metadata.get("sourceRef") != source_ref
+        or not proof.get("mergeMetadataHash")
+        or not isinstance(record, dict)
+        or record.get("state") != "MERGED"
+        or record.get("headRefOid") != candidate
+        or persisted != record
+    ):
+        raise RuntimeError(f"cleanup provider proof is stale for {assignment_id}")
+
+
 def permanent_cleanup(repo: Path, confirm: bool) -> int:
     root, relay = repo.resolve(), repo.resolve() / ".relay"
     state_path = relay / "state.json"
@@ -3342,6 +3501,9 @@ def permanent_cleanup(repo: Path, confirm: bool) -> int:
     bug_marker = f"<!-- relay: campaign={state['campaignId']} repository={hashlib.sha256(str(root).encode()).hexdigest()[:12]} -->"
     if not bugs.is_file() or bug_marker not in bugs.read_text(encoding="utf-8"):
         raise RuntimeError("bugs.md ownership mismatch")
+    for assignment_id, task_state in state.get("taskStates", {}).items():
+        if task_state.get("phase") == "integrated":
+            validate_cleanup_provider_proof(state, assignment_id)
     plans = []
     for item in root.iterdir():
         if "plan" not in item.name.lower() or not item.is_file():
@@ -3391,6 +3553,7 @@ def initialize_campaign(repo: Path, text: str, args: argparse.Namespace) -> tupl
     (relay / "logs").mkdir()
     state = initial_state(repo, metadata, args)
     state["taskSeeds"] = {task["id"]: task["seed"] for task in tasks if task.get("seed")}
+    state["taskProvenance"] = {task["id"]: {key: task[key] for key in ("sourceRef", "testPaths", "regressionValidationCommands")} for task in tasks if task.get("sourceRef")}
     state["taskTotal"] = len(tasks)
     repository_root, prefix = repository_layout(repo, args.provider_timeout)
     state.update(repositoryRoot=str(repository_root), repositoryPrefix=prefix)
