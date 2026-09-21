@@ -8,7 +8,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-from run import _blocker_detail, _blocker_log, _publication_retry_key, parse_bugs, parse_tasks, repair_attempts_started, review_call_limit
+from run import _blocker_detail, _blocker_log, _publication_retry_key, display_assignment, parse_bugs, parse_tasks, repair_attempts_started, review_call_limit
 
 
 def parser() -> argparse.ArgumentParser:
@@ -33,6 +33,7 @@ def main(argv: list[str] | None = None) -> int:
     _, ledger_bugs = parse_bugs((repo / "bugs.md").read_text(encoding="utf-8"))
     now = datetime.now().timestamp()
     task_states = state.get("taskStates", {})
+    label = lambda assignment_id: display_assignment(state, assignment_id)
     task_ids = {task["id"] for task in tasks}
     integrated = {key for key, value in task_states.items() if key in task_ids and value.get("phase") == "integrated"}
     print(f"Overall: {len(integrated)}/{len(tasks)} integrated")
@@ -56,7 +57,7 @@ def main(argv: list[str] | None = None) -> int:
             elapsed = age(started) if started else "not-started"
             deadline = operation.get("operationDeadline")
             command = f" command={operation['validationPosition']}/{operation.get('validationTotal', '?')}" if operation.get("validationPosition") else ""
-            print(f"  {assignment_id}: {operation.get('operation', 'unknown')}{command} elapsed={elapsed}" + (f" deadline-in={max(0, int(deadline - now))}s" if deadline else ""))
+            print(f"  {label(assignment_id)}: {operation.get('operation', 'unknown')}{command} elapsed={elapsed}" + (f" deadline-in={max(0, int(deadline - now))}s" if deadline else ""))
 
     waits = []
     for assignment_id, task in (("AGENTS", bootstrap), *sorted(task_states.items())):
@@ -68,7 +69,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\nExternal/provider waits")
         for assignment_id, pr, task, deadline in waits:
             remaining = f"{max(0, int(deadline - now))}s" if deadline else "not-started"
-            print(f"  {assignment_id}: PR #{pr.get('number', '?')} status={task.get('providerStatus', 'pending')} deadline-in={remaining} next={task.get('nextAction', 'poll' if deadline else 'resume')}")
+            print(f"  {label(assignment_id)}: PR #{pr.get('number', '?')} status={task.get('providerStatus', 'pending')} deadline-in={remaining} next={task.get('nextAction', 'poll' if deadline else 'resume')}")
 
     blockers = []
     if state.get("error"):
@@ -81,7 +82,7 @@ def main(argv: list[str] | None = None) -> int:
         groups = {}
         for assignment_id, reason in sorted(blockers):
             category, concise = _blocker_detail(reason)
-            groups.setdefault((category, concise, _blocker_log(state, reason)), []).append(assignment_id)
+            groups.setdefault((category, concise, _blocker_log(state, reason)), []).append(label(assignment_id))
         for (category, reason, log), assignment_ids in sorted(groups.items()):
             print(f"  category={category} affected={','.join(assignment_ids)} reason={reason} log={log}")
 
@@ -95,6 +96,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nTasks\n  Total: {len(tasks)}\n  Ready: {ready}")
     phases = Counter(value.get("phase", "unknown") for key, value in task_states.items() if key in task_ids)
     for phase, count in sorted(phases.items()): print(f"  {phase}: {count}")
+    for task in tasks:
+        if task.get("sourceRef"):
+            print(f"  {label(task['id'])}: sourceRef={task['sourceRef']}")
     budget_ids = set(state.get("attemptCounters", {})) | {assignment_id for assignment_id, task in task_states.items() if task.get("validationRepairAttemptsStarted") or task.get("validationRepairCallsStarted")}
     if budget_ids or state.get("providerDeadlines"):
         print("\nBudgets and deadlines")
@@ -102,21 +106,21 @@ def main(argv: list[str] | None = None) -> int:
             session = state.get("reviewSessions", {}).get(assignment_id)
             calls = session.get("reviewCallsStarted", 0) if session else task_states.get(assignment_id, {}).get("validationRepairCallsStarted", 0)
             call_limit = session.get("reviewCallLimit") if session else review_call_limit(state["fixLoopLimit"], state["formatRetryAllowance"])
-            print(f"  {assignment_id}: attempts={state.get('attemptCounters', {}).get(assignment_id, 0)}/{state['taskAttemptLimit']} fixes={repair_attempts_started(state, assignment_id)}/{state['fixLoopLimit']} review-calls={calls}/{call_limit} validations={state.get('validationCommandsStarted', {}).get(assignment_id, 0)} agent={state['agentTimeoutSeconds']}s validation={state['validationTimeoutSeconds']}s")
-        for assignment_id, deadline in sorted(state.get("providerDeadlines", {}).items()): print(f"  {assignment_id}: provider-check-deadline-in={max(0, int(deadline - now))}s")
+            print(f"  {label(assignment_id)}: attempts={state.get('attemptCounters', {}).get(assignment_id, 0)}/{state['taskAttemptLimit']} fixes={repair_attempts_started(state, assignment_id)}/{state['fixLoopLimit']} review-calls={calls}/{call_limit} validations={state.get('validationCommandsStarted', {}).get(assignment_id, 0)} agent={state['agentTimeoutSeconds']}s validation={state['validationTimeoutSeconds']}s")
+        for assignment_id, deadline in sorted(state.get("providerDeadlines", {}).items()): print(f"  {label(assignment_id)}: provider-check-deadline-in={max(0, int(deadline - now))}s")
     if state.get("reviewSessions"):
         print("\nReview sessions")
-        for assignment_id, session in sorted(state["reviewSessions"].items()): print(f"  {assignment_id}: {session['phase']} calls={session['reviewCallsStarted']}/{session['reviewCallLimit']} fixes={session['repairAttemptsStarted']}/{state['fixLoopLimit']}")
+        for assignment_id, session in sorted(state["reviewSessions"].items()): print(f"  {label(assignment_id)}: {session['phase']} calls={session['reviewCallsStarted']}/{session['reviewCallLimit']} fixes={session['repairAttemptsStarted']}/{state['fixLoopLimit']}")
     if state.get("recoveryAttemptGrants") or state.get("recoveryHistory") or state.get("pendingRecovery"):
         print("\nRecovery")
         for assignment_id, count in sorted(state.get("recoveryAttemptGrants", {}).items()):
-            print(f"  {assignment_id}: grants={count} started={state.get('recoveryAttemptsStarted', {}).get(assignment_id, 0)}")
+            print(f"  {label(assignment_id)}: grants={count} started={state.get('recoveryAttemptsStarted', {}).get(assignment_id, 0)}")
         for assignment_id, paths in sorted(state.get("recoveryAllowedPaths", {}).items()):
-            print(f"  {assignment_id}: adopted user deletions={','.join(paths)}")
+            print(f"  {label(assignment_id)}: adopted user deletions={','.join(paths)}")
         pending = state.get("pendingRecovery") or {}
         for action in pending.get("actions", []):
             key = f"{action['action']}:{action['assignmentId']}"
-            print(f"  {action['assignmentId']}: {action['action']} status={'done' if key in pending.get('completed', []) else 'required'}")
+            print(f"  {label(action['assignmentId'])}: {action['action']} status={'done' if key in pending.get('completed', []) else 'required'}")
         for index, recovery in enumerate(state.get("recoveryHistory", []), 1):
             actions = ", ".join(f"{item['assignmentId']}:{item['action']}" for item in recovery["actions"])
             print(f"  history-{index} {recovery['recoveredAt']}: {actions}")
@@ -131,16 +135,16 @@ def main(argv: list[str] | None = None) -> int:
                 action = "correct the validation condition, then use the printed replay or explicit grant command"
             else:
                 action = "inspect with run.py --recover and an explicit disposition"
-            print(f"  {assignment_id}: {action}")
+            print(f"  {label(assignment_id)}: {action}")
     if bugs:
         print("\nBugs")
         for label, count in sorted(bugs.items()): print(f"  {label}: {count}")
     if state.get("worktrees"):
         print("\nWorktrees")
-        for assignment_id, record in sorted(state["worktrees"].items()): print(f"  {assignment_id}: {record['path']}")
+        for assignment_id, record in sorted(state["worktrees"].items()): print(f"  {label(assignment_id)}: {record['path']}")
     if state.get("pullRequests"):
         print("\nPull requests")
-        for assignment_id, pr in sorted(state["pullRequests"].items()): print(f"  {assignment_id}: #{pr.get('number')} {pr.get('state', 'unknown')} checks={task_states.get(assignment_id, {}).get('providerStatus', bootstrap.get('providerStatus', 'unknown') if assignment_id == 'AGENTS' else 'unknown')} {pr.get('url', '')}")
+        for assignment_id, pr in sorted(state["pullRequests"].items()): print(f"  {label(assignment_id)}: #{pr.get('number')} {pr.get('state', 'unknown')} checks={task_states.get(assignment_id, {}).get('providerStatus', bootstrap.get('providerStatus', 'unknown') if assignment_id == 'AGENTS' else 'unknown')} {pr.get('url', '')}")
     return 0
 
 

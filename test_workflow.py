@@ -89,6 +89,25 @@ class ContractTests(unittest.TestCase):
             "acceptanceCriteria": ["It works."], "validationCommands": ["python -m unittest"],
         }
 
+    def backlog_bug(self, bug_id="BUG-0001"):
+        return {
+            "id": bug_id, "title": "Repair defect", "severity": "P1", "status": "backlog",
+            "source": "TASK-0009", "sourceFindingId": "finding-1", "location": "src/app.py:12",
+            "failure": "input fails", "reproduction": "python -m unittest tests.test_app",
+            "requirement": "input works", "evidence": "exit 1", "deferralReason": "next campaign",
+            "allowedPaths": ["src/app.py"],
+        }
+
+    def backlog_task(self, source_ref="origin/BUG-0001"):
+        task = self.task()
+        task.update(
+            allowedPaths=["src/app.py", "tests/test_app.py"], sourceRef=source_ref,
+            testPaths=["tests/test_app.py"],
+            regressionValidationCommands=["python -m unittest tests.test_app"],
+            validationCommands=["python -m unittest tests.test_app"],
+        )
+        return task
+
     def test_plan_round_trip(self):
         text = plan.render_tasks([self.task()], "0123456789abcdef", "abc123")
         metadata, tasks = run.parse_tasks(text)
@@ -112,6 +131,55 @@ class ContractTests(unittest.TestCase):
         _, parsed = run.parse_tasks(text)
         self.assertEqual(parsed[0]["seed"], task["seed"])
         self.assertNotEqual(plan.plan_digest([task], ["full build"]), plan.plan_digest([{key: value for key, value in task.items() if key != "seed"}], ["full build"]))
+
+    def test_backlog_parser_preserves_owned_qualified_entries(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            parsed = plan.parse_backlog(run.render_backlog("origin", root, [self.backlog_bug()]), root)
+            self.assertEqual(parsed["campaignId"], "origin")
+            self.assertEqual(parsed["entries"][0]["sourceRef"], "origin/BUG-0001")
+            self.assertEqual(parsed["entries"][0]["allowedPaths"], ["src/app.py"])
+            self.assertIsNone(plan.parse_backlog("# User requirements\n", root))
+
+    def test_backlog_parser_rejects_malformed_or_unsafe_contracts(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            valid = run.render_backlog("origin", root, [self.backlog_bug()])
+            cases = {
+                "marker": valid.replace("<!-- relay: backlog", "<!-- not-relay: backlog"),
+                "repository": valid.replace(hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:12], "0" * 12),
+                "missing": valid.replace("- Evidence: exit 1\n", ""),
+                "unsafe": valid.replace("`src/app.py`", "`../app.py`"),
+                "empty": run.render_backlog("origin", root, []),
+                "duplicate": valid + valid[valid.index("## BUG-0001"):],
+            }
+            for label, text in cases.items():
+                with self.subTest(label=label), self.assertRaises(ValueError):
+                    plan.parse_backlog(text, root)
+
+    def test_backlog_plan_requires_exact_mapping_and_regression_contract(self):
+        entries = [{**self.backlog_bug(), "sourceRef": "origin/BUG-0001"}]
+        valid = {"campaignValidationCommands": ["python -m unittest"], "tasks": [self.backlog_task()]}
+        self.assertEqual(plan.validate_plan(valid, entries), valid)
+        variants = []
+        for change in (
+            {"sourceRef": "origin/BUG-9999"}, {"testPaths": []},
+            {"allowedPaths": ["src/app.py"]}, {"regressionValidationCommands": ["missing command"]},
+        ):
+            variants.append(valid | {"tasks": [self.backlog_task() | change]})
+        variants += [valid | {"tasks": []}, valid | {"tasks": [self.backlog_task(), self.backlog_task("origin/BUG-0001")] }]
+        for value in variants:
+            with self.assertRaises(ValueError):
+                plan.validate_plan(value, entries)
+
+    def test_provenance_render_parse_and_digest_round_trip(self):
+        task = self.backlog_task()
+        commands = ["python -m unittest"]
+        text = plan.render_tasks([task], "0123456", "abc123", campaign_validation_commands=commands)
+        _, parsed = run.parse_tasks(text)
+        for key in ("sourceRef", "testPaths", "regressionValidationCommands"):
+            self.assertEqual(parsed[0][key], task[key])
+        self.assertNotEqual(plan.plan_digest([task], commands), plan.plan_digest([{key: value for key, value in task.items() if key != "sourceRef"}], commands))
 
     def test_planning_result_requires_campaign_validation(self):
         with self.assertRaisesRegex(ValueError, "campaign validation"):
@@ -339,6 +407,14 @@ class PlanningTests(unittest.TestCase):
         self.assertIn("attempt=2/2 call=2/2 timeout=10s", events[2][1])
         self.assertEqual(budget.started, 2)
 
+    def test_backlog_planner_stops_when_no_test_contract_is_returned(self):
+        entry = {**ContractTests().backlog_bug(), "sourceRef": "origin/BUG-0001"}
+        invalid = {"campaignValidationCommands": ["python -m unittest"], "tasks": [ContractTests().task() | {"sourceRef": "origin/BUG-0001", "testPaths": [], "regressionValidationCommands": []}]}
+        budget = plan.CallBudget(2)
+        with patch("plan.invoke_agent", return_value=invalid), patch("plan.progress"), self.assertRaisesRegex(RuntimeError, "valid structured output"):
+            plan.invoke_validated(Path("."), "prompt", plan.planning_schema(True), lambda value: plan.validate_plan(value, [entry]), 10, budget, 1)
+        self.assertEqual(budget.started, 2)
+
     def test_plan_review_accepts_after_one_review_and_one_audit(self):
         tasks = [ContractTests().task()]
         digest = plan.plan_digest(tasks)
@@ -523,6 +599,12 @@ class DeterministicCoreTests(unittest.TestCase):
     def azure_pr(self, status="active", merge_status="succeeded", sha="abc"):
         return {"pullRequestId": 7, "status": status, "mergeStatus": merge_status, "lastMergeSourceCommit": {"commitId": sha}}
 
+    def provider_metadata(self, store, assignment, sha, pr):
+        title, _body, digest = run.canonical_pr_metadata(store.state, assignment, sha)
+        task_state = store.state["taskStates"].setdefault(assignment["id"], {})
+        task_state.update(candidateSha=sha, pr=pr, prMetadata={"hash": digest, "candidateSha": sha, "sourceRef": assignment.get("sourceRef"), "title": title})
+        store.state["pullRequests"][assignment["id"]] = pr
+
     def test_validation_uses_explicit_platform_shells(self):
         command = "$items = @('one', 'two'); $items | ForEach-Object { $_ }"
         with patch.object(run.os, "name", "nt"), patch("run.tool_command", return_value=[r"C:\Tools\pwsh.exe"]):
@@ -574,6 +656,31 @@ class DeterministicCoreTests(unittest.TestCase):
             with patch("run.run_validations", side_effect=lambda *args, **kwargs: calls.append((args[3], args[4] if len(args) > 4 else None))):
                 self.assertEqual(run.validate_candidate(store, assignment, target, {"candidateSha": base}), base)
             self.assertEqual(calls, [("task", None), ("campaign", ["python -m unittest"])])
+
+    def test_backlog_candidate_must_change_a_declared_test_path(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = make_git_repository(Path(root))
+            (target / "src").mkdir(); (target / "tests").mkdir()
+            (target / "src" / "app.py").write_text("old\n", encoding="utf-8")
+            (target / "tests" / "test_app.py").write_text("old\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", "src/app.py", "tests/test_app.py"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "base"], check=True, capture_output=True)
+            base = git_output(target, "rev-parse", "HEAD").strip()
+            store = self.state_store(target)
+            run.exclude_relay_files(target)
+            assignment = ContractTests().backlog_task()
+            store.state["worktrees"][assignment["id"]] = {"baseSha": base}
+            (target / "src" / "app.py").write_text("fixed\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", "src/app.py"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "source only"], check=True, capture_output=True)
+            source_only = git_output(target, "rev-parse", "HEAD").strip()
+            with self.assertRaisesRegex(ValueError, "declared test path"):
+                run.candidate_integrity(store, assignment, target, {"candidateSha": source_only})
+            (target / "tests" / "test_app.py").write_text("regression\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", "tests/test_app.py"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "regression"], check=True, capture_output=True)
+            candidate = git_output(target, "rev-parse", "HEAD").strip()
+            self.assertEqual(run.candidate_integrity(store, assignment, target, {"candidateSha": candidate}), candidate)
 
     def test_repeated_candidate_validation_failure_trips_after_second_attempt(self):
         with tempfile.TemporaryDirectory() as root:
@@ -669,6 +776,15 @@ class DeterministicCoreTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "user-owned"):
                 run.publish_backlog(store, bugs)
             self.assertEqual(path.read_text(encoding="utf-8"), "# Mine\n")
+
+    def test_empty_new_backlog_does_not_delete_existing_owned_backlog(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            path = Path(root) / "BACKLOG.md"
+            original = run.render_backlog("older", Path(root), [ContractTests().backlog_bug()])
+            path.write_text(original, encoding="utf-8")
+            self.assertIsNone(run.publish_backlog(store, []))
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
 
     def test_campaign_summary_orders_tasks_and_backlog(self):
         tasks = [ContractTests().task("TASK-0002"), ContractTests().task("TASK-0001")]
@@ -1104,7 +1220,7 @@ class DeterministicCoreTests(unittest.TestCase):
                 actions = run.plan_recovery(store, tasks, [], ["TASK-0003"])
                 self.assertEqual(store.path.read_bytes(), before)
                 lines, next_line = run.campaign_summary(store.state, tasks, [])
-                self.assertTrue(any(line.startswith("- BLOCKED category=provider-publication affected=TASK-0001,TASK-0002 reason=Azure DevOps PR discovery exhausted attempts log=") for line in lines))
+                self.assertTrue(any(line.startswith("- BLOCKED category=provider-publication affected=test/TASK-0001,test/TASK-0002 reason=Azure DevOps PR discovery exhausted attempts log=") for line in lines))
                 self.assertIn("--recover --grant-attempt TASK-0003", next_line)
                 with patch("run.stderr_event") as event:
                     run.report_stopped(store.state)
@@ -1128,7 +1244,7 @@ class DeterministicCoreTests(unittest.TestCase):
             with patch("sys.stdout", output):
                 self.assertEqual(status.main(["--repo", root]), 0)
             shown = output.getvalue()
-            self.assertIn("category=provider-publication affected=TASK-0001", shown)
+            self.assertIn("category=provider-publication affected=test/TASK-0001", shown)
             self.assertIn(str(Path(".relay") / "logs" / "provider.log"), shown)
             self.assertIn("restore provider access, then use safe publication recovery", shown)
 
@@ -1331,7 +1447,7 @@ class DeterministicCoreTests(unittest.TestCase):
                 pr = run.pr_create(store, "create", "relay/TASK-0001", "title", body)
             self.assertEqual(pr["headRefOid"], "abc")
             description = provider.call_args.args[provider.call_args.args.index("--description") + 1]
-            self.assertNotRegex(description, r"[\r\n]")
+            self.assertRegex(description, r"[\r\n]")
             self.assertIn("Candidate: abc", description)
 
     def test_stopped_reports_every_blocked_assignment(self):
@@ -1369,7 +1485,7 @@ class DeterministicCoreTests(unittest.TestCase):
                 {"action": "resume-assignment-setup", "assignmentId": "TASK-0002", "baseSha": "0123456"},
             ])
             lines, next_line = run.campaign_summary(store.state, tasks, [])
-            self.assertTrue(any(line.startswith("- BLOCKED category=worktree-setup affected=TASK-0001,TASK-0002 reason=Git could not create assignment worktrees before Worker launch") for line in lines))
+            self.assertTrue(any(line.startswith("- BLOCKED category=worktree-setup affected=test/TASK-0001,test/TASK-0002 reason=Git could not create assignment worktrees before Worker launch") for line in lines))
             self.assertNotIn("non-zero exit status", "\n".join(lines))
             self.assertIn("Preview safe worktree setup recovery", next_line)
             with patch("run.stderr_event") as event:
@@ -1448,7 +1564,7 @@ class DeterministicCoreTests(unittest.TestCase):
             shown = output.getvalue()
             self.assertTrue(shown.startswith("Overall: 0/1 integrated"))
             self.assertIn("External/provider waits", shown)
-            self.assertIn("TASK-0001: PR #25 status=pending", shown)
+            self.assertIn("test/TASK-0001: PR #25 status=pending", shown)
 
     def test_status_does_not_count_integrated_audit_bugs_as_tasks(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1535,6 +1651,7 @@ class DeterministicCoreTests(unittest.TestCase):
             store.state["taskStates"][assignment["id"]] = {"phase": "approved"}
             store.state["pullRequests"][assignment["id"]] = {"number": 7, "state": "OPEN"}
             store.state["reviewSessions"][assignment["id"]] = {"phase": "approved", "reviewedSha": "abc", "repairAttemptsStarted": 0, "reviewCallsStarted": 3, "reviewCallLimit": 9}
+            self.provider_metadata(store, assignment, "abc", {"number": 7, "state": "OPEN", "url": "x", "headRefOid": "abc"})
             show = subprocess.CompletedProcess([], 0, json.dumps(self.azure_pr()), "")
             waiting = subprocess.CompletedProcess([], 0, json.dumps([{"configuration": {"isBlocking": True, "type": {"id": "fa4e907d-c16b-4a4c-9dfa-4906e5d171dd"}}, "status": "rejected"}]), "")
             with patch("run.provider_approve"), patch("run.run_tool", side_effect=[show, waiting]), patch("run.time.time", side_effect=[100, 100, 101]), patch("run.time.sleep"), patch("run.invoke_with_replacements") as worker:
@@ -1550,6 +1667,7 @@ class DeterministicCoreTests(unittest.TestCase):
             store.state["taskStates"][assignment["id"]] = {"phase": "approved"}
             store.state["pullRequests"][assignment["id"]] = {"number": 7, "state": "OPEN"}
             store.state["reviewSessions"][assignment["id"]] = {"phase": "approved", "reviewedSha": "abc", "repairAttemptsStarted": 0, "reviewCallsStarted": 3, "reviewCallLimit": 9}
+            self.provider_metadata(store, assignment, "abc", {"number": 7, "state": "OPEN", "url": "x", "headRefOid": "abc"})
             merged = subprocess.CompletedProcess([], 0, "{}", "")
             with patch("run.provider_with_retries", side_effect=[RuntimeError("vote denied"), merged]) as provider, patch("run.wait_for_checks", return_value="passed"), patch("run.invoke_with_replacements") as worker:
                 self.assertTrue(run.merge_assignment(store, threading.Semaphore(1), assignment, Path(root), "branch", {"number": 7}, "abc"))
@@ -1588,6 +1706,7 @@ class DeterministicCoreTests(unittest.TestCase):
             store.state["taskStates"][assignment["id"]] = {"phase": "approved"}
             store.state["pullRequests"][assignment["id"]] = {"number": 1, "state": "OPEN"}
             store.state["reviewSessions"][assignment["id"]] = {"phase": "approved", "reviewedSha": "abc", "repairAttemptsStarted": 0, "reviewCallsStarted": 3, "reviewCallLimit": 9}
+            self.provider_metadata(store, assignment, "abc", {"number": 1, "state": "OPEN", "url": "x", "headRefOid": "abc"})
             with patch("run.wait_for_checks", return_value="bypassable"), patch("run.provider_with_retries", return_value=subprocess.CompletedProcess([], 0, "", "")) as provider:
                 self.assertTrue(run.merge_assignment(store, threading.Semaphore(1), assignment, Path(root), "branch", {"number": 1}, "abc"))
             self.assertIn("--admin", provider.call_args.args)
@@ -1606,9 +1725,15 @@ class DeterministicCoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
             with patch("run.provider_with_retries") as provider:
-                run.pr_merge(store, "merge", 1)
+                run.pr_merge(store, "merge", 1, subject="test/TASK-0001: title", body="Relay-Candidate: abc")
             self.assertNotIn("--admin", provider.call_args.args)
             self.assertNotIn("--match-head-commit", provider.call_args.args)
+            self.assertEqual(provider.call_args.args[provider.call_args.args.index("--subject") + 1], "test/TASK-0001: title")
+            self.assertEqual(provider.call_args.args[provider.call_args.args.index("--body") + 1], "Relay-Candidate: abc")
+            store.state["mergeMethod"] = "rebase"
+            with patch("run.provider_with_retries") as provider:
+                run.pr_merge(store, "rebase", 1, subject="ignored", body="ignored")
+            self.assertNotIn("--subject", provider.call_args.args)
 
     def test_azure_sha_drift_and_merge_modes(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1617,8 +1742,10 @@ class DeterministicCoreTests(unittest.TestCase):
             with patch("run.run_tool", return_value=drift):
                 self.assertEqual(run.wait_for_checks(store, "DRIFT", {"number": 7}, "abc"), "sha-drift")
             with patch("run.provider_with_retries") as provider:
-                run.pr_merge(store, "merge", 7)
+                run.pr_merge(store, "merge", 7, subject="campaign/TASK-0001: title", body="Relay-Candidate: abc")
                 self.assertIn("true", provider.call_args.args)
+                message = provider.call_args.args[provider.call_args.args.index("--merge-commit-message") + 1]
+                self.assertIn("Relay-Candidate: abc", message)
                 store.state["mergeMethod"] = "merge"
                 run.pr_merge(store, "merge-2", 7)
                 self.assertIn("false", provider.call_args.args)
@@ -1734,7 +1861,7 @@ class DeterministicCoreTests(unittest.TestCase):
                 if role == "worker":
                     return {"mode": "repair", "assignmentId": assignment["id"], "status": "candidate", "candidateSha": "new", "validation": [], "summary": ""}
                 return {"assignmentId": assignment["id"], "candidateSha": "new", "status": "resolved"}
-            with patch("run.wait_for_checks", side_effect=["failed", "passed"]), patch("run.git", return_value=completed), patch("run.invoke_with_replacements", side_effect=agent), patch("run.validate_candidate", return_value="new"), patch("run.publish_candidate"), patch("run.provider_with_retries", return_value=completed):
+            with patch("run.wait_for_checks", side_effect=["failed", "passed"]), patch("run.git", return_value=completed), patch("run.invoke_with_replacements", side_effect=agent), patch("run.validate_candidate", return_value="new"), patch("run.publish_candidate"), patch("run.provider_with_retries", return_value=completed), patch("run.mark_integrated"):
                 self.assertTrue(run.merge_assignment(store, __import__("threading").Semaphore(1), assignment, Path(root), "relay/TASK-0001", {"number": 1}, "old"))
             session = store.state["reviewSessions"][assignment["id"]]
             self.assertEqual((session["repairAttemptsStarted"], session["reviewCallsStarted"], session["reviewedSha"]), (1, 5, "new"))
@@ -1748,12 +1875,35 @@ class DeterministicCoreTests(unittest.TestCase):
             store.state["taskStates"][assignment["id"]] = {"pushedSha": "sha", "pr": pr, "phase": "approved"}
             store.state["pullRequests"][assignment["id"]] = pr
             store.state["reviewSessions"][assignment["id"]] = {"phase": "approved", "repairAttemptsStarted": 0, "reviewCallsStarted": 3, "reviewCallLimit": 9}
-            with patch("run.provider_call") as provider:
+            self.provider_metadata(store, assignment, "sha", pr)
+            with patch("run.pr_inspect", return_value=pr), patch("run.provider_call") as provider:
                 self.assertIs(run.publish_candidate(store, assignment, Path(root), "branch", "sha"), pr)
                 provider.assert_not_called()
             with patch("run.wait_for_checks", return_value="merged"), patch("run.provider_with_retries") as merge:
                 self.assertTrue(run.merge_assignment(store, __import__("threading").Semaphore(1), assignment, Path(root), "branch", pr, "sha"))
                 merge.assert_not_called()
+
+    def test_canonical_pr_metadata_is_qualified_and_idempotent(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().backlog_task()
+            pr = {"number": 8, "state": "OPEN", "url": "x", "headRefOid": "abc"}
+            store.state["taskStates"][assignment["id"]] = {"pushedSha": "abc", "pr": pr, "phase": "approved"}
+            title, body, digest = run.canonical_pr_metadata(store.state, assignment, "abc")
+            self.assertEqual(title, "test/TASK-0001 [source origin/BUG-0001]: Do the thing")
+            for value in ("Campaign:", "Qualified assignment:", "Source reference:", "Current candidate SHA:", "## Test paths", "## Regression validation", "## Campaign validation"):
+                self.assertIn(value, body)
+            with patch("run.pr_inspect", return_value=pr), patch("run.pr_edit") as edit:
+                run.publish_candidate(store, assignment, Path(root), "branch", "abc")
+                edit.assert_called_once()
+            self.assertEqual(store.state["taskStates"][assignment["id"]]["prMetadata"]["hash"], digest)
+            with patch("run.pr_inspect", return_value=pr), patch("run.pr_edit") as edit:
+                run.publish_candidate(store, assignment, Path(root), "branch", "abc")
+                edit.assert_not_called()
+            store.state["taskStates"][assignment["id"]].pop("prMetadata")
+            with patch("run.pr_inspect", return_value=pr), patch("run.pr_edit") as edit:
+                run.publish_candidate(store, assignment, Path(root), "branch", "abc")
+                edit.assert_called_once()
 
     def test_publish_ignores_historical_pr_for_reused_branch(self):
         cases = (("github", 24, "e4086c53", "fcd0513f"), ("azure-devops", 25, "eefb0f87", "920d47a5"))
@@ -1765,7 +1915,7 @@ class DeterministicCoreTests(unittest.TestCase):
                 store.state["taskStates"][assignment["id"]] = {"pushedSha": candidate_sha, "phase": "approved"}
                 old = {"number": number, "state": "MERGED", "url": "old", "headRefOid": historical_sha}
                 new = {"number": number + 7, "state": "OPEN", "url": "new", "headRefOid": candidate_sha}
-                with patch("run.pr_discover", return_value=[old]), patch("run.pr_create", return_value=new) as create:
+                with patch("run.pr_discover", return_value=[old]), patch("run.pr_create", return_value=new) as create, patch("run.pr_edit"):
                     self.assertEqual(run.publish_candidate(store, assignment, Path(root), "relay/TASK-0001", candidate_sha), new)
                 create.assert_called_once()
 
@@ -1777,9 +1927,11 @@ class DeterministicCoreTests(unittest.TestCase):
             fresh = stale | {"headRefOid": "60d09d4a"}
             store.state["taskStates"][assignment["id"]] = {"pushedSha": "f63189a5", "pr": stale, "phase": "approved"}
             completed = subprocess.CompletedProcess([], 0, "f63189a5\trefs/heads/relay/TASK-0001\n", "")
-            with patch("run.git_provider_with_retries", return_value=completed) as git_provider, patch("run.pr_inspect", return_value=fresh) as inspect:
+            with patch("run.git_provider_with_retries", return_value=completed) as git_provider, patch("run.pr_inspect", return_value=fresh) as inspect, patch("run.pr_edit") as edit:
                 self.assertEqual(run.publish_candidate(store, assignment, Path(root), "relay/TASK-0001", "60d09d4a"), fresh)
             inspect.assert_called_once_with(store, "TASK-0001:pr-refresh:60d09d4a", 30)
+            edit.assert_called_once()
+            self.assertEqual(store.state["taskStates"][assignment["id"]]["prMetadata"]["candidateSha"], "60d09d4a")
             self.assertIn("--force-with-lease=refs/heads/relay/TASK-0001:f63189a5", git_provider.call_args_list[1].args)
 
     def test_push_before_pr_refresh_resumes_refresh_without_repush(self):
@@ -1789,7 +1941,7 @@ class DeterministicCoreTests(unittest.TestCase):
             stale = {"number": 30, "state": "OPEN", "url": "old", "headRefOid": "old"}
             fresh = stale | {"headRefOid": "new"}
             store.state["taskStates"][assignment["id"]] = {"pushedSha": "new", "pr": stale, "phase": "approved"}
-            with patch("run.git_provider_with_retries") as git_provider, patch("run.pr_inspect", return_value=fresh):
+            with patch("run.git_provider_with_retries") as git_provider, patch("run.pr_inspect", return_value=fresh), patch("run.pr_edit"):
                 self.assertEqual(run.publish_candidate(store, assignment, Path(root), "branch", "new"), fresh)
             git_provider.assert_not_called()
 
@@ -1874,6 +2026,17 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertNotIn("tasks", store.state)
             self.assertNotIn("bugs", store.state)
 
+    def test_tasks_ledger_provenance_must_match_campaign_state(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            task = ContractTests().backlog_task()
+            Path(root, "tasks.md").write_text(plan.render_tasks([task], "0123456", "abc123", campaign_validation_commands=store.state["campaignValidationCommands"]), encoding="utf-8")
+            store.state["taskProvenance"] = {task["id"]: {key: task[key] for key in ("sourceRef", "testPaths", "regressionValidationCommands")}}
+            self.assertEqual(run.load_tasks(store)[0]["sourceRef"], "origin/BUG-0001")
+            Path(root, "tasks.md").write_text(Path(root, "tasks.md").read_text(encoding="utf-8").replace("origin/BUG-0001", "origin/BUG-0002"), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "provenance"):
+                run.load_tasks(store)
+
     def test_complete_cleanup_preview_then_confirm(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root).resolve(); relay = root / ".relay"; relay.mkdir(); (root / ".git" / "info").mkdir(parents=True)
@@ -1900,6 +2063,33 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual((root / "AGENTS.md").read_text(encoding="utf-8"), "keep agents\n")
             self.assertEqual((root / "BACKLOG.md").read_text(encoding="utf-8"), "keep backlog\n")
             self.assertEqual((root / ".git" / "info" / "exclude").read_text(encoding="utf-8"), "keep.me\n")
+
+    def test_cleanup_refuses_missing_or_stale_provider_proof(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root).resolve()
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            store.state.update(phase="complete", worktrees={}, activeProcesses={})
+            store.state["taskStates"][assignment["id"]] = {"phase": "integrated", "candidateSha": "abc"}
+            store.save()
+            with self.assertRaisesRegex(RuntimeError, "provider proof"):
+                run.permanent_cleanup(root, False)
+            record = {"number": 1, "url": "x", "headRefOid": "abc", "state": "MERGED"}
+            self.provider_metadata(store, assignment, "abc", record)
+            _subject, _body, merge_hash = run.canonical_merge_metadata(store.state, assignment, "abc")
+            metadata = store.state["taskStates"][assignment["id"]]["prMetadata"]
+            store.state["taskStates"][assignment["id"]].update(
+                phase="integrated", providerProof={
+                    "finalCandidate": "abc", "sourceRef": None, "prMetadataHash": metadata["hash"],
+                    "mergeMetadataHash": merge_hash, "mergedProviderRecord": record,
+                },
+            )
+            store.save()
+            self.assertEqual(run.permanent_cleanup(root, False), 0)
+            store.state["taskStates"][assignment["id"]]["providerProof"]["finalCandidate"] = "old"
+            store.save()
+            with self.assertRaisesRegex(RuntimeError, "stale"):
+                run.permanent_cleanup(root, False)
 
     def test_campaign_initialization_generates_only_missing_agents(self):
         with tempfile.TemporaryDirectory() as root:
@@ -2139,6 +2329,40 @@ class FakeEndToEndTests(unittest.TestCase):
             self.assertEqual(run.parse_bugs((target / "bugs.md").read_text(encoding="utf-8"))[1][0]["status"], "resolved")
             self.assertEqual(len(list(provider.glob("*.json"))), 3)
 
+    def test_backlog_lifecycle_preserves_provenance_tests_provider_proof_and_backlog(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); target = make_git_repository(root)
+            bug = ContractTests().backlog_bug()
+            bug.update(location="one.txt:1", allowedPaths=["one.txt"])
+            backlog = target / "BACKLOG.md"
+            backlog.write_text(run.render_backlog("origin", target, [bug]), encoding="utf-8")
+            fake_codex, fake_gh = root / "fake_codex.py", root / "fake_gh.py"
+            fake_codex.write_text(FAKE_CODEX, encoding="utf-8"); fake_gh.write_text(FAKE_GH, encoding="utf-8")
+            provider = root / "provider"; provider.mkdir()
+            environment = os.environ | VALIDATION_ENV | {
+                "RELAY_CODEX": f"{sys.executable} {fake_codex}", "RELAY_GH": f"{sys.executable} {fake_gh}",
+                "RELAY_ALLOW_FAKE_PROVIDER": "1", "FAKE_GH_STATE": str(provider), "FAKE_BACKLOG": "1",
+            }
+            subprocess.run([sys.executable, str(Path(plan.__file__)), "--repo", str(target), "--requirements", str(backlog)], capture_output=True, text=True, env=environment, check=True)
+            completed = subprocess.run([sys.executable, str(Path(run.__file__)), "--repo", str(target), "--agent-timeout", "10", "--validation-timeout", "10", "--provider-timeout", "10", "--provider-check-timeout", "10"], capture_output=True, text=True, env=environment, timeout=60)
+            state = json.loads((target / ".relay" / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr + json.dumps(state, indent=2))
+            task = run.parse_tasks((target / "tasks.md").read_text(encoding="utf-8"), runtime=True)[1][0]
+            self.assertEqual((task["sourceRef"], task["testPaths"]), ("origin/BUG-0001", ["test_one.txt"]))
+            task_state = state["taskStates"]["TASK-0001"]
+            self.assertEqual(task_state["providerProof"]["sourceRef"], "origin/BUG-0001")
+            self.assertEqual(task_state["providerProof"]["finalCandidate"], task_state["candidateSha"])
+            record = next(json.loads(path.read_text()) for path in provider.glob("*.json") if "agents-bootstrap" not in path.name)
+            self.assertIn("[source origin/BUG-0001]", record["title"])
+            self.assertIn(task_state["candidateSha"], record["body"])
+            self.assertIn("Relay-Source: origin/BUG-0001", record["mergeBody"])
+            shown = subprocess.run([sys.executable, str(Path(status.__file__)), "--repo", str(target)], capture_output=True, text=True, check=True)
+            self.assertIn(f"{state['campaignId']}/TASK-0001: sourceRef=origin/BUG-0001", shown.stdout)
+            cleanup = subprocess.run([sys.executable, str(Path(run.__file__)), "--repo", str(target), "--cleanup", "--confirm"], capture_output=True, text=True)
+            self.assertEqual(cleanup.returncode, 0, cleanup.stdout + cleanup.stderr)
+            self.assertTrue(backlog.is_file())
+            self.assertFalse((target / ".relay").exists())
+
     def test_adversarial_review_terminates_at_shared_repair_budget(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
@@ -2204,6 +2428,9 @@ if prompt.startswith("Role: Repository Scout"):
 elif prompt.startswith("Role: Planning Project Manager"):
     if os.environ.get("FAKE_REQUIRE_EVIDENCE") and "Scout evidence:\n[]" in prompt: raise SystemExit("missing scout evidence")
     tasks = [{"id": "TASK-0001", "title": "Add one file", "status": "ready", "priority": "P1", "dependencies": [], "allowedPaths": ["one.txt"], "acceptanceCriteria": ["File exists."], "validationCommands": ["python -c \"from pathlib import Path; assert Path('one.txt').is_file()\""]}]
+    if os.environ.get("FAKE_BACKLOG"):
+        command = "python -c \"from pathlib import Path; assert Path('test_one.txt').is_file()\""
+        tasks[0].update(allowedPaths=["one.txt", "test_one.txt"], sourceRef="origin/BUG-0001", testPaths=["test_one.txt"], regressionValidationCommands=[command], validationCommands=[command])
     if os.environ.get("FAKE_TWO_TASKS"):
         tasks.append({"id": "TASK-0002", "title": "Add another file", "status": "ready", "priority": "P1", "dependencies": [], "allowedPaths": ["two.txt"], "acceptanceCriteria": ["File exists."], "validationCommands": ["python -c \"from pathlib import Path; assert Path('two.txt').is_file()\""]})
     result = {"campaignValidationCommands": ["python -c \"print('baseline')\""], "tasks": tasks}
@@ -2218,7 +2445,11 @@ elif "Role: Worker" in prompt:
         time.sleep(.35)
     content = assignment + (f" {mode} {time.time()}" if mode == "repair" else "") + "\n"
     with open(path, "w", encoding="utf-8") as stream: stream.write(content)
-    subprocess.run(["git", "-C", cwd, "add", allowed[0]], check=True)
+    changed = [allowed[0]]
+    if os.environ.get("FAKE_BACKLOG") and mode == "task":
+        with open(os.path.join(cwd, allowed[1]), "w", encoding="utf-8") as stream: stream.write("regression\n")
+        changed.append(allowed[1])
+    subprocess.run(["git", "-C", cwd, "add", *changed], check=True)
     subprocess.run(["git", "-C", cwd, "commit", "-m", assignment], check=True, capture_output=True)
     sha = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
     if events and mode == "task":
@@ -2264,9 +2495,16 @@ if args[:2] == ["pr", "list"]:
     print(json.dumps([json.loads(path.read_text())] if path.exists() else [])); raise SystemExit(0)
 if args[:2] == ["pr", "create"]:
     branch = args[args.index("--head") + 1]; body = pathlib.Path(args[args.index("--body-file") + 1]).read_text()
-    sha = re.search(r"Candidate: ([0-9a-f]+)", body).group(1); number = int(re.search(r"(\d+)$", branch).group(1))
-    file_for(branch).write_text(json.dumps({"number": number, "url": f"https://example.invalid/{number}", "headRefOid": sha, "state": "OPEN", "branch": branch}))
+    sha = (re.search(r"Current candidate SHA: `([0-9a-f]+)`", body) or re.search(r"Candidate: ([0-9a-f]+)", body)).group(1); number = int(re.search(r"(\d+)$", branch).group(1))
+    file_for(branch).write_text(json.dumps({"number": number, "url": f"https://example.invalid/{number}", "headRefOid": sha, "state": "OPEN", "branch": branch, "title": args[args.index("--title") + 1], "body": body}))
     print(f"https://example.invalid/{number}"); raise SystemExit(0)
+if args[:2] == ["pr", "edit"]:
+    key = args[2]
+    for path in root.glob("*.json"):
+        record = json.loads(path.read_text())
+        if str(record["number"]) == key:
+            record.update(title=args[args.index("--title") + 1], body=pathlib.Path(args[args.index("--body-file") + 1]).read_text())
+            path.write_text(json.dumps(record)); raise SystemExit(0)
 if args[:2] == ["pr", "view"]:
     key = args[2]
     paths = list(root.glob("*.json")); records = [(path, json.loads(path.read_text())) for path in paths]
@@ -2284,6 +2522,8 @@ if args[:2] == ["pr", "merge"]:
             operation = "merge-bypass" if "--admin" in args else "merge"
             if operation == "merge-bypass" and args[args.index("--match-head-commit") + 1] != record["headRefOid"]: raise SystemExit("head mismatch")
             record.setdefault("operations", []).append(operation)
+            record["mergeSubject"] = args[args.index("--subject") + 1] if "--subject" in args else None
+            record["mergeBody"] = args[args.index("--body") + 1] if "--body" in args else None
             if "agents-bootstrap" in record["branch"]:
                 remote = root.parent / "remote.git"
                 subprocess.run(["git", "--git-dir", str(remote), "update-ref", "refs/heads/main", record["headRefOid"]], check=True)
@@ -2305,15 +2545,14 @@ if args[:3] == ["repos", "pr", "list"]:
 if args[:3] == ["repos", "pr", "create"]:
     branch = args[args.index("--source-branch") + 1]
     description = args[args.index("--description") + 1]
-    if "\r" in description or "\n" in description: raise SystemExit("multiline Azure description")
     attempts = root / ".create-attempts"
     attempt = int(attempts.read_text()) + 1 if attempts.exists() else 1
     attempts.write_text(str(attempt))
     if attempt <= int(os.environ.get("FAKE_AZ_FAIL_CREATE_ATTEMPTS", "0")):
         print("simulated create failure", file=sys.stderr); raise SystemExit(1)
-    sha = re.search(r"Candidate: ([0-9a-f]+)", description).group(1)
+    sha = (re.search(r"Current candidate SHA: `([0-9a-f]+)`", description) or re.search(r"Candidate: ([0-9a-f]+)", description)).group(1)
     number = int(re.search(r"(\d+)$", branch).group(1))
-    record = {"pullRequestId": number, "status": "active", "mergeStatus": "succeeded", "lastMergeSourceCommit": {"commitId": sha}, "branch": branch}
+    record = {"pullRequestId": number, "status": "active", "mergeStatus": "succeeded", "lastMergeSourceCommit": {"commitId": sha}, "branch": branch, "title": args[args.index("--title") + 1], "description": description}
     file_for(branch).write_text(json.dumps(record)); print(json.dumps(record)); raise SystemExit(0)
 if args[:3] == ["repos", "pr", "show"]:
     number = args[args.index("--id") + 1]
@@ -2332,9 +2571,11 @@ if args[:3] == ["repos", "pr", "update"]:
     for path in root.glob("*.json"):
         record = json.loads(path.read_text())
         if str(record["pullRequestId"]) == number:
+            if "--status" not in args:
+                record.update(title=args[args.index("--title") + 1], description=args[args.index("--description") + 1]); path.write_text(json.dumps(record)); print(json.dumps(record)); raise SystemExit(0)
             if "agents-bootstrap" in record["branch"]:
                 subprocess.run(["git", "--git-dir", os.environ["FAKE_AZ_REMOTE"], "update-ref", "refs/heads/main", record["lastMergeSourceCommit"]["commitId"]], check=True)
-            record["status"] = "completed"; path.write_text(json.dumps(record)); print(json.dumps(record)); raise SystemExit(0)
+            record["status"] = "completed"; record["mergeMessage"] = args[args.index("--merge-commit-message") + 1] if "--merge-commit-message" in args else None; path.write_text(json.dumps(record)); print(json.dumps(record)); raise SystemExit(0)
 raise SystemExit(f"unknown az args: {args}")
 ''')
 
