@@ -77,14 +77,14 @@ def create(path: Path, github: str | None = None, visibility: str | None = None,
         raise ValueError(f"refusing existing Git repository: {target}")
 
     started = time.monotonic()
-    relay_console.update(f"repository initialize | elapsed 0s / {timeout}s")
+    relay_console.update("repository initialize", started=started, timeout=timeout)
     run("git", "-C", str(target), "init", "--initial-branch=main", timeout=timeout)
     create_exclusive(target / "README.md", f"# {target.name}\n")
     create_exclusive(target / "AGENTS.md", TARGET_AGENTS)
     run("git", "-C", str(target), "add", "README.md", "AGENTS.md", timeout=timeout)
     relay_console.emit("DONE", operation="initialize", elapsed=f"{time.monotonic() - started:.1f}s")
     started = time.monotonic()
-    relay_console.update(f"repository commit | elapsed 0s / {timeout}s")
+    relay_console.update("repository commit", started=started, timeout=timeout)
     run("git", "-C", str(target), "commit", "-m", "Initial commit", timeout=timeout)
     branch = run("git", "-C", str(target), "branch", "--show-current", capture=True, timeout=timeout).stdout.strip()
     sha = run("git", "-C", str(target), "rev-parse", "HEAD", capture=True, timeout=timeout).stdout.strip()
@@ -92,13 +92,13 @@ def create(path: Path, github: str | None = None, visibility: str | None = None,
 
     if github:
         started = time.monotonic()
-        relay_console.update(f"repository publish | elapsed 0s / {timeout}s")
+        relay_console.update("repository publish", started=started, timeout=timeout)
         run("gh", "auth", "status", timeout=timeout)
         run("gh", "repo", "create", github, f"--{visibility}", "--source", str(target), "--remote", "origin", "--push", timeout=timeout)
         relay_console.emit("DONE", operation="publish", elapsed=f"{time.monotonic() - started:.1f}s")
     elif azure_devops:
         started = time.monotonic()
-        relay_console.update(f"repository publish | elapsed 0s / {timeout}s")
+        relay_console.update("repository publish", started=started, timeout=timeout)
         organization, project, repository = azure_devops
         created = run("az", "repos", "create", "--name", repository, "--organization", f"https://dev.azure.com/{organization}", "--project", project, "--output", "json", capture=True, timeout=timeout)
         data = json.loads(created.stdout)
