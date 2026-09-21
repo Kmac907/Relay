@@ -28,6 +28,26 @@ class TTYBuffer(io.StringIO):
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_timed_status_recalculates_for_tty_and_redirected_waits(self):
+        clock = [5.0]
+        stream = TTYBuffer()
+        console = relay_console.Console(stream, interval=3600, monotonic=lambda: clock[0], width=lambda: 80)
+        console.update("working", started=10.0, timeout=30)
+        clock[0] = 17.0
+        console.update("working", started=10.0, timeout=30)
+        console.close()
+        self.assertIn("working | elapsed 0s / 30s", stream.getvalue())
+        self.assertIn("working | elapsed 7s / 30s", stream.getvalue())
+
+        stream, clock = io.StringIO(), [10.0]
+        console = relay_console.Console(stream, interval=3600, wait_interval=5, monotonic=lambda: clock[0])
+        console.update("working", started=clock[0], timeout=30)
+        clock[0] = 15.0
+        console.update("working", started=10.0, timeout=30)
+        console.close()
+        self.assertEqual(stream.getvalue().count("WAIT"), 2)
+        self.assertIn("working | elapsed 5s / 30s", stream.getvalue())
+
     def test_tty_rewrites_one_truncated_line_without_wait_events(self):
         stream = TTYBuffer()
         console = relay_console.Console(stream, interval=3600, width=lambda: 20)

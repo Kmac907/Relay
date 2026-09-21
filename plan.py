@@ -431,7 +431,7 @@ class CallBudget:
             return self.started
 
 
-def invoke_agent(repo: Path, prompt: str, schema: dict, timeout: int, budget: CallBudget | None, wait_detail: str | None = None) -> object:
+def invoke_agent(repo: Path, prompt: str, schema: dict, timeout: int, budget: CallBudget | None, wait_detail: str | None = None, started: float | None = None) -> object:
     if budget is not None:
         budget.consume()
     with tempfile.TemporaryDirectory(prefix="relay-plan-") as temporary:
@@ -445,7 +445,7 @@ def invoke_agent(repo: Path, prompt: str, schema: dict, timeout: int, budget: Ca
             "--output-schema", str(schema_path), "--output-last-message", str(result_path), "-",
         ]
         if wait_detail:
-            relay_console.update(f"{wait_detail} | elapsed 0s / {timeout}s")
+            relay_console.update(wait_detail, started=started, timeout=timeout)
         completed = subprocess.run(invocation, input=prompt, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout)
         if completed.returncode:
             raise RuntimeError(f"agent failed with exit code {completed.returncode}")
@@ -467,7 +467,7 @@ def invoke_validated(repo: Path, prompt: str, schema: dict, validator, timeout: 
         started = time.monotonic()
         progress("START", detail)
         try:
-            result = validator(invoke_agent(repo, prompt, schema, timeout, None, detail))
+            result = validator(invoke_agent(repo, prompt, schema, timeout, None, detail, started))
             progress("DONE", f"{detail} elapsed={time.monotonic() - started:.1f}s")
             return result
         except (ValueError, json.JSONDecodeError, RuntimeError, OSError, subprocess.TimeoutExpired) as caught:

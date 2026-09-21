@@ -31,6 +31,8 @@ class Console:
         self.stop = threading.Event()
         self.thread: threading.Thread | None = None
         self.text = ""
+        self.started: float | None = None
+        self.timeout: float | None = None
         self.last_text = ""
         self.last_wait = float("-inf")
         self.drawn = 0
@@ -55,11 +57,17 @@ class Console:
             self.output.flush()
             self.drawn = 0
 
+    def _render_locked(self) -> str:
+        if self.started is None or self.timeout is None:
+            return self.text
+        elapsed = int(max(0, self.monotonic() - self.started))
+        return f"{self.text} | elapsed {elapsed}s / {self.timeout}s"
+
     def _draw_locked(self) -> None:
         if not self.text or not self.tty:
             return
         limit = max(1, self.width() - 1)
-        line = f"{SPINNER[self.frame % 4]} {self.text}"[:limit]
+        line = f"{SPINNER[self.frame % 4]} {self._render_locked()}"[:limit]
         self.frame += 1
         padding = " " * max(0, self.drawn - len(line))
         self.output.write("\r" + line + padding)
@@ -72,21 +80,23 @@ class Console:
                 if self.tty:
                     self._draw_locked()
                 elif self.text and self.monotonic() - self.last_wait >= self.wait_interval:
-                    print(self._event("WAIT", self.text), file=self.output, flush=True)
+                    print(self._event("WAIT", self._render_locked()), file=self.output, flush=True)
                     self.last_wait = self.monotonic()
 
-    def update(self, text: str) -> None:
+    def update(self, text: str, *, started: float | None = None, timeout: float | None = None) -> None:
         with self.lock:
             now = self.monotonic()
-            changed = text != self.last_text
+            changed = text != self.last_text or started != self.started or timeout != self.timeout
             self.text = text
+            self.started = started
+            self.timeout = timeout
             if self.thread is None or not self.thread.is_alive():
                 self.stop.clear()
                 self.thread = threading.Thread(target=self._animate, name="relay-console", daemon=True)
                 self.thread.start()
             if not self.tty:
                 if changed or now - self.last_wait >= self.wait_interval:
-                    print(self._event("WAIT", text), file=self.output, flush=True)
+                    print(self._event("WAIT", self._render_locked()), file=self.output, flush=True)
                     self.last_wait = now
                 self.last_text = text
                 return
@@ -106,6 +116,8 @@ class Console:
             self.thread = None
             self._clear_locked()
             self.text = ""
+            self.started = None
+            self.timeout = None
             self.last_text = ""
         if thread and thread is not threading.current_thread():
             thread.join(timeout=max(1, self.interval * 2))
@@ -114,8 +126,8 @@ class Console:
 _CONSOLE = Console()
 
 
-def update(text: str) -> None:
-    _CONSOLE.update(text)
+def update(text: str, *, started: float | None = None, timeout: float | None = None) -> None:
+    _CONSOLE.update(text, started=started, timeout=timeout)
 
 
 def emit(event: str, detail: str = "", **fields: object) -> None:
