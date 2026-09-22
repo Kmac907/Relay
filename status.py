@@ -143,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {label(assignment_id)}: {action}")
     if bugs:
         print("\nBugs")
-        for label, count in sorted(bugs.items()): print(f"  {label}: {count}")
+        for bug_label, count in sorted(bugs.items()): print(f"  {bug_label}: {count}")
     if state.get("worktrees"):
         print("\nWorktrees")
         for assignment_id, record in sorted(state["worktrees"].items()): print(f"  {label(assignment_id)}: {record['path']}")

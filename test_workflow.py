@@ -1909,6 +1909,40 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual((store.state["pullRequests"][assignment["id"]]["number"], session["reviewCallsStarted"]), (8, 3))
             self.assertEqual(run.load_bugs(store)[0]["sourceFindingId"], "legacy-one")
 
+    def test_schema_two_migration_preserves_integrated_sessions_without_worktrees(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            finding = {"id": "legacy-fixed", "severity": "P1", "location": "src/app.py:1", "failure": "fails", "reproduction": "run test", "requirement": "works", "evidence": "exit 1", "candidateIntroduced": True}
+            bug = {"id": "BUG-0001", "title": "Fixed", "severity": "P1", "status": "resolved", "source": assignment["id"], "sourceFindingId": finding["id"], "location": finding["location"], "failure": finding["failure"], "reproduction": finding["reproduction"], "requirement": finding["requirement"], "evidence": finding["evidence"], "allowedPaths": ["src/app.py"]}
+            Path(root, "bugs.md").write_text(run.render_bugs("test", root, [bug]), encoding="utf-8")
+            store.state.update(schemaVersion=2, phase="blocked", error="stale preview failure", blockedEvidence={"type": "RuntimeError"})
+            store.state["taskStates"][assignment["id"]] = {"phase": "integrated", "candidateSha": "candidate"}
+            store.state["reviewSessions"][assignment["id"]] = {
+                "phase": "approved", "initialCandidateSha": "candidate", "reviewedSha": "candidate", "acceptedBlockerIds": [bug["id"]],
+                "repairAttemptsStarted": 1, "reviewCallsStarted": 4, "reviewCallLimit": 9,
+                "initialResults": {"contract-reviewer": {"assignmentId": assignment["id"], "candidateSha": "candidate", "findings": [finding]}},
+            }
+            store.state["worktrees"][assignment["id"]] = {"path": str(root / "cleaned"), "root": str(root / "cleaned"), "branch": "relay/TASK-0001", "baseSha": "base"}
+            store.save()
+            with patch("run.recovery_worktree", side_effect=AssertionError("integrated worktree must not be inspected")):
+                migration = run.plan_schema_two_migration(store, [assignment])
+                run.apply_schema_two_migration(store, [assignment], migration)
+            self.assertEqual((store.state["schemaVersion"], store.state["phase"], store.state["taskStates"][assignment["id"]]["phase"]), (3, "build", "integrated"))
+            self.assertNotIn("error", store.state)
+            self.assertEqual(run.load_bugs(store)[0]["status"], "resolved")
+
+    def test_failed_schema_two_preview_does_not_mutate_state(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            store.state.update(schemaVersion=2, phase="needs-user")
+            store.save()
+            before = store.path.read_bytes()
+            with patch("run.sys.stdin", io.StringIO()), patch("run.plan_schema_two_migration", side_effect=RuntimeError("preview refused")), patch("run.relay_console.emit"), patch("run.relay_console.close"):
+                self.assertEqual(run.main(["--repo", root, "--recover"]), 1)
+            self.assertEqual(store.path.read_bytes(), before)
+
     def test_bug_dispositions_persist_reasons_and_discard_stays_out_of_ledger(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
@@ -2098,6 +2132,18 @@ class DeterministicCoreTests(unittest.TestCase):
             with patch("sys.stdout", output):
                 self.assertEqual(status.main(["--repo", root]), 0)
             self.assertIn("fixes=1/2 review-calls=2/7", output.getvalue())
+
+    def test_status_prints_bugs_before_worktrees_without_shadowing_labels(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            bug = {"id": "BUG-0001", "title": "Fixed", "severity": "P1", "status": "resolved", "source": "TASK-0001", "sourceFindingId": "legacy", "location": "src/app.py:1", "failure": "fails", "reproduction": "run", "requirement": "works", "evidence": "fixed", "allowedPaths": ["src/app.py"]}
+            Path(root, "bugs.md").write_text(run.render_bugs("test", Path(root), [bug]), encoding="utf-8")
+            store.state["worktrees"]["TASK-0001"] = {"path": str(root)}
+            store.save()
+            output = io.StringIO()
+            with patch("sys.stdout", output):
+                self.assertEqual(status.main(["--repo", root]), 0)
+            self.assertIn(f"Worktrees\n  test/TASK-0001: {root}", output.getvalue())
 
     def test_runtime_progress_counts_running_and_queued_agents_once(self):
         state = {
