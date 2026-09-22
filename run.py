@@ -38,6 +38,14 @@ CHILD_LOCK = threading.Lock()
 ACTIVE_CHILDREN: set[subprocess.Popen] = set()
 STATE_SCHEMA_VERSION = 3
 ORIGINAL_PYTHON_USER_SITE = site.getusersitepackages()
+LEGACY_REVIEW_PORT = {
+    "campaignId": "20260921-011652-282557",
+    "assignmentId": "TASK-0007",
+    "baseSha": "f29ea9d923f3688e586f3da2b0bb4f83b937ffda",
+    "previousCandidateSha": "4b8cf5c4cb591bb0c310762ddc22bb7f1e292a8f",
+    "candidateSha": "394584dfd16b8b62619396b1e9486a16ee910047",
+    "blockerIds": ["BUG-0021", "BUG-0022", "BUG-0023", "BUG-0024", "BUG-0025"],
+}
 
 AGENT_SCHEMAS = {
     "worker": {"mode": str, "assignmentId": str, "status": str, "candidateSha": str, "validation": list, "summary": str},
@@ -152,6 +160,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--dry-run", action="store_true")
     result.add_argument("--cleanup", action="store_true")
     result.add_argument("--recover", action="store_true", help="preview or confirm resume, grant, and defer recovery")
+    result.add_argument("--port-legacy-review", metavar="TASK-NNNN", help=argparse.SUPPRESS)
     result.add_argument("--defer-blocker", action="append", default=[], metavar="BUG-NNNN")
     result.add_argument("--grant-attempt", action="append", default=[], metavar="TASK-NNNN")
     result.add_argument("--confirm", action="store_true")
@@ -1090,10 +1099,6 @@ def create_worktree(store: StateStore, assignment: dict) -> tuple[Path, str]:
         return path, branch
 
 
-def assignment_paths(store: StateStore, assignment: dict) -> list[str]:
-    return assignment["allowedPaths"] + store.state.get("recoveryAllowedPaths", {}).get(assignment["id"], [])
-
-
 def scope_directories(store: StateStore, scopes: list[str]) -> set[str]:
     known = {normalized_path(item) for item in store.state.get("pathDirectories", [])}
     has_metadata = "pathDirectories" in store.state
@@ -1239,7 +1244,7 @@ def candidate_integrity(store: StateStore, assignment: dict, worktree: Path, res
         if sha == parent_sha or ancestry.returncode:
             raise ValueError("validation repair must commit a descendant candidate")
     changed = target_changes(store, worktree, assignment_base, sha)
-    allowed = assignment_paths(store, assignment)
+    allowed = assignment["allowedPaths"]
     outside = sorted(item for item in changed if not allowed_change(item, allowed, scope_directories(store, allowed)))
     if outside:
         raise ValueError(f"candidate changed paths outside assignment scope: {', '.join(outside)}")
@@ -2614,11 +2619,134 @@ def _recovery_snapshot(store: StateStore, assignment: dict) -> dict:
     if ancestry.returncode:
         raise RuntimeError(f"recovery refused candidate ancestry drift: {assignment_id}")
     changed = target_changes(store, worktree, record["baseSha"], head)
-    allowed = assignment_paths(store, assignment)
+    allowed = assignment["allowedPaths"]
+    if "approvedRepairPaths" in session:
+        approved = session["approvedRepairPaths"]
+        if not isinstance(approved, list) or any(not isinstance(path, str) or not valid_relative_path(path) for path in approved):
+            raise RuntimeError(f"recovery refused invalid approved repair scope: {assignment_id}")
+        maximum = maximum_repair_paths(store, assignment)
+        directories = scope_directories(store, maximum)
+        unapproved = sorted(path for path in approved if not allowed_change(path, maximum, directories))
+        if unapproved:
+            raise RuntimeError(f"recovery refused approved repair paths outside maximum scope for {assignment_id}: {', '.join(unapproved)}")
+        allowed = approved
     outside = sorted(path for path in changed if not allowed_change(path, allowed, scope_directories(store, allowed)))
     if outside:
         raise RuntimeError(f"recovery refused scope drift for {assignment_id}: {', '.join(outside)}")
     return {"headSha": head, "branch": record["branch"]}
+
+
+def _provider_identity(store: StateStore) -> dict:
+    remote = git(Path(store.state["repository"]), "config", "--get", "remote.origin.url", timeout=store.state["providerTimeoutSeconds"]).stdout.strip()
+    return detect_provider(remote)
+
+
+def _listed_worktrees(store: StateStore) -> set[Path]:
+    repository = Path(store.state.get("repositoryRoot", store.state["repository"]))
+    output = git(repository, "worktree", "list", "--porcelain", timeout=store.state["providerTimeoutSeconds"]).stdout
+    return {Path(line.removeprefix("worktree ")).resolve() for line in output.splitlines() if line.startswith("worktree ")}
+
+
+def plan_legacy_review_port(store: StateStore, tasks: list[dict], assignment_id: str) -> dict:
+    expected = LEGACY_REVIEW_PORT
+    if assignment_id != expected["assignmentId"] or store.state.get("campaignId") != expected["campaignId"]:
+        raise RuntimeError("legacy review port does not match this campaign and assignment")
+    if store.state.get("schemaVersion") != STATE_SCHEMA_VERSION or store.state.get("phase") != "needs-user" or store.state.get("activeProcesses"):
+        raise RuntimeError("legacy review port requires an inactive schema-3 needs-user campaign")
+    identity = _provider_identity(store)
+    if any(store.state.get(key) != value for key, value in identity.items()):
+        raise RuntimeError("legacy review port repository ownership mismatch")
+    assignments = {task["id"]: task for task in tasks}
+    assignment = assignments.get(assignment_id)
+    if not assignment:
+        raise RuntimeError("legacy review port assignment is missing")
+    task_state = store.state.get("taskStates", {}).get(assignment_id, {})
+    session = store.state.get("reviewSessions", {}).get(assignment_id, {})
+    record = store.state.get("worktrees", {}).get(assignment_id, {})
+    task = assignments[assignment_id]
+    if task["status"] != "blocked" or (task["attempt"], task["attemptLimit"], task["fixLoop"], task["fixLoopLimit"]) != (3, 3, 0, 2):
+        raise RuntimeError("legacy review port task ledger shape mismatch")
+    if store.state.get("taskAttemptLimit") != 3 or store.state.get("fixLoopLimit") != 2 or store.state.get("attemptCounters", {}).get(assignment_id) != 3:
+        raise RuntimeError("legacy review port campaign counters mismatch")
+    if task_state.get("phase") != "needs-user" or task_state.get("fixAttemptsStarted") != 0:
+        raise RuntimeError("legacy review port task state mismatch")
+    if task_state.get("branch") != f"relay/{expected['campaignId']}/{assignment_id}" or task_state.get("pushed") is not True or task_state.get("merged") is not False:
+        raise RuntimeError("legacy review port task publication state mismatch")
+    if task_state.get("candidateSha") != expected["candidateSha"] or task_state.get("validationCandidateSha") != expected["candidateSha"]:
+        raise RuntimeError("legacy review port candidate SHA mismatch")
+    if (task_state.get("validationRepairAttemptsStarted"), task_state.get("validationRepairCallsStarted")) != (0, 0):
+        raise RuntimeError("legacy review port validation counters mismatch")
+    if session.get("phase") != "needs-user" or session.get("repairAttemptsStarted") != 2:
+        raise RuntimeError("legacy review port review state mismatch")
+    if session.get("reviewCallsStarted") != 6 or session.get("reviewCallLimit") != 7:
+        raise RuntimeError("legacy review port review budget mismatch")
+    if session.get("previousCandidateSha") != expected["previousCandidateSha"] or session.get("currentCandidateSha") != expected["candidateSha"]:
+        raise RuntimeError("legacy review port review SHA mismatch")
+    review_result = session.get("reviewResult")
+    if session.get("initialCandidateSha") != expected["previousCandidateSha"] or session.get("reviewedSha") != "" or not isinstance(review_result, dict) or review_result.get("candidateSha") != expected["previousCandidateSha"]:
+        raise RuntimeError("legacy review port reviewed candidate mismatch")
+    if session.get("pendingRepairSha") is not None or session.get("pendingRepairNumber") is not None:
+        raise RuntimeError("legacy review port already has a pending repair")
+    if session.get("acceptedBlockerIds") != expected["blockerIds"]:
+        raise RuntimeError("legacy review port blockers mismatch")
+    bugs = load_bugs(store)
+    active = sorted(bug["id"] for bug in bugs if bug.get("status") == "active" and bug.get("source") == assignment_id)
+    if active != expected["blockerIds"]:
+        raise RuntimeError("legacy review port active blocker ledger mismatch")
+    if record.get("baseSha") != expected["baseSha"] or record.get("branch") != f"relay/{expected['campaignId']}/{assignment_id}":
+        raise RuntimeError("legacy review port worktree record mismatch")
+    snapshot = _recovery_snapshot(store, assignment)
+    if snapshot["headSha"] != expected["candidateSha"]:
+        raise RuntimeError("legacy review port worktree SHA mismatch")
+    worktree, _ = recovery_worktree(store, assignment_id)
+    if git(worktree, "merge-base", "--is-ancestor", expected["previousCandidateSha"], expected["candidateSha"], timeout=store.state["validationTimeoutSeconds"], check=False).returncode:
+        raise RuntimeError("legacy review port candidate ancestry mismatch")
+    pr = task_state.get("pr")
+    if pr != store.state.get("pullRequests", {}).get(assignment_id):
+        raise RuntimeError("legacy review port PR records mismatch")
+    if not pr or pr.get("headRefOid") != expected["previousCandidateSha"] or pr.get("state") != "OPEN":
+        raise RuntimeError("legacy review port recorded PR mismatch")
+    metadata, proof = task_state.get("prMetadata"), task_state.get("publicationProof")
+    if task_state.get("pushedSha") != expected["previousCandidateSha"] or not isinstance(metadata, dict) or metadata.get("candidateSha") != expected["previousCandidateSha"] or not isinstance(proof, dict) or proof.get("candidateSha") != expected["previousCandidateSha"]:
+        raise RuntimeError("legacy review port publication proof mismatch")
+    live = _inspect_pr_readonly(store, pr["number"])
+    if live.get("headRefOid") != expected["previousCandidateSha"] or live.get("state") != "OPEN":
+        raise RuntimeError("legacy review port live PR mismatch")
+    listed = _listed_worktrees(store)
+    campaign_root = Path(tempfile.gettempdir()).resolve() / "relay-worktrees" / store.state["campaignId"]
+    stale = []
+    for other_id, other_record in sorted(store.state.get("worktrees", {}).items()):
+        if other_id == assignment_id or store.state.get("taskStates", {}).get(other_id, {}).get("phase") != "integrated":
+            continue
+        root = safe_within(Path(other_record.get("root", other_record["path"])), campaign_root)
+        if root.resolve() not in listed:
+            stale.append(other_id)
+    return {"assignmentId": assignment_id, "candidateSha": expected["candidateSha"], "previousCandidateSha": expected["previousCandidateSha"], "prNumber": live["number"], "staleWorktreeRecords": stale}
+
+
+def print_legacy_review_port(action: dict) -> None:
+    print(f"PORT assignment={action['assignmentId']} phase=needs-user->verify-2 candidate={action['candidateSha']} pr={action['prNumber']} stale-worktree-records={','.join(action['staleWorktreeRecords']) or 'none'}")
+
+
+def apply_legacy_review_port(store: StateStore, tasks: list[dict], action: dict) -> None:
+    if plan_legacy_review_port(store, tasks, action["assignmentId"]) != action:
+        raise RuntimeError("campaign changed after legacy review port preview")
+    assignment_id = action["assignmentId"]
+    task_state = store.state["taskStates"][assignment_id]
+    session = store.state["reviewSessions"][assignment_id]
+    store.state["pendingRecovery"] = {"legacyReviewPort": action}
+    store.save()
+    task_state.update(phase="verify-2", fixAttemptsStarted=2)
+    task_state.pop("error", None)
+    task_state.pop("validationRepairAttemptsStarted", None)
+    task_state.pop("validationRepairCallsStarted", None)
+    session.update(phase="verify-2", pendingRepairSha=action["candidateSha"], pendingRepairNumber=2)
+    session.pop("repairAttemptsStarted", None)
+    for stale_id in action["staleWorktreeRecords"]:
+        store.state["worktrees"].pop(stale_id, None)
+    store.save()
+    update_task_ledger(store, assignment_id, fixLoop="2/2")
+    store.update(lambda state: (state.setdefault("recoveryHistory", []).append({"recoveredAt": datetime.now(timezone.utc).isoformat(), "legacyReviewPort": action}), state.__setitem__("pendingRecovery", None), state.__setitem__("phase", "build")))
 
 
 def _inspect_pr_readonly(store: StateStore, identifier: str | int) -> dict:
@@ -3288,8 +3416,8 @@ def main(argv: list[str] | None = None) -> int:
     repo = args.repo.resolve()
     if not repo.is_dir():
         parser().error("repository does not exist")
-    if (args.defer_blocker or args.grant_attempt) and not args.recover:
-        parser().error("--defer-blocker and --grant-attempt require --recover")
+    if (args.defer_blocker or args.grant_attempt or args.port_legacy_review) and not args.recover:
+        parser().error("--defer-blocker, --grant-attempt, and --port-legacy-review require --recover")
     if args.recover and (args.cleanup or args.dry_run or args.plan):
         parser().error("--recover cannot be combined with --cleanup, --dry-run, or --plan")
     if args.cleanup:
@@ -3338,6 +3466,18 @@ def main(argv: list[str] | None = None) -> int:
             resuming = False
         if args.recover and not resuming:
             raise RuntimeError("recovery requires an existing campaign")
+        if args.port_legacy_review and (args.defer_blocker or args.grant_attempt):
+            raise RuntimeError("legacy review port cannot grant attempts or defer blockers")
+        if args.port_legacy_review:
+            tasks = load_tasks(store)
+            action = plan_legacy_review_port(store, tasks, args.port_legacy_review)
+            print_legacy_review_port(action)
+            if not args.confirm:
+                return 0
+            with coordinator_lock(store.path.parent):
+                apply_legacy_review_port(store, tasks, action)
+            relay_console.emit("NEXT", f"Resume with: {_shell_join([sys.executable, str(Path(__file__).resolve()), '--repo', str(repo)])}")
+            return 0
         if args.recover and not args.confirm:
             print_recovery(plan_recovery(store, load_tasks(store), args.defer_blocker, args.grant_attempt))
             return 0
