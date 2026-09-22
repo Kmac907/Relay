@@ -1704,15 +1704,8 @@ def canonical_pr_metadata(state: dict, assignment: dict, sha: str) -> tuple[str,
 
 
 def canonical_merge_metadata(state: dict, assignment: dict, sha: str) -> tuple[str, str, str]:
-    title, _body, _digest = canonical_pr_metadata(state, assignment, sha)
-    trailers = [
-        f"Relay-Campaign: {state['campaignId']}",
-        f"Relay-Assignment: {qualified_assignment(state, assignment['id'])}",
-        *([f"Relay-Source: {assignment['sourceRef']}"] if assignment.get("sourceRef") else []),
-        f"Relay-Candidate: {sha}",
-    ]
-    body = "\n".join(trailers)
-    return title, body, hashlib.sha256((title + "\n" + body).encode()).hexdigest()
+    subject, body = assignment["title"], ""
+    return subject, body, hashlib.sha256((subject + "\n" + body).encode()).hexdigest()
 
 
 def update_pr_metadata(store: StateStore, assignment: dict, pr: dict, sha: str) -> dict:

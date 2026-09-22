@@ -2346,12 +2346,17 @@ class DeterministicCoreTests(unittest.TestCase):
     def test_github_unblocked_merge_retains_non_admin_path(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
+            assignment = ContractTests().backlog_task()
+            subject, body, _digest = run.canonical_merge_metadata(store.state, assignment, "abc")
             with patch("run.provider_with_retries") as provider:
-                run.pr_merge(store, "merge", 1, subject="test/TASK-0001: title", body="Relay-Candidate: abc")
+                run.pr_merge(store, "merge", 1, subject=subject, body=body)
             self.assertNotIn("--admin", provider.call_args.args)
             self.assertNotIn("--match-head-commit", provider.call_args.args)
-            self.assertEqual(provider.call_args.args[provider.call_args.args.index("--subject") + 1], "test/TASK-0001: title")
-            self.assertEqual(provider.call_args.args[provider.call_args.args.index("--body") + 1], "Relay-Candidate: abc")
+            self.assertEqual(provider.call_args.args[provider.call_args.args.index("--subject") + 1], "Do the thing")
+            self.assertEqual(provider.call_args.args[provider.call_args.args.index("--body") + 1], "")
+            merge_args = "\n".join(map(str, provider.call_args.args[2:]))
+            for value in ("test", "TASK-0001", "abc", "Relay-Campaign", "Relay-Assignment", "Relay-Source", "Relay-Candidate"):
+                self.assertNotIn(value, merge_args)
             store.state["mergeMethod"] = "rebase"
             with patch("run.provider_with_retries") as provider:
                 run.pr_merge(store, "rebase", 1, subject="ignored", body="ignored")
@@ -2363,11 +2368,13 @@ class DeterministicCoreTests(unittest.TestCase):
             drift = subprocess.CompletedProcess([], 0, json.dumps(self.azure_pr(sha="changed")), "")
             with patch("run.run_tool", return_value=drift):
                 self.assertEqual(run.wait_for_checks(store, "DRIFT", {"number": 7}, "abc"), "sha-drift")
+            assignment = ContractTests().backlog_task()
+            subject, body, _digest = run.canonical_merge_metadata(store.state, assignment, "abc")
             with patch("run.provider_with_retries") as provider:
-                run.pr_merge(store, "merge", 7, subject="campaign/TASK-0001: title", body="Relay-Candidate: abc")
+                run.pr_merge(store, "merge", 7, subject=subject, body=body)
                 self.assertIn("true", provider.call_args.args)
                 message = provider.call_args.args[provider.call_args.args.index("--merge-commit-message") + 1]
-                self.assertIn("Relay-Candidate: abc", message)
+                self.assertEqual(message, "Do the thing")
                 store.state["mergeMethod"] = "merge"
                 run.pr_merge(store, "merge-2", 7)
                 self.assertIn("false", provider.call_args.args)
@@ -2563,6 +2570,14 @@ class DeterministicCoreTests(unittest.TestCase):
             with patch("run.pr_inspect", return_value=pr), patch("run.pr_edit") as edit:
                 run.publish_candidate(store, assignment, Path(root), "branch", "abc")
                 edit.assert_called_once()
+
+    def test_canonical_merge_metadata_is_assignment_title_only(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().backlog_task()
+            subject, body, digest = run.canonical_merge_metadata(store.state, assignment, "abc")
+            self.assertEqual((subject, body), ("Do the thing", ""))
+            self.assertEqual(digest, hashlib.sha256(b"Do the thing\n").hexdigest())
 
     def test_publish_ignores_historical_pr_for_reused_branch(self):
         cases = (("github", 24, "e4086c53", "fcd0513f"), ("azure-devops", 25, "eefb0f87", "920d47a5"))
@@ -2769,12 +2784,11 @@ class DeterministicCoreTests(unittest.TestCase):
                 run.permanent_cleanup(root, False)
             record = {"number": 1, "url": "x", "headRefOid": "abc", "state": "MERGED"}
             self.provider_metadata(store, assignment, "abc", record)
-            _subject, _body, merge_hash = run.canonical_merge_metadata(store.state, assignment, "abc")
             metadata = store.state["taskStates"][assignment["id"]]["prMetadata"]
             store.state["taskStates"][assignment["id"]].update(
                 phase="integrated", providerProof={
                     "finalCandidate": "abc", "sourceRef": None, "prMetadataHash": metadata["hash"],
-                    "mergeMetadataHash": merge_hash, "mergedProviderRecord": record,
+                    "mergeMetadataHash": "legacy-nonempty-proof", "mergedProviderRecord": record,
                 },
             )
             store.save()
@@ -3048,7 +3062,7 @@ class FakeEndToEndTests(unittest.TestCase):
             record = next(json.loads(path.read_text()) for path in provider.glob("*.json") if "agents-bootstrap" not in path.name)
             self.assertIn("[source origin/BUG-0001]", record["title"])
             self.assertIn(task_state["candidateSha"], record["body"])
-            self.assertIn("Relay-Source: origin/BUG-0001", record["mergeBody"])
+            self.assertEqual((record["mergeSubject"], record["mergeBody"]), (task["title"], ""))
             shown = subprocess.run([sys.executable, str(Path(status.__file__)), "--repo", str(target)], capture_output=True, text=True, check=True)
             self.assertIn(f"{state['campaignId']}/TASK-0001: sourceRef=origin/BUG-0001", shown.stdout)
             cleanup = subprocess.run([sys.executable, str(Path(run.__file__)), "--repo", str(target), "--cleanup", "--confirm"], capture_output=True, text=True)
