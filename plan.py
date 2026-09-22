@@ -31,9 +31,6 @@ TASK_SCHEMA = {
     "dependencies": list, "allowedPaths": list, "acceptanceCriteria": list,
     "validationCommands": list,
 }
-BACKLOG_TASK_SCHEMA = TASK_SCHEMA | {
-    "sourceRef": str, "testPaths": list, "regressionValidationCommands": list,
-}
 PLAN_SCHEMA = {"campaignValidationCommands": list, "tasks": list}
 
 
@@ -76,11 +73,10 @@ def validate_dict(value: object, schema: dict[str, type], label: str) -> dict:
     return value
 
 
-def validate_tasks(value: object, backlog_entries: list[dict] | None = None) -> list[dict]:
+def validate_tasks(value: object) -> list[dict]:
     if not isinstance(value, dict) or not isinstance(value.get("tasks"), list):
         raise ValueError("planning result must contain a tasks list")
-    schema = BACKLOG_TASK_SCHEMA if backlog_entries is not None else TASK_SCHEMA
-    tasks = [validate_dict(item, schema, "task") for item in value["tasks"]]
+    tasks = [validate_dict(item, TASK_SCHEMA, "task") for item in value["tasks"]]
     ids = [task["id"] for task in tasks]
     if len(ids) != len(set(ids)) or any(not TASK_ID.fullmatch(item) for item in ids):
         raise ValueError("task IDs must be unique TASK-NNNN values")
@@ -96,32 +92,8 @@ def validate_tasks(value: object, backlog_entries: list[dict] | None = None) -> 
             raise ValueError("task contracts must not be empty")
         if any(not valid_relative_path(path) for path in task["allowedPaths"]):
             raise ValueError("allowed paths must stay relative to the repository")
-        provenance_keys = {"sourceRef", "testPaths", "regressionValidationCommands"}
-        present = provenance_keys & task.keys()
-        if present and present != provenance_keys:
-            raise ValueError("task provenance metadata is incomplete")
-        if present:
-            if not task["sourceRef"].strip():
-                raise ValueError("backlog task sourceRef must not be empty")
-            for key in ("testPaths", "regressionValidationCommands"):
-                if not task[key] or any(not isinstance(item, str) or not item.strip() for item in task[key]):
-                    raise ValueError(f"backlog task {key} must contain nonempty strings")
-            if any(not valid_relative_path(path) for path in task["testPaths"]):
-                raise ValueError("test paths must stay relative to the repository")
-            if any(not run.allowed_change(path, task["allowedPaths"]) for path in task["testPaths"]):
-                raise ValueError("test paths must be included in allowedPaths")
-            if any(command not in task["validationCommands"] for command in task["regressionValidationCommands"]):
-                raise ValueError("regression validation commands must be included in validationCommands")
         if set(task["dependencies"]) - known or task["id"] in task["dependencies"]:
             raise ValueError("unknown or self dependency")
-        if "seed" in task:
-            seed = task["seed"]
-            if not isinstance(seed, dict) or set(seed) != {"originalBaseSha", "candidateSha", "archiveRef", "summary"}:
-                raise ValueError("invalid task seed metadata")
-            if any(not isinstance(item, str) or not item.strip() for item in seed.values()):
-                raise ValueError("invalid task seed metadata")
-            if any(not re.fullmatch(r"[0-9a-f]{7,64}", seed[key]) for key in ("originalBaseSha", "candidateSha")) or not re.fullmatch(r"relay/archive/[A-Za-z0-9._-]+/TASK-\d{4}", seed["archiveRef"]):
-                raise ValueError("invalid task seed metadata")
     graph, visiting, visited = {task["id"]: task["dependencies"] for task in tasks}, set(), set()
     def visit(task_id: str) -> None:
         if task_id in visiting:
@@ -131,25 +103,15 @@ def validate_tasks(value: object, backlog_entries: list[dict] | None = None) -> 
             for dependency in graph[task_id]: visit(dependency)
             visiting.remove(task_id); visited.add(task_id)
     for task_id in ids: visit(task_id)
-    if backlog_entries is not None:
-        expected = {entry["sourceRef"]: entry for entry in backlog_entries}
-        actual = [task["sourceRef"] for task in tasks]
-        if len(tasks) != len(backlog_entries) or len(actual) != len(set(actual)) or set(actual) != set(expected):
-            raise ValueError("backlog tasks must map one-to-one to source references")
-        for task in tasks:
-            allowed = {path.replace("\\", "/").strip("/") for path in task["allowedPaths"]}
-            required = {path.replace("\\", "/").strip("/") for path in expected[task["sourceRef"]]["allowedPaths"]}
-            if not required <= allowed:
-                raise ValueError(f"backlog task omitted original allowed paths: {task['sourceRef']}")
     return tasks
 
 
-def validate_plan(value: object, backlog_entries: list[dict] | None = None) -> dict:
+def validate_plan(value: object) -> dict:
     result = validate_dict(value, PLAN_SCHEMA, "planning result")
     commands = result["campaignValidationCommands"]
     if not commands or any(not isinstance(command, str) or not command.strip() for command in commands):
         raise ValueError("planning result needs nonempty campaign validation commands")
-    return {"campaignValidationCommands": commands, "tasks": validate_tasks({"tasks": result["tasks"]}, backlog_entries)}
+    return {"campaignValidationCommands": commands, "tasks": validate_tasks({"tasks": result["tasks"]})}
 
 
 def validate_scout(value: object, expected_scope: str) -> dict:
@@ -176,60 +138,6 @@ def valid_relative_path(value: str) -> bool:
     return bool(value.strip()) and not path.is_absolute() and ".." not in path.parts
 
 
-def parse_backlog(text: str, repo: Path) -> dict | None:
-    if not text.startswith("# Relay Backlog\n"):
-        return None
-    markers = list(run.BACKLOG_MARKER.finditer(text))
-    if len(markers) != 1:
-        raise ValueError("Relay backlog needs exactly one ownership marker")
-    marker = markers[0]
-    repository_hash = hashlib.sha256(str(repo.resolve()).encode()).hexdigest()[:12]
-    if marker.group(2) != repository_hash:
-        raise ValueError("Relay backlog repository mismatch")
-    lines = text.splitlines()
-    invalid_headings = [line for line in lines if line.startswith("## ") and not run.BUG_HEADING.fullmatch(line)]
-    if invalid_headings:
-        raise ValueError("Relay backlog contains a malformed bug heading")
-    starts = [index for index, line in enumerate(lines) if run.BUG_HEADING.fullmatch(line)]
-    if not starts:
-        raise ValueError("Relay backlog must contain at least one bug")
-    entries = []
-    required_fields = (
-        "Severity", "Source", "Source finding", "Location", "Observable failure",
-        "Reproduction", "Requirement", "Evidence", "Deferral reason",
-    )
-    for index, start in enumerate(starts):
-        heading = run.BUG_HEADING.fullmatch(lines[start])
-        block = lines[start + 1: starts[index + 1] if index + 1 < len(starts) else len(lines)]
-        allowed_fields = {f"- {field}:" for field in required_fields} | {"- Allowed paths:"}
-        if any(line.startswith("- ") and not any(line.startswith(prefix) for prefix in allowed_fields) for line in block):
-            raise ValueError(f"unknown Relay backlog field for {heading.group(1)}")
-        values = {field: run._field(block, field) for field in required_fields}
-        if "- Allowed paths:" not in block:
-            raise ValueError(f"missing Allowed paths for {heading.group(1)}")
-        paths = run._sublist(block, "Allowed paths")
-        if any(not value.strip() for value in values.values()) or not paths:
-            raise ValueError(f"empty Relay backlog contract for {heading.group(1)}")
-        if values["Severity"] not in {"P0", "P1", "P2", "P3"}:
-            raise ValueError(f"invalid Relay backlog severity for {heading.group(1)}")
-        if any(not valid_relative_path(path) for path in paths):
-            raise ValueError(f"unsafe Relay backlog path for {heading.group(1)}")
-        reproduction = values["Reproduction"]
-        entries.append({
-            "id": heading.group(1), "title": heading.group(2), "severity": values["Severity"],
-            "source": values["Source"], "sourceFindingId": values["Source finding"],
-            "location": values["Location"], "failure": values["Observable failure"],
-            "reproduction": reproduction[1:-1] if len(reproduction) > 1 and reproduction[0] == reproduction[-1] == "`" else reproduction,
-            "requirement": values["Requirement"], "evidence": values["Evidence"],
-            "deferralReason": values["Deferral reason"], "allowedPaths": paths,
-            "sourceRef": f"{marker.group(1)}/{heading.group(1)}",
-        })
-    ids = [entry["id"] for entry in entries]
-    if len(ids) != len(set(ids)):
-        raise ValueError("Relay backlog contains duplicate bugs")
-    return {"campaignId": marker.group(1), "repositoryHash": repository_hash, "entries": entries}
-
-
 def render_tasks(tasks: list[dict], base_sha: str, requirements_hash: str, task_attempts: int = 3, fix_loops: int = 2, campaign_validation_commands: list[str] | None = None) -> str:
     lines = ["# Tasks", "", f"<!-- relay: planned-base={base_sha} requirements={requirements_hash} -->", ""]
     if campaign_validation_commands is not None:
@@ -245,17 +153,6 @@ def render_tasks(tasks: list[dict], base_sha: str, requirements_hash: str, task_
             *[f"  - `{item}`" for item in task["allowedPaths"]],
             "- Acceptance criteria:", *[f"  - {item}" for item in task["acceptanceCriteria"]],
             "- Validation:", *[f"  - `{item}`" for item in task["validationCommands"]],
-            *([] if not task.get("sourceRef") else [
-                f"- Source ref: {task['sourceRef']}",
-                "- Test paths:", *[f"  - `{item}`" for item in task["testPaths"]],
-                "- Regression validation:", *[f"  - `{item}`" for item in task["regressionValidationCommands"]],
-            ]),
-            *([] if not task.get("seed") else [
-                f"- Seed Original base: {task['seed']['originalBaseSha']}",
-                f"- Seed Candidate SHA: {task['seed']['candidateSha']}",
-                f"- Seed Archive ref: {task['seed']['archiveRef']}",
-                f"- Seed Worker summary: {json.dumps(task['seed']['summary'], ensure_ascii=False)}",
-            ]),
             f"- Attempt: 0/{task_attempts}", f"- Fix loop: 0/{fix_loops}", "- Branch: pending",
             "- Pull request: pending", "- Candidate: pending", "",
         ]
@@ -269,8 +166,8 @@ def json_schema(properties: dict[str, type], array_name: str | None = None) -> d
     return {"type": "object", "properties": {array_name: {"type": "array", "items": item}}, "required": [array_name], "additionalProperties": False} if array_name else item
 
 
-def planning_schema(backlog: bool = False) -> dict:
-    task = json_schema(BACKLOG_TASK_SCHEMA if backlog else TASK_SCHEMA)
+def planning_schema() -> dict:
+    task = json_schema(TASK_SCHEMA)
     return {
         "type": "object",
         "properties": {
@@ -297,74 +194,6 @@ def command(tool: str) -> list[str]:
 
 def git(repo: Path, *args: str) -> str:
     return subprocess.run(command("git") + ["-C", str(repo), *args], check=True, capture_output=True, encoding="utf-8", errors="replace", timeout=60).stdout.strip()
-
-
-def parse_handoff(text: str, repo: Path) -> dict | None:
-    if not text.startswith("# Relay Handoff\n"):
-        return None
-    marker = run.HANDOFF_MARKER.search(text)
-    match = re.search(r"```json\n(.+?)\n```", text, re.DOTALL)
-    if not marker or not match:
-        raise ValueError("invalid Relay handoff")
-    payload = json.loads(match.group(1))
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    repository_hash = hashlib.sha256(str(repo.resolve()).encode()).hexdigest()[:12]
-    if marker.group(2) != repository_hash or marker.group(3) != hashlib.sha256(canonical.encode()).hexdigest():
-        raise ValueError("Relay handoff repository or manifest hash mismatch")
-    if not isinstance(payload, dict) or payload.get("campaignId") != marker.group(1) or payload.get("repositoryHash") != repository_hash:
-        raise ValueError("Relay handoff ownership mismatch")
-    defect, entries = payload.get("baselineDefect"), payload.get("tasks")
-    if not isinstance(defect, dict) or set(defect) != {"category", "command", "commandHash", "outcome"} or defect["commandHash"] != hashlib.sha256(str(defect["command"]).encode()).hexdigest():
-        raise ValueError("invalid Relay handoff baseline defect")
-    if not isinstance(entries, list) or not entries:
-        raise ValueError("Relay handoff has no tasks")
-    ids, contracts = [], []
-    for entry in entries:
-        if not isinstance(entry, dict) or set(entry) != {"contract", "contractHash", "seed"}:
-            raise ValueError("invalid Relay handoff task")
-        contract, seed = entry["contract"], entry["seed"]
-        contract_text = json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        if entry["contractHash"] != hashlib.sha256(contract_text.encode()).hexdigest():
-            raise ValueError("Relay handoff task hash mismatch")
-        if not isinstance(seed, dict) or set(seed) != {"originalBaseSha", "candidateSha", "archiveRef", "summary"}:
-            raise ValueError("invalid Relay handoff seed")
-        if any(not re.fullmatch(r"[0-9a-f]{7,64}", seed[key]) for key in ("originalBaseSha", "candidateSha")) or not re.fullmatch(rf"relay/archive/{re.escape(marker.group(1))}/{re.escape(contract['id'])}", str(seed["archiveRef"])) or not isinstance(seed["summary"], str) or not seed["summary"].strip():
-            raise ValueError("invalid Relay handoff seed")
-        for revision in (seed["originalBaseSha"], seed["candidateSha"], seed["archiveRef"]):
-            git(repo, "cat-file", "-e", f"{revision}^{{commit}}")
-        if git(repo, "rev-parse", seed["archiveRef"]) != seed["candidateSha"]:
-            raise ValueError("Relay handoff archive ref mismatch")
-        ancestry = subprocess.run(command("git") + ["-C", str(repo), "merge-base", "--is-ancestor", seed["originalBaseSha"], seed["candidateSha"]], capture_output=True, timeout=60)
-        if ancestry.returncode:
-            raise ValueError("Relay handoff candidate ancestry mismatch")
-        ids.append(contract["id"])
-        contracts.append(contract)
-    if len(ids) != len(set(ids)):
-        raise ValueError("duplicate Relay handoff task")
-    validate_tasks({"tasks": contracts})
-    return payload
-
-
-def apply_handoff(tasks: list[dict], commands: list[str], handoff: dict | None) -> tuple[list[str], list[dict]]:
-    if handoff is None:
-        return commands, tasks
-    entries = {entry["contract"]["id"]: entry for entry in handoff["tasks"]}
-    planned = {task["id"]: task for task in tasks}
-    missing = sorted(entries.keys() - planned.keys())
-    if missing:
-        raise ValueError(f"reviewed plan omitted migrated tasks: {', '.join(missing)}")
-    tasks = [planned[task_id] for task_id in entries]
-    shared = handoff["baselineDefect"]["command"]
-    for task_id, entry in entries.items():
-        focused = [command for command in entry["contract"]["validationCommands"] if command != shared]
-        if not focused:
-            raise ValueError(f"migrated task has no focused validation after removing campaign command: {task_id}")
-        planned[task_id]["validationCommands"] = focused
-        planned[task_id]["seed"] = dict(entry["seed"])
-        if entry["contract"].get("sourceRef"):
-            planned[task_id].update({key: entry["contract"][key] for key in ("sourceRef", "testPaths", "regressionValidationCommands")})
-    validate_tasks({"tasks": tasks})
-    return [shared], tasks
 
 
 def progress(event: str, detail: str) -> None:
@@ -430,7 +259,7 @@ class CallBudget:
             return self.started
 
 
-def invoke_agent(repo: Path, prompt: str, schema: dict, timeout: int, budget: CallBudget | None, wait_detail: str | None = None, started: float | None = None) -> object:
+def invoke_agent(repo: Path, prompt: str, schema: dict, timeout: int, budget: CallBudget | None) -> object:
     if budget is not None:
         budget.consume()
     with tempfile.TemporaryDirectory(prefix="relay-plan-") as temporary:
@@ -443,8 +272,6 @@ def invoke_agent(repo: Path, prompt: str, schema: dict, timeout: int, budget: Ca
             "--ephemeral", "--sandbox", "read-only", "--cd", str(repo),
             "--output-schema", str(schema_path), "--output-last-message", str(result_path), "-",
         ]
-        if wait_detail:
-            relay_console.update(wait_detail, started=started, timeout=timeout)
         completed = subprocess.run(invocation, input=prompt, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout)
         if completed.returncode:
             raise RuntimeError(f"agent failed with exit code {completed.returncode}")
@@ -466,7 +293,7 @@ def invoke_validated(repo: Path, prompt: str, schema: dict, validator, timeout: 
         started = time.monotonic()
         progress("START", detail)
         try:
-            result = validator(invoke_agent(repo, prompt, schema, timeout, None, detail, started))
+            result = validator(invoke_agent(repo, prompt, schema, timeout, None))
             progress("DONE", f"{detail} elapsed={time.monotonic() - started:.1f}s")
             return result
         except (ValueError, json.JSONDecodeError, RuntimeError, OSError, subprocess.TimeoutExpired) as caught:
@@ -489,15 +316,7 @@ Requirements:\n{requirements}
 Return only the required JSON evidence object."""
 
 
-def planning_prompt(requirements: str, instructions: str, files: list[str], base: str, evidence: list[dict], backlog: dict | None = None) -> str:
-    backlog_rules = ""
-    if backlog:
-        backlog_rules = f"""This is a Relay-owned backlog. Produce exactly one task per structured entry below.
-Preserve each sourceRef exactly. Every task requires nonempty testPaths and regressionValidationCommands.
-Include the original bug paths and every test path in allowedPaths, and include every regression command in validationCommands.
-Use satisfied only when repository evidence proves both the fix and its regression coverage already exist.
-Structured backlog entries:\n{json.dumps(backlog['entries'])}
-"""
+def planning_prompt(requirements: str, instructions: str, files: list[str], base: str, evidence: list[dict]) -> str:
     return f"""Role: Planning Project Manager (read-only).
 Reconcile requirements with the existing repository. Return bounded tasks only for missing work.
 Do not edit, spawn agents, request another pass, or create historical ordering dependencies.
@@ -517,7 +336,6 @@ Base SHA: {base}
 Target instructions:\n{instructions}
 Tracked tree:\n{chr(10).join(files)}
 Scout evidence:\n{json.dumps(evidence)}
-{backlog_rules}
 Requirements:\n{requirements}
 Return only {{\"campaignValidationCommands\": [\"...\"], \"tasks\": [...]}} matching the supplied schema."""
 
@@ -527,7 +345,7 @@ def plan_digest(tasks: list[dict], campaign_validation_commands: list[str] | Non
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def plan_review_prompt(role: str, requirements: str, instructions: str, tasks: list[dict], digest: str, campaign_validation_commands: list[str] | None = None, backlog: dict | None = None) -> str:
+def plan_review_prompt(role: str, requirements: str, instructions: str, tasks: list[dict], digest: str, campaign_validation_commands: list[str] | None = None) -> str:
     focus = "Check requirement coverage, technical feasibility, task boundaries, dependencies, allowed paths, acceptance criteria, exact command syntax, target-platform behavior, campaign/task validation separation, and consistency."
     return f"""Role: {role} (read-only plan review).
 Assignment ID: PLAN
@@ -543,12 +361,11 @@ delays integration to a later task.
 Target instructions:\n{instructions}
 Requirements:\n{requirements}
 Campaign validation commands:\n{json.dumps(campaign_validation_commands or [])}
-Structured backlog entries:\n{json.dumps((backlog or {}).get('entries', []))}
 Draft tasks:\n{json.dumps(tasks)}
 Return only the supplied JSON schema."""
 
 
-def plan_repair_prompt(requirements: str, instructions: str, files: list[str], base: str, tasks: list[dict], findings: list[dict], campaign_validation_commands: list[str] | None = None, backlog: dict | None = None) -> str:
+def plan_repair_prompt(requirements: str, instructions: str, files: list[str], base: str, tasks: list[dict], findings: list[dict], campaign_validation_commands: list[str] | None = None) -> str:
     return f"""Role: Planning Project Manager (repair, read-only).
 Repair only the supplied findings and return the complete revised task graph.
 Do not edit files, spawn agents, widen requirements, create another review, or omit unaffected tasks.
@@ -561,7 +378,6 @@ Target instructions:\n{instructions}
 Tracked tree:\n{chr(10).join(files)}
 Requirements:\n{requirements}
 Campaign validation commands:\n{json.dumps(campaign_validation_commands or [])}
-Structured backlog entries:\n{json.dumps((backlog or {}).get('entries', []))}
 Draft tasks:\n{json.dumps(tasks)}
 Plan findings:\n{json.dumps(findings)}
 Return only {{"campaignValidationCommands": ["..."], "tasks": [...]}} matching the supplied schema."""
@@ -580,11 +396,11 @@ Findings:\n{json.dumps(findings)}
 Return resolved, unresolved, or invalid-result using the supplied JSON schema."""
 
 
-def reviewed_plan(repo: Path, requirements: str, instructions: str, files: list[str], base: str, tasks: list[dict], timeout: int, budget: CallBudget, retries: int, campaign_validation_commands: list[str] | None = None, handoff: dict | None = None, backlog: dict | None = None):
+def reviewed_plan(repo: Path, requirements: str, instructions: str, files: list[str], base: str, tasks: list[dict], timeout: int, budget: CallBudget, retries: int, campaign_validation_commands: list[str] | None = None):
     digest = plan_digest(tasks, campaign_validation_commands)
     role = "plan-reviewer"
     result = invoke_validated(
-        repo, plan_review_prompt(role, requirements, instructions, tasks, digest, campaign_validation_commands, backlog), run.ROLE_JSON_SCHEMAS[role],
+        repo, plan_review_prompt(role, requirements, instructions, tasks, digest, campaign_validation_commands), run.ROLE_JSON_SCHEMAS[role],
         lambda value: run.validate_agent_result(role, value, "PLAN"), timeout, budget, retries, "role=plan-review",
     )
     if result["candidateSha"] != digest:
@@ -595,12 +411,10 @@ def reviewed_plan(repo: Path, requirements: str, instructions: str, files: list[
         return tasks if campaign_validation_commands is None else (campaign_validation_commands, tasks)
     progress("START", f"operation=plan-repair findings={len(findings)}")
     revised = invoke_validated(
-        repo, plan_repair_prompt(requirements, instructions, files, base, tasks, findings, campaign_validation_commands, backlog), planning_schema(backlog is not None) if campaign_validation_commands is not None else json_schema(BACKLOG_TASK_SCHEMA if backlog else TASK_SCHEMA, "tasks"),
-        (lambda value: validate_plan(value, backlog["entries"] if backlog else None)) if campaign_validation_commands is not None else (lambda value: validate_tasks(value, backlog["entries"] if backlog else None)), timeout, budget, retries, "role=planning-pm-repair",
+        repo, plan_repair_prompt(requirements, instructions, files, base, tasks, findings, campaign_validation_commands), planning_schema() if campaign_validation_commands is not None else json_schema(TASK_SCHEMA, "tasks"),
+        validate_plan if campaign_validation_commands is not None else validate_tasks, timeout, budget, retries, "role=planning-pm-repair",
     )
     revised_commands, revised_tasks = (revised["campaignValidationCommands"], revised["tasks"]) if campaign_validation_commands is not None else (None, revised)
-    if revised_commands is not None:
-        revised_commands, revised_tasks = apply_handoff(revised_tasks, revised_commands, handoff)
     revised_digest = plan_digest(revised_tasks, revised_commands)
     verification = invoke_validated(
         repo, plan_verification_prompt(requirements, {"campaignValidationCommands": campaign_validation_commands, "tasks": tasks} if campaign_validation_commands is not None else tasks, revised, findings, revised_digest), run.ROLE_JSON_SCHEMAS["verification-reviewer"],
@@ -642,8 +456,6 @@ def main(argv: list[str] | None = None) -> int:
         parser().error("requirements file must not be empty")
     try:
         base, files, instructions = inspect_repository(repo)
-        handoff = parse_handoff(requirements, repo)
-        backlog = parse_backlog(requirements, repo)
         scopes = scout_scopes(files, args.workers)
         budget = CallBudget(len(scopes) + 4 + args.format_retries)
         progress("START", f"operation=plan name=Relay Planner workers={args.workers} calls={budget.limit}")
@@ -652,18 +464,16 @@ def main(argv: list[str] | None = None) -> int:
             with tempfile.TemporaryDirectory(prefix="relay-scouts-") as temporary, ThreadPoolExecutor(max_workers=args.workers) as pool:
                 futures = []
                 for slot, scope in enumerate(scopes, 1):
-                    relay_console.update(f"scout {slot}/{len(scopes)} | scope={scope} | calls={budget.started}/{budget.limit}")
                     snapshot = create_scout_snapshot(repo, files, scope, Path(temporary) / f"scope-{slot}")
                     prompt = scout_prompt(scope, requirements, instructions)
                     futures.append(pool.submit(invoke_validated, snapshot, prompt, scout_schema(scope), lambda value, expected=scope: validate_scout(value, expected), args.agent_timeout, budget, args.format_retries, f"role=scout slot={slot}"))
                 evidence = [future.result() for future in futures]
-        relay_console.update(f"planning-pm synthesize | calls={budget.started}/{budget.limit}")
         planned = invoke_validated(
-            repo, planning_prompt(requirements, instructions, files, base, evidence, backlog), planning_schema(backlog is not None),
-            lambda value: validate_plan(value, backlog["entries"] if backlog else None), args.agent_timeout, budget, args.format_retries, "role=planning-pm",
+            repo, planning_prompt(requirements, instructions, files, base, evidence), planning_schema(),
+            validate_plan, args.agent_timeout, budget, args.format_retries, "role=planning-pm",
         )
-        commands, tasks = apply_handoff(planned["tasks"], planned["campaignValidationCommands"], handoff)
-        commands, tasks = reviewed_plan(repo, requirements, instructions, files, base, tasks, args.agent_timeout, budget, args.format_retries, commands, handoff, backlog)
+        commands, tasks = planned["campaignValidationCommands"], planned["tasks"]
+        commands, tasks = reviewed_plan(repo, requirements, instructions, files, base, tasks, args.agent_timeout, budget, args.format_retries, commands)
         progress("DONE", f"operation=validate-plan tasks={len(tasks)}")
         output = render_tasks(tasks, base, hashlib.sha256(requirements.encode()).hexdigest()[:12], args.task_attempts, args.fix_loops, commands)
         output_path = (args.output or repo / "PLAN.md").resolve()
@@ -683,8 +493,6 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, RuntimeError, OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         progress("FAILED", f"operation=plan reason={str(error).splitlines()[0]}")
         return 1
-    finally:
-        relay_console.close()
 
 
 if __name__ == "__main__":
