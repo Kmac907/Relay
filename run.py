@@ -1772,6 +1772,8 @@ def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: di
             if any(item["action"] == "needs-user" for item in triage["decisions"]):
                 transition_review(session, "needs-user", store.state["fixLoopLimit"])
                 session["triageCompleted"] = True
+                if not store.state["taskStates"][assignment_id].get("error"):
+                    store.state["taskStates"][assignment_id]["error"] = "review requires user"
                 store.save()
                 return False
             with store.lock:
@@ -1796,13 +1798,15 @@ def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: di
                     transition_review(session, "needs-user", store.state["fixLoopLimit"])
                     store.save()
                     return False
-                current_sha = session.get("previousCandidateSha") or session.get("currentCandidateSha", sha)
+                current_sha = session.get("currentCandidateSha", sha)
                 try:
                     if session.get("pendingWorkerSha"):
                         repair = {"candidateSha": session["pendingWorkerSha"]}
                     else:
                         if session["repairAttemptsStarted"] >= store.state["fixLoopLimit"]:
                             transition_review(session, "needs-user", store.state["fixLoopLimit"])
+                            if not store.state["taskStates"][assignment_id].get("error"):
+                                store.state["taskStates"][assignment_id]["error"] = "review requires user"
                             store.save()
                             return False
                         store.update(lambda state: state["reviewSessions"][assignment_id].__setitem__("repairAttemptsStarted", state["reviewSessions"][assignment_id]["repairAttemptsStarted"] + 1))
@@ -1811,6 +1815,7 @@ def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: di
                             store.state["taskStates"][assignment_id]["workerSummary"] = repair["summary"]
                         session.update(previousCandidateSha=current_sha, pendingWorkerSha=repair["candidateSha"])
                         store.save()
+                    candidate_integrity(store, assignment, worktree, repair, current_sha)
                     repaired_sha = validate_candidate(store, assignment, worktree, repair)
                 except (RuntimeError, ValueError, json.JSONDecodeError) as error:
                     task_state = store.state["taskStates"][assignment_id]
@@ -1845,12 +1850,17 @@ def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: di
                         next(item for item in bugs if item["id"] == bug["id"])["status"] = "resolved"
                     write_bugs(store, bugs)
                 break
+            store.state["taskStates"][assignment_id]["error"] = f"verification {verification['status']}"
             target = f"repair-{number + 1}" if number < store.state["fixLoopLimit"] else "needs-user"
             transition_review(session, target, store.state["fixLoopLimit"])
             session.pop("pendingRepairSha", None)
             session.pop("pendingRepairNumber", None)
             store.save()
-        return session["phase"] == "approved"
+        approved = session["phase"] == "approved"
+        if not approved and not store.state["taskStates"][assignment_id].get("error"):
+            store.state["taskStates"][assignment_id]["error"] = "review requires user"
+            store.save()
+        return approved
     except (RuntimeError, ValueError, json.JSONDecodeError) as error:
         store.state["taskStates"][assignment_id]["error"] = str(error)
         if session["phase"] not in TERMINAL_REVIEW_PHASES:
@@ -2828,7 +2838,11 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str], gra
         changed = target_changes(store, worktree, record["baseSha"], head)
         outside = sorted(path for path in changed if not allowed_change(path, assignment["allowedPaths"]))
         if not dirty and not outside and head != session.get("initialCandidateSha"):
-            actions.append({"action": "salvage-repair", "assignmentId": assignment_id, "headSha": head, "previousSha": session.get("currentCandidateSha") or session["initialCandidateSha"], "repair": session["repairAttemptsStarted"]})
+            previous = session.get("previousCandidateSha")
+            ancestry = git(worktree, "merge-base", "--is-ancestor", previous, head, timeout=store.state["validationTimeoutSeconds"], check=False) if previous and previous != head else None
+            if not previous or previous == head or ancestry.returncode:
+                raise RuntimeError(f"cannot salvage review repair: {assignment_id}")
+            actions.append({"action": "salvage-repair", "assignmentId": assignment_id, "headSha": head, "previousSha": previous, "repair": session["repairAttemptsStarted"]})
             handled.add(assignment_id)
     unresolved = sorted(
         assignment_id for assignment_id, task_state in store.state.get("taskStates", {}).items()
@@ -3138,6 +3152,7 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
             task_state.pop("error", None)
         elif action["action"] == "salvage-repair":
             worktree, _ = recovery_worktree(store, assignment_id)
+            candidate_integrity(store, by_id[assignment_id], worktree, {"candidateSha": action["headSha"]}, action["previousSha"])
             if task_state.get("candidateSha") != action["headSha"]:
                 validate_candidate(store, by_id[assignment_id], worktree, {"candidateSha": action["headSha"]})
             session = store.state["reviewSessions"][assignment_id]

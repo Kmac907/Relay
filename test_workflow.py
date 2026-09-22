@@ -1208,7 +1208,7 @@ class DeterministicCoreTests(unittest.TestCase):
                 "reviewCallsStarted": 0, "reviewCallLimit": 9,
             }
             candidate = {"status": "candidate", "candidateSha": "repair"}
-            with patch("run.invoke_with_replacements", return_value=candidate) as worker, patch("run.validate_candidate", side_effect=[RuntimeError("first validation"), RuntimeError("last validation")]):
+            with patch("run.invoke_with_replacements", return_value=candidate) as worker, patch("run.candidate_integrity", return_value="repair"), patch("run.validate_candidate", side_effect=[RuntimeError("first validation"), RuntimeError("last validation")]):
                 self.assertFalse(run.run_review(store, threading.Semaphore(1), assignment, Path(root), "sha"))
             session = store.state["reviewSessions"][assignment["id"]]
             self.assertEqual((worker.call_count, session["repairAttemptsStarted"], session["phase"]), (2, 2, "needs-user"))
@@ -1292,6 +1292,82 @@ class DeterministicCoreTests(unittest.TestCase):
             with patch("run.recovery_worktree", return_value=(Path(root), store.state["worktrees"][assignment["id"]])), patch("run.git", side_effect=recovery_git), self.assertRaisesRegex(RuntimeError, "explicit disposition"):
                 run.plan_recovery(store, [assignment], [], [assignment["id"]])
 
+    def test_recovery_salvage_restores_parent_to_repair_diff(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = make_git_repository(Path(root))
+            base = git_output(target, "rev-parse", "HEAD").strip()
+            (target / "src").mkdir()
+            (target / "src" / "value.txt").write_text("candidate\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", "src/value.txt"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "candidate"], check=True, capture_output=True)
+            parent = git_output(target, "rev-parse", "HEAD").strip()
+            (target / "src" / "value.txt").write_text("repair\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "commit", "-am", "repair"], check=True, capture_output=True)
+            repaired = git_output(target, "rev-parse", "HEAD").strip()
+            store = self.state_store(target)
+            run.exclude_relay_files(target)
+            assignment = ContractTests().task()
+            assignment.update(allowedPaths=["src"], validationCommands=[])
+            record = {"path": str(target), "root": str(target), "branch": "main", "baseSha": base}
+            store.state.update(phase="needs-user", campaignValidationCommands=[])
+            store.state["worktrees"][assignment["id"]] = record
+            store.state["taskStates"][assignment["id"]] = {"phase": "needs-user", "candidateSha": parent}
+            store.state["reviewSessions"][assignment["id"]] = {
+                "phase": "needs-user", "acceptedBlockerIds": [], "initialCandidateSha": parent,
+                "currentCandidateSha": repaired, "previousCandidateSha": parent,
+                "repairAttemptsStarted": 1, "reviewCallsStarted": 1, "reviewCallLimit": 9,
+            }
+            with patch("run.recovery_worktree", return_value=(target, record)):
+                actions = run.plan_recovery(store, [assignment], [], [])
+                self.assertEqual(actions, [{"action": "salvage-repair", "assignmentId": assignment["id"], "headSha": repaired, "previousSha": parent, "repair": 1}])
+                run.apply_recovery(store, [assignment], actions)
+            session = store.state["reviewSessions"][assignment["id"]]
+            self.assertEqual((session["phase"], session["previousCandidateSha"]), ("verify-1", parent))
+            verified = {"assignmentId": assignment["id"], "candidateSha": repaired, "status": "resolved"}
+            with patch("run.invoke_with_replacements", return_value=verified) as reviewer:
+                self.assertTrue(run.run_review(store, threading.Semaphore(1), assignment, target, parent))
+            self.assertIn(f'"repairDiff": "{parent}..{repaired}"', reviewer.call_args.args[5])
+
+    def test_recovery_salvage_refuses_missing_equal_or_nonancestor_parent(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = make_git_repository(Path(root))
+            base = git_output(target, "rev-parse", "HEAD").strip()
+            (target / "src").mkdir()
+            (target / "src" / "value.txt").write_text("candidate\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", "src/value.txt"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "candidate"], check=True, capture_output=True)
+            parent = git_output(target, "rev-parse", "HEAD").strip()
+            (target / "src" / "value.txt").write_text("repair\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "commit", "-am", "repair"], check=True, capture_output=True)
+            repaired = git_output(target, "rev-parse", "HEAD").strip()
+            subprocess.run(["git", "-C", str(target), "checkout", "-b", "unrelated", base], check=True, capture_output=True)
+            (target / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", "unrelated.txt"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "unrelated"], check=True, capture_output=True)
+            unrelated = git_output(target, "rev-parse", "HEAD").strip()
+            subprocess.run(["git", "-C", str(target), "checkout", "main"], check=True, capture_output=True)
+            store = self.state_store(target)
+            run.exclude_relay_files(target)
+            assignment = ContractTests().task()
+            assignment.update(allowedPaths=["src"], validationCommands=[])
+            record = {"path": str(target), "root": str(target), "branch": "main", "baseSha": base}
+            store.state["phase"] = "needs-user"
+            store.state["worktrees"][assignment["id"]] = record
+            store.state["taskStates"][assignment["id"]] = {"phase": "needs-user"}
+            session = {
+                "phase": "needs-user", "acceptedBlockerIds": [], "initialCandidateSha": parent,
+                "currentCandidateSha": repaired, "repairAttemptsStarted": 1,
+            }
+            store.state["reviewSessions"][assignment["id"]] = session
+            for label, previous in (("missing", None), ("equal", repaired), ("nonancestor", unrelated)):
+                with self.subTest(parent=label):
+                    if previous:
+                        session["previousCandidateSha"] = previous
+                    else:
+                        session.pop("previousCandidateSha", None)
+                    with patch("run.recovery_worktree", return_value=(target, record)), self.assertRaisesRegex(RuntimeError, "cannot salvage review repair"):
+                        run.plan_recovery(store, [assignment], [], [])
+
     def test_clean_changed_terminal_candidate_replays_without_attempt(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
@@ -1327,10 +1403,109 @@ class DeterministicCoreTests(unittest.TestCase):
             store.state["worktrees"][assignment["id"]] = {"baseSha": "base"}
             store.state["reviewSessions"][assignment["id"]] = {"phase": "repair-2", "acceptedBlockerIds": [], "repairAttemptsStarted": 2, "reviewCallsStarted": 3, "reviewCallLimit": 9, "pendingWorkerSha": "new", "previousCandidateSha": "old"}
             verified = {"assignmentId": assignment["id"], "candidateSha": "new", "status": "resolved"}
-            with patch("run.validate_candidate", return_value="new") as validate, patch("run.invoke_with_replacements", return_value=verified) as agent:
+            with patch("run.candidate_integrity", return_value="new"), patch("run.validate_candidate", return_value="new") as validate, patch("run.invoke_with_replacements", return_value=verified) as agent:
                 self.assertTrue(run.run_review(store, threading.Semaphore(1), assignment, Path(root), "old"))
             validate.assert_called_once()
             self.assertEqual(agent.call_args.args[4], "verification-reviewer")
+
+    def test_second_review_repair_starts_from_current_candidate(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            store.state["taskStates"][assignment["id"]] = {"phase": "repair-1"}
+            store.state["worktrees"][assignment["id"]] = {"baseSha": "base"}
+            store.state["reviewSessions"][assignment["id"]] = {
+                "phase": "repair-1", "acceptedBlockerIds": [], "repairAttemptsStarted": 0,
+                "reviewCallsStarted": 0, "reviewCallLimit": 9, "currentCandidateSha": "initial",
+            }
+            workers = iter(("repair-one", "repair-two"))
+            verifications = iter(("unresolved", "resolved"))
+            prompts = []
+            parents = []
+
+            def invoke(_store, _semaphore, _worktree, assignment_id, role, prompt, **_kwargs):
+                prompts.append((role, prompt))
+                if role == "worker":
+                    return {"assignmentId": assignment_id, "candidateSha": next(workers), "status": "candidate"}
+                candidate = "repair-one" if len([item for item in prompts if item[0] == role]) == 1 else "repair-two"
+                return {"assignmentId": assignment_id, "candidateSha": candidate, "status": next(verifications)}
+
+            def integrity(_store, _assignment, _worktree, result, parent):
+                parents.append((result["candidateSha"], parent))
+                return result["candidateSha"]
+
+            def validate(_store, _assignment, _worktree, result):
+                store.state["taskStates"][assignment["id"]].pop("error", None)
+                return result["candidateSha"]
+
+            with patch("run.invoke_with_replacements", side_effect=invoke), patch("run.candidate_integrity", side_effect=integrity), patch("run.validate_candidate", side_effect=validate):
+                self.assertTrue(run.run_review(store, threading.Semaphore(1), assignment, Path(root), "initial"))
+
+            worker_prompts = [prompt for role, prompt in prompts if role == "worker"]
+            self.assertIn("Current candidate: initial", worker_prompts[0])
+            self.assertIn("Current candidate: repair-one", worker_prompts[1])
+            self.assertEqual(parents, [("repair-one", "initial"), ("repair-two", "repair-one")])
+
+    def test_same_sha_review_repair_skips_validation_and_verification(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = make_git_repository(Path(root))
+            candidate = git_output(target, "rev-parse", "HEAD").strip()
+            store = self.state_store(target, fix_loops=1)
+            run.exclude_relay_files(target)
+            assignment = ContractTests().task()
+            store.state["taskStates"][assignment["id"]] = {"phase": "repair-1"}
+            store.state["worktrees"][assignment["id"]] = {"baseSha": candidate}
+            store.state["reviewSessions"][assignment["id"]] = {
+                "phase": "repair-1", "acceptedBlockerIds": [], "repairAttemptsStarted": 0,
+                "reviewCallsStarted": 0, "reviewCallLimit": 9, "currentCandidateSha": candidate,
+            }
+            result = {"assignmentId": assignment["id"], "candidateSha": candidate, "status": "candidate"}
+            with patch("run.invoke_with_replacements", return_value=result) as agent, patch("run.validate_candidate") as validate:
+                self.assertFalse(run.run_review(store, threading.Semaphore(1), assignment, target, candidate))
+            validate.assert_not_called()
+            self.assertEqual(agent.call_count, 1)
+            self.assertEqual(store.state["reviewSessions"][assignment["id"]]["repairAttemptsStarted"], 1)
+            self.assertEqual(store.state["taskStates"][assignment["id"]]["error"], "validation repair must commit a descendant candidate")
+
+    def test_failed_verification_overrides_passed_provider_status_in_summaries(self):
+        for verification_status in ("unresolved", "invalid-result"):
+            with self.subTest(status=verification_status), tempfile.TemporaryDirectory() as root:
+                store = self.state_store(root, fix_loops=1)
+                assignment = ContractTests().task()
+                store.state["taskStates"][assignment["id"]] = {"phase": "verify-1", "providerStatus": "passed"}
+                store.state["reviewSessions"][assignment["id"]] = {
+                    "phase": "verify-1", "acceptedBlockerIds": [], "repairAttemptsStarted": 1,
+                    "reviewCallsStarted": 0, "reviewCallLimit": 9, "previousCandidateSha": "old",
+                    "currentCandidateSha": "new", "pendingRepairSha": "new", "pendingRepairNumber": 1,
+                }
+                result = {"assignmentId": assignment["id"], "candidateSha": "new", "status": verification_status}
+                with patch("run.invoke_with_replacements", return_value=result):
+                    self.assertFalse(run.run_review(store, threading.Semaphore(1), assignment, Path(root), "old"))
+                task_state = store.state["taskStates"][assignment["id"]]
+                task_state["phase"] = "needs-user"
+                self.assertEqual(task_state["error"], f"verification {verification_status}")
+                lines, _ = run.campaign_summary(store.state, [assignment], [])
+                self.assertIn(f"reason=verification {verification_status}", "\n".join(lines))
+                with patch("run.stderr_event") as event:
+                    run.report_stopped(store.state)
+                output = "\n".join(call.args[1] for call in event.call_args_list)
+                self.assertIn(f"reason=verification {verification_status}", output)
+                self.assertNotIn("reason=passed", output)
+
+    def test_triage_needs_user_records_review_error(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            store.state["taskStates"][assignment["id"]] = {"phase": "triage", "providerStatus": "passed"}
+            store.state["reviewSessions"][assignment["id"]] = {
+                "phase": "triage", "initialResults": {"contract-reviewer": {"findings": [{"id": "finding"}]}},
+                "acceptedBlockerIds": [], "repairAttemptsStarted": 0, "reviewCallsStarted": 0,
+                "reviewCallLimit": 9, "triageCompleted": False,
+            }
+            triage = {"assignmentId": assignment["id"], "decisions": [{"findingId": "finding", "action": "needs-user", "reason": "operator decision"}]}
+            with patch("run.invoke_with_replacements", return_value=triage):
+                self.assertFalse(run.run_review(store, threading.Semaphore(1), assignment, Path(root), "candidate"))
+            self.assertEqual(store.state["taskStates"][assignment["id"]]["error"], "review requires user")
 
     def test_real_cumulative_candidate_and_one_file_repair_validate(self):
         with tempfile.TemporaryDirectory() as root:
