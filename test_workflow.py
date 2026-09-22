@@ -509,69 +509,6 @@ class DeterministicCoreTests(unittest.TestCase):
         store.state.update(provider="azure-devops", azureOrganization="my org", azureProject="My Project", azureRepository="My Repo", mergeMethod=merge_method)
         return store
 
-    def legacy_port_store(self, root):
-        root = Path(root)
-        store = self.state_store(root)
-        expected = run.LEGACY_REVIEW_PORT
-        assignment = ContractTests().task(expected["assignmentId"])
-        assignment.update(status="blocked", allowedPaths=["src/file.py"])
-        text = plan.render_tasks([assignment], store.state["baseSha"], store.state["requirementsHash"], campaign_validation_commands=store.state["campaignValidationCommands"])
-        text = text.replace("- Attempt: 0/3", "- Attempt: 3/3")
-        (root / "tasks.md").write_text(text, encoding="utf-8")
-        bugs = [
-            {"id": bug_id, "title": "Blocker", "severity": "P1", "status": "active", "source": assignment["id"], "location": "src/file.py:1", "failure": "fails", "reproduction": "test", "requirement": "works", "evidence": "proof", "allowedPaths": ["src/file.py"]}
-            for bug_id in expected["blockerIds"]
-        ]
-        store.state.update(campaignId=expected["campaignId"], phase="needs-user", provider="github", githubRepository="example/repo")
-        (root / "bugs.md").write_text(run.render_bugs(expected["campaignId"], root, bugs), encoding="utf-8")
-        worktree = root / "relay-worktrees" / expected["campaignId"] / assignment["id"]
-        worktree.mkdir(parents=True)
-        stale = root / "relay-worktrees" / expected["campaignId"] / "TASK-0002"
-        stale.mkdir(parents=True)
-        store.state["attemptCounters"][assignment["id"]] = 3
-        pr = {"number": 8, "url": "https://example.invalid/8", "headRefOid": expected["previousCandidateSha"], "state": "OPEN"}
-        store.state["taskStates"].update({
-            assignment["id"]: {"phase": "needs-user", "fixAttemptsStarted": 0, "candidateSha": expected["candidateSha"], "validationCandidateSha": expected["candidateSha"], "validationRepairAttemptsStarted": 0, "validationRepairCallsStarted": 0, "error": "verification unresolved", "branch": f"relay/{expected['campaignId']}/{assignment['id']}", "pushed": True, "merged": False, "pushedSha": expected["previousCandidateSha"], "pr": pr, "prMetadata": {"candidateSha": expected["previousCandidateSha"]}, "publicationProof": {"candidateSha": expected["previousCandidateSha"]}},
-            "TASK-0002": {"phase": "integrated"},
-        })
-        store.state["reviewSessions"][assignment["id"]] = {
-            "phase": "needs-user", "repairAttemptsStarted": 2, "reviewCallsStarted": 6, "reviewCallLimit": 7,
-            "initialCandidateSha": expected["previousCandidateSha"], "previousCandidateSha": expected["previousCandidateSha"], "currentCandidateSha": expected["candidateSha"], "reviewedSha": "", "reviewResult": {"candidateSha": expected["previousCandidateSha"]},
-            "acceptedBlockerIds": list(expected["blockerIds"]), "approvedRepairPaths": ["src/file.py"],
-        }
-        store.state["worktrees"].update({
-            assignment["id"]: {"path": str(worktree), "root": str(worktree), "branch": f"relay/{expected['campaignId']}/{assignment['id']}", "baseSha": expected["baseSha"]},
-            "TASK-0002": {"path": str(stale), "root": str(stale), "branch": "stale", "baseSha": "base"},
-        })
-        store.state["pullRequests"][assignment["id"]] = pr
-        store.save()
-        return store, run.load_tasks(store), worktree
-
-    def legacy_port_patches(self, store, worktree, *, ancestry=True, changed="src/file.py\n", live_sha=None):
-        expected = run.LEGACY_REVIEW_PORT
-        def recovery_git(_repo, *args, **_kwargs):
-            if args[:2] == ("rev-parse", "--show-toplevel"):
-                output, code = f"{worktree}\n", 0
-            elif args[:2] == ("rev-parse", "HEAD"):
-                output, code = f"{expected['candidateSha']}\n", 0
-            elif args[0] == "status":
-                output, code = "", 0
-            elif args[0] == "diff":
-                output, code = changed, 0
-            elif args[0] == "merge-base":
-                output, code = "", 0 if ancestry else 1
-            else:
-                output, code = "", 0
-            return subprocess.CompletedProcess([], code, output, "")
-        live = {"number": 8, "url": "https://example.invalid/8", "headRefOid": live_sha or expected["previousCandidateSha"], "state": "OPEN"}
-        return (
-            patch("run.tempfile.gettempdir", return_value=str(Path(store.state["repository"]))),
-            patch("run._provider_identity", return_value={"provider": "github", "githubRepository": "example/repo"}),
-            patch("run.git", side_effect=recovery_git),
-            patch("run._inspect_pr_readonly", return_value=live),
-            patch("run._listed_worktrees", return_value={Path(store.state["repository"]).resolve(), worktree.resolve()}),
-        )
-
     def azure_pr(self, status="active", merge_status="succeeded", sha="abc"):
         return {"pullRequestId": 7, "status": status, "mergeStatus": merge_status, "lastMergeSourceCommit": {"commitId": sha}}
 
@@ -1188,58 +1125,6 @@ class DeterministicCoreTests(unittest.TestCase):
                 store.state["reviewSessions"][assignment["id"]].pop("approvedRepairPaths")
                 with self.assertRaisesRegex(RuntimeError, "scope drift"):
                     run._recovery_snapshot(store, assignment)
-
-    def test_legacy_review_port_preview_and_apply_exact_state(self):
-        with tempfile.TemporaryDirectory() as root:
-            store, tasks, worktree = self.legacy_port_store(root)
-            before = (store.path.read_bytes(), Path(root, "tasks.md").read_bytes())
-            patches = self.legacy_port_patches(store, worktree)
-            with patches[0], patches[1], patches[2], patches[3], patches[4]:
-                action = run.plan_legacy_review_port(store, tasks, run.LEGACY_REVIEW_PORT["assignmentId"])
-                self.assertEqual((store.path.read_bytes(), Path(root, "tasks.md").read_bytes()), before)
-                run.apply_legacy_review_port(store, tasks, action)
-            task_state = store.state["taskStates"][run.LEGACY_REVIEW_PORT["assignmentId"]]
-            session = store.state["reviewSessions"][run.LEGACY_REVIEW_PORT["assignmentId"]]
-            self.assertEqual((store.state["phase"], task_state["phase"], task_state["fixAttemptsStarted"]), ("build", "verify-2", 2))
-            self.assertEqual((session["phase"], session["pendingRepairSha"], session["pendingRepairNumber"]), ("verify-2", run.LEGACY_REVIEW_PORT["candidateSha"], 2))
-            self.assertEqual(session["previousCandidateSha"], run.LEGACY_REVIEW_PORT["previousCandidateSha"])
-            self.assertNotIn("repairAttemptsStarted", session)
-            self.assertNotIn("validationRepairAttemptsStarted", task_state)
-            self.assertNotIn("validationRepairCallsStarted", task_state)
-            self.assertNotIn("TASK-0002", store.state["worktrees"])
-            self.assertTrue((Path(root) / "relay-worktrees" / run.LEGACY_REVIEW_PORT["campaignId"] / "TASK-0002").is_dir())
-            self.assertEqual(run.load_tasks(store)[0]["fixLoop"], 2)
-
-    def test_legacy_review_port_rejects_every_mismatched_boundary(self):
-        with tempfile.TemporaryDirectory() as root:
-            store, tasks, worktree = self.legacy_port_store(root)
-            patches = self.legacy_port_patches(store, worktree)
-            with patches[0], patches[1], patches[2], patches[3], patches[4], self.assertRaises(RuntimeError):
-                run.plan_legacy_review_port(store, tasks, "TASK-9999")
-        cases = {
-            "campaign": lambda store: store.state.__setitem__("campaignId", "wrong"),
-            "repository": lambda store: store.state.__setitem__("githubRepository", "wrong/repo"),
-            "task phase": lambda store: store.state["taskStates"][run.LEGACY_REVIEW_PORT["assignmentId"]].__setitem__("phase", "ready"),
-            "counter": lambda store: store.state["attemptCounters"].__setitem__(run.LEGACY_REVIEW_PORT["assignmentId"], 2),
-            "blockers": lambda store: store.state["reviewSessions"][run.LEGACY_REVIEW_PORT["assignmentId"]].__setitem__("acceptedBlockerIds", []),
-            "worktree": lambda store: store.state["worktrees"][run.LEGACY_REVIEW_PORT["assignmentId"]].__setitem__("baseSha", "wrong"),
-            "sha": lambda store: store.state["taskStates"][run.LEGACY_REVIEW_PORT["assignmentId"]].__setitem__("candidateSha", "wrong"),
-            "paths": lambda store: store.state["reviewSessions"][run.LEGACY_REVIEW_PORT["assignmentId"]].__setitem__("approvedRepairPaths", ["outside.py"]),
-            "pr": lambda store: store.state["taskStates"][run.LEGACY_REVIEW_PORT["assignmentId"]]["pr"].__setitem__("headRefOid", "wrong"),
-        }
-        for label, mutate in cases.items():
-            with self.subTest(label=label), tempfile.TemporaryDirectory() as root:
-                store, tasks, worktree = self.legacy_port_store(root)
-                mutate(store)
-                patches = self.legacy_port_patches(store, worktree)
-                with patches[0], patches[1], patches[2], patches[3], patches[4], self.assertRaises(RuntimeError):
-                    run.plan_legacy_review_port(store, tasks, run.LEGACY_REVIEW_PORT["assignmentId"])
-        for label, options in (("ancestry", {"ancestry": False}), ("live PR", {"live_sha": "wrong"}), ("changed paths", {"changed": "outside.py\n"})):
-            with self.subTest(label=label), tempfile.TemporaryDirectory() as root:
-                store, tasks, worktree = self.legacy_port_store(root)
-                patches = self.legacy_port_patches(store, worktree, **options)
-                with patches[0], patches[1], patches[2], patches[3], patches[4], self.assertRaises(RuntimeError):
-                    run.plan_legacy_review_port(store, tasks, run.LEGACY_REVIEW_PORT["assignmentId"])
 
     def test_bug_dispositions_persist_reasons_and_discard_stays_out_of_ledger(self):
         with tempfile.TemporaryDirectory() as root:
