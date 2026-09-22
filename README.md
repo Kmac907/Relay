@@ -78,6 +78,25 @@ python status.py --repo C:\Code\Projects\Example
 
 ## Architecture
 
+```text
+[Requirements] -> [Plan] -> [Vertical slice] -> [Focused validation] -> [Campaign validation]
+                                          ^                                  |
+                                          |                                  v
+                                          +-------- bounded repair ------ [One review]
+                                                                             | \
+                                                                    approved |  \ unsafe or exhausted
+                                                                             v   v
+                                                                    [Pull request] [needs-user]
+                                                                             |
+                                                                             v
+                                                                          [Merge]
+                                                                             |
+                                                      +----------------------+------------------+
+                                                      |                                         |
+                                                      v                                         v
+                                                [Next slice]                            [One finite audit]
+```
+
 `plan.py` reads the requirements, tracked tree, base SHA, and target `AGENTS.md`. It may run fixed read-only scout scopes concurrently, then creates the fewest independently useful vertical slices. One read-only plan review may trigger one bounded repair and exact verification. Every structured agent result is validated before output is accepted.
 
 `run.py` is the only writer of active campaign state and ledgers. Before any Worker starts, it validates the campaign commands at the planned base in a detached worktree. It optionally publishes a generated target `AGENTS.md` in its own PR. Ready slices then run concurrently when dependencies and path ownership allow it.
