@@ -528,11 +528,7 @@ def plan_digest(tasks: list[dict], campaign_validation_commands: list[str] | Non
 
 
 def plan_review_prompt(role: str, requirements: str, instructions: str, tasks: list[dict], digest: str, campaign_validation_commands: list[str] | None = None, backlog: dict | None = None) -> str:
-    focus = (
-        "Check requirement coverage, task boundaries, dependencies, allowed paths, acceptance criteria, campaign/task validation separation, and consistency."
-        if role == "contract-reviewer" else
-        "Audit technical feasibility against the repository, especially whether campaign commands pass on the untouched base, exact validation command syntax, target-platform behavior, and paths needed to satisfy each task."
-    )
+    focus = "Check requirement coverage, technical feasibility, task boundaries, dependencies, allowed paths, acceptance criteria, exact command syntax, target-platform behavior, campaign/task validation separation, and consistency."
     return f"""Role: {role} (read-only plan review).
 Assignment ID: PLAN
 Candidate SHA: {digest}
@@ -586,18 +582,16 @@ Return resolved, unresolved, or invalid-result using the supplied JSON schema.""
 
 def reviewed_plan(repo: Path, requirements: str, instructions: str, files: list[str], base: str, tasks: list[dict], timeout: int, budget: CallBudget, retries: int, campaign_validation_commands: list[str] | None = None, handoff: dict | None = None, backlog: dict | None = None):
     digest = plan_digest(tasks, campaign_validation_commands)
-    findings = []
-    for role in ("contract-reviewer", "risk-reviewer"):
-        operation = "plan-review" if role == "contract-reviewer" else "plan-audit"
-        result = invoke_validated(
-            repo, plan_review_prompt(role, requirements, instructions, tasks, digest, campaign_validation_commands, backlog), run.ROLE_JSON_SCHEMAS[role],
-            lambda value, expected=role: run.validate_agent_result(expected, value, "PLAN"), timeout, budget, retries, f"role={operation}",
-        )
-        if result["candidateSha"] != digest:
-            raise ValueError(f"{role} changed plan digest")
-        findings.extend(result["findings"])
+    role = "plan-reviewer"
+    result = invoke_validated(
+        repo, plan_review_prompt(role, requirements, instructions, tasks, digest, campaign_validation_commands, backlog), run.ROLE_JSON_SCHEMAS[role],
+        lambda value: run.validate_agent_result(role, value, "PLAN"), timeout, budget, retries, "role=plan-review",
+    )
+    if result["candidateSha"] != digest:
+        raise ValueError("plan reviewer changed plan digest")
+    findings = result["findings"]
     if not findings:
-        progress("DONE", "operation=plan-audit result=approved")
+        progress("DONE", "operation=plan-review result=approved")
         return tasks if campaign_validation_commands is None else (campaign_validation_commands, tasks)
     progress("START", f"operation=plan-repair findings={len(findings)}")
     revised = invoke_validated(
@@ -651,7 +645,7 @@ def main(argv: list[str] | None = None) -> int:
         handoff = parse_handoff(requirements, repo)
         backlog = parse_backlog(requirements, repo)
         scopes = scout_scopes(files, args.workers)
-        budget = CallBudget(len(scopes) + 5 + args.format_retries)
+        budget = CallBudget(len(scopes) + 4 + args.format_retries)
         progress("START", f"operation=plan name=Relay Planner workers={args.workers} calls={budget.limit}")
         evidence = []
         if scopes:

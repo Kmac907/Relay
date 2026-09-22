@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
+import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -88,7 +90,10 @@ def main(argv: list[str] | None = None) -> int:
 
     bugs = Counter(f"{item['severity']} {item['status']}" for item in ledger_bugs)
     provider = "Azure DevOps" if state.get("provider") == "azure-devops" else "GitHub" if state.get("provider") == "github" or state.get("githubRepository") else "not-detected"
-    print(f"\nCampaign\n  ID: {state['campaignId']}\n  Provider: {provider}\n  Phase: {state['phase']}\n  Elapsed: {age(state['createdAt'])}\n  Heartbeat age: {age(state['heartbeat'])}")
+    print(f"\nCampaign\n  ID: {state['campaignId']}\n  Schema: {state.get('schemaVersion', 'unknown')}\n  Provider: {provider}\n  Phase: {state['phase']}\n  Elapsed: {age(state['createdAt'])}\n  Heartbeat age: {age(state['heartbeat'])}")
+    if state.get("schemaVersion") == 2:
+        command = subprocess.list2cmdline([sys.executable, str(Path(__file__).resolve().with_name("run.py")), "--repo", str(repo), "--recover"])
+        print(f"\nRecovery\n  Schema-2 migration preview: {command}")
     if bootstrap:
         pr = bootstrap.get("pr") or {}
         print(f"\nAGENTS.md bootstrap\n  Phase: {bootstrap['phase']}\n  PR: {pr.get('url', pr.get('number', 'not-created'))}\n  Checks: {bootstrap.get('providerStatus', 'pending')}")
