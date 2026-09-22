@@ -28,15 +28,14 @@ class TTYBuffer(io.StringIO):
 
 
 class ConsoleTests(unittest.TestCase):
-    def test_emit_and_update_are_plain_synchronous_events(self):
+    def test_emit_is_a_plain_synchronous_event(self):
         stream = io.StringIO()
-        with patch.object(relay_console.sys, "stderr", stream), patch.object(relay_console.time, "monotonic", return_value=12):
-            relay_console.update("working", started=10, timeout=30)
+        with patch.object(relay_console.sys, "stderr", stream):
+            relay_console.emit("WAIT", "working", deadline="30s")
             relay_console.emit("DONE", operation="step")
-            relay_console.close()
         output = stream.getvalue()
         self.assertIn("WAIT", output)
-        self.assertIn("elapsed=2s/30s", output)
+        self.assertIn("deadline=30s", output)
         self.assertIn("DONE", output)
         self.assertNotIn("\\r", output)
 

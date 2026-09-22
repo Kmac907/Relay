@@ -77,14 +77,14 @@ def create(path: Path, github: str | None = None, visibility: str | None = None,
         raise ValueError(f"refusing existing Git repository: {target}")
 
     started = time.monotonic()
-    relay_console.update("repository initialize", started=started, timeout=timeout)
+    relay_console.emit("START", operation="initialize", deadline=f"{timeout}s")
     run("git", "-C", str(target), "init", "--initial-branch=main", timeout=timeout)
     create_exclusive(target / "README.md", f"# {target.name}\n")
     create_exclusive(target / "AGENTS.md", TARGET_AGENTS)
     run("git", "-C", str(target), "add", "README.md", "AGENTS.md", timeout=timeout)
     relay_console.emit("DONE", operation="initialize", elapsed=f"{time.monotonic() - started:.1f}s")
     started = time.monotonic()
-    relay_console.update("repository commit", started=started, timeout=timeout)
+    relay_console.emit("START", operation="commit", deadline=f"{timeout}s")
     run("git", "-C", str(target), "commit", "-m", "Initial commit", timeout=timeout)
     branch = run("git", "-C", str(target), "branch", "--show-current", capture=True, timeout=timeout).stdout.strip()
     sha = run("git", "-C", str(target), "rev-parse", "HEAD", capture=True, timeout=timeout).stdout.strip()
@@ -92,13 +92,13 @@ def create(path: Path, github: str | None = None, visibility: str | None = None,
 
     if github:
         started = time.monotonic()
-        relay_console.update("repository publish", started=started, timeout=timeout)
+        relay_console.emit("START", operation="publish", deadline=f"{timeout}s")
         run("gh", "auth", "status", timeout=timeout)
         run("gh", "repo", "create", github, f"--{visibility}", "--source", str(target), "--remote", "origin", "--push", timeout=timeout)
         relay_console.emit("DONE", operation="publish", elapsed=f"{time.monotonic() - started:.1f}s")
     elif azure_devops:
         started = time.monotonic()
-        relay_console.update("repository publish", started=started, timeout=timeout)
+        relay_console.emit("START", operation="publish", deadline=f"{timeout}s")
         organization, project, repository = azure_devops
         created = run("az", "repos", "create", "--name", repository, "--organization", f"https://dev.azure.com/{organization}", "--project", project, "--output", "json", capture=True, timeout=timeout)
         data = json.loads(created.stdout)
@@ -136,18 +136,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.azure_devops and (not re.fullmatch(r"[^/\s]+", args.azure_devops[0]) or any(not value.strip() for value in args.azure_devops[1:])):
         parser().error("invalid Azure DevOps organization, project, or repository")
     try:
-        try:
-            path, branch, sha = create(args.path, args.github, args.visibility, args.provider_timeout, tuple(args.azure_devops) if args.azure_devops else None)
-        except (ValueError, OSError, json.JSONDecodeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-            reason = f"command exited with code {error.returncode}" if isinstance(error, subprocess.CalledProcessError) else "operation timed out" if isinstance(error, subprocess.TimeoutExpired) else str(error).splitlines()[0]
-            relay_console.emit("FAILED", operation="repository", reason=reason)
-            return 1
-        print(f"Path:   {path}")
-        print(f"Branch: {branch}")
-        print(f"SHA:    {sha}")
-        return 0
-    finally:
-        relay_console.close()
+        path, branch, sha = create(args.path, args.github, args.visibility, args.provider_timeout, tuple(args.azure_devops) if args.azure_devops else None)
+    except (ValueError, OSError, json.JSONDecodeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        reason = f"command exited with code {error.returncode}" if isinstance(error, subprocess.CalledProcessError) else "operation timed out" if isinstance(error, subprocess.TimeoutExpired) else str(error).splitlines()[0]
+        relay_console.emit("FAILED", operation="repository", reason=reason)
+        return 1
+    print(f"Path:   {path}")
+    print(f"Branch: {branch}")
+    print(f"SHA:    {sha}")
+    return 0
 
 
 if __name__ == "__main__":

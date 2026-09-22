@@ -562,7 +562,7 @@ def start_operation(store: StateStore, assignment_id: str, operation: str, timeo
             if operation == "provider-checks" and assignment_id != "AGENTS":
                 target["phase"] = "provider-checks"
     store.update(change)
-    relay_console.update(runtime_progress(store.state, load_bugs(store)))
+    relay_console.emit("WAIT", runtime_progress(store.state, load_bugs(store)))
 
 
 def clear_operation(store: StateStore, assignment_id: str, operation: str | None = None) -> None:
@@ -572,7 +572,7 @@ def clear_operation(store: StateStore, assignment_id: str, operation: str | None
             for field in OPERATION_FIELDS:
                 target.pop(field, None)
     store.update(change)
-    relay_console.update(runtime_progress(store.state, load_bugs(store)))
+    relay_console.emit("WAIT", runtime_progress(store.state, load_bugs(store)))
 
 
 @contextlib.contextmanager
@@ -1188,7 +1188,7 @@ def run_validations(store: StateStore, assignment: dict, worktree: Path, categor
             if assignment_id == "BASELINE":
                 target.update(phase="running", commandsStarted=count, currentCommand=command, startedAt=target.get("startedAt") or datetime.now(timezone.utc).isoformat(), deadline=target["operationDeadline"])
         store.update(consume)
-        relay_console.update(runtime_progress(store.state, load_bugs(store)))
+        relay_console.emit("WAIT", runtime_progress(store.state, load_bugs(store)))
         relay_console.emit("START", f"operation=validate category={category} assignment={assignment_id} command={command_number}/{len(commands)} attempt={started['number']} deadline={store.state['validationTimeoutSeconds']}s")
         shell = validation_command(command)
         middle = "" if category == "task" else f"-{category}"
@@ -1883,7 +1883,7 @@ def wait_for_checks(store: StateStore, assignment_id: str, pr: dict, reviewed_sh
             if target is not None:
                 target.update(providerStatus=status, providerPolicyCounts=counts or {}, nextAction=next_action)
         store.update(change)
-        relay_console.update(runtime_progress(store.state, load_bugs(store)))
+        relay_console.emit("WAIT", runtime_progress(store.state, load_bugs(store)))
 
     first = True
     while first or time.time() < deadline:
@@ -3297,7 +3297,6 @@ def main(argv: list[str] | None = None) -> int:
             return permanent_cleanup(repo, args.confirm)
         except (RuntimeError, ValueError, OSError, json.JSONDecodeError) as error:
             relay_console.emit("FAILED", operation="cleanup", reason=str(error).splitlines()[0])
-            relay_console.close()
             return 1
     stdin_text = sys.stdin.read() if not sys.stdin.isatty() else ""
     relay_state = repo / ".relay" / "state.json"
@@ -3341,7 +3340,6 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError("recovery requires an existing campaign")
         if args.recover and not args.confirm:
             print_recovery(plan_recovery(store, load_tasks(store), args.defer_blocker, args.grant_attempt))
-            relay_console.close()
             return 0
         relay_console.emit("START", f"operation=campaign campaign={store.state['campaignId']} workers={store.state['workerLimit']} tasks={store.state.get('taskTotal', len(tasks or []))}")
         with coordinator_lock(store.path.parent):
@@ -3353,7 +3351,6 @@ def main(argv: list[str] | None = None) -> int:
                 print_recovery(actions)
                 apply_recovery(store, tasks, actions)
                 relay_console.emit("NEXT", f"Resume with: {_shell_join([sys.executable, str(Path(__file__).resolve()), '--repo', str(repo)])}")
-                relay_console.close()
                 return 0
             stop = threading.Event()
             heartbeat = threading.Thread(target=heartbeat_loop, args=(store, stop), daemon=True)
@@ -3378,13 +3375,11 @@ def main(argv: list[str] | None = None) -> int:
             finally:
                 stop.set()
                 heartbeat.join()
-                relay_console.close()
     except Exception as error:
         if not (args.recover and not args.confirm) and "store" in locals() and isinstance(store, StateStore):
             with contextlib.suppress(Exception):
                 store.update(lambda state: state.update(phase="blocked", error=str(error), blockedEvidence={"type": type(error).__name__, "message": str(error)}))
         relay_console.emit("FAILED", operation="campaign", reason=str(error).splitlines()[0])
-        relay_console.close()
         return 1
 
 

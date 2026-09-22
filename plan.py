@@ -259,7 +259,7 @@ class CallBudget:
             return self.started
 
 
-def invoke_agent(repo: Path, prompt: str, schema: dict, timeout: int, budget: CallBudget | None, wait_detail: str | None = None, started: float | None = None) -> object:
+def invoke_agent(repo: Path, prompt: str, schema: dict, timeout: int, budget: CallBudget | None) -> object:
     if budget is not None:
         budget.consume()
     with tempfile.TemporaryDirectory(prefix="relay-plan-") as temporary:
@@ -272,8 +272,6 @@ def invoke_agent(repo: Path, prompt: str, schema: dict, timeout: int, budget: Ca
             "--ephemeral", "--sandbox", "read-only", "--cd", str(repo),
             "--output-schema", str(schema_path), "--output-last-message", str(result_path), "-",
         ]
-        if wait_detail:
-            relay_console.update(wait_detail, started=started, timeout=timeout)
         completed = subprocess.run(invocation, input=prompt, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout)
         if completed.returncode:
             raise RuntimeError(f"agent failed with exit code {completed.returncode}")
@@ -295,7 +293,7 @@ def invoke_validated(repo: Path, prompt: str, schema: dict, validator, timeout: 
         started = time.monotonic()
         progress("START", detail)
         try:
-            result = validator(invoke_agent(repo, prompt, schema, timeout, None, detail, started))
+            result = validator(invoke_agent(repo, prompt, schema, timeout, None))
             progress("DONE", f"{detail} elapsed={time.monotonic() - started:.1f}s")
             return result
         except (ValueError, json.JSONDecodeError, RuntimeError, OSError, subprocess.TimeoutExpired) as caught:
@@ -466,12 +464,10 @@ def main(argv: list[str] | None = None) -> int:
             with tempfile.TemporaryDirectory(prefix="relay-scouts-") as temporary, ThreadPoolExecutor(max_workers=args.workers) as pool:
                 futures = []
                 for slot, scope in enumerate(scopes, 1):
-                    relay_console.update(f"scout {slot}/{len(scopes)} | scope={scope} | calls={budget.started}/{budget.limit}")
                     snapshot = create_scout_snapshot(repo, files, scope, Path(temporary) / f"scope-{slot}")
                     prompt = scout_prompt(scope, requirements, instructions)
                     futures.append(pool.submit(invoke_validated, snapshot, prompt, scout_schema(scope), lambda value, expected=scope: validate_scout(value, expected), args.agent_timeout, budget, args.format_retries, f"role=scout slot={slot}"))
                 evidence = [future.result() for future in futures]
-        relay_console.update(f"planning-pm synthesize | calls={budget.started}/{budget.limit}")
         planned = invoke_validated(
             repo, planning_prompt(requirements, instructions, files, base, evidence), planning_schema(),
             validate_plan, args.agent_timeout, budget, args.format_retries, "role=planning-pm",
@@ -497,8 +493,6 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, RuntimeError, OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         progress("FAILED", f"operation=plan reason={str(error).splitlines()[0]}")
         return 1
-    finally:
-        relay_console.close()
 
 
 if __name__ == "__main__":
