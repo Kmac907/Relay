@@ -127,20 +127,21 @@ python -m unittest -v test_workflow.py
 ```mermaid
 flowchart TD
     R[Requirements and repository] --> P[Read-only scouting and bounded plan]
-    P --> PR[Contract and risk review<br/>optional repair verification]
+    P --> PR[One plan review<br/>optional repair verification]
     PR --> B[Validate planned base]
     B -->|pass| G[Optional AGENTS.md bootstrap PR]
     B -->|blocked| NU[needs-user]
     G --> W[Dependency-aware parallel Workers]
     W --> V[Focused then campaign validation]
-    V --> RV[Independent review and triage]
-    RV -->|repair budget| RP[Repair and focused verification]
-    RP --> V
-    RV --> PC[Provider checks and approvals]
+    V --> RV[One slice review]
+    RV -->|repair budget| RP[Repair, both validations,<br/>exact verification]
+    RP --> PUB[Publish PR]
+    RV -->|approved| PUB
+    PUB --> PC[Provider checks and approvals]
     PC -->|pending| WP[waiting-provider]
     PC -->|pass| M[Merge]
     M --> A[One finite audit]
-    A -->|accepted P0/P1| BF[Bounded bug fixes<br/>validate, review, check, merge]
+    A -->|repair P0/P1| BF[Bounded bug fixes<br/>validate, exact verify, check, merge]
     BF --> BL
     A -->|no active bugs| BL[Publish BACKLOG.md]
     BL --> C[complete]
@@ -158,7 +159,7 @@ flowchart TD
 
 ### Planning
 
-`plan.py` reads the requirements, tracked tree, base SHA, and target instructions. For nontrivial repositories it runs fixed read-only scout scopes concurrently, then a read-only Planning PM creates the fewest independently usable vertical slices, normally three to five. A slice owns the production entrypoint, direct collaborators, contracts, and tests needed by its acceptance criteria; dependencies describe runtime prerequisites rather than implementation history. Layer-only plans are rejected. A contract review checks each criterion through the real production composition; a risk review checks feasibility, regression risk, security, data loss, exact commands, platforms, and paths. Tests may fake external processes, networks, clocks, and providers, but not the internal component being integrated. Relay validates every structured result before changing state. Blocking findings get one planning repair and a verification review; unresolved findings fail without writing `PLAN.md`, and a clean draft skips both.
+`plan.py` reads the requirements, tracked tree, base SHA, and target instructions. For nontrivial repositories it runs fixed read-only scout scopes concurrently, then a read-only Planning PM creates the fewest independently usable vertical slices, normally three to five. A slice owns the production entrypoint, direct collaborators, contracts, and tests needed by its acceptance criteria; dependencies describe runtime prerequisites rather than implementation history. Layer-only plans are rejected. One plan reviewer checks coverage, feasibility, regressions, security, exact commands, platforms, and paths by tracing each criterion through the real production composition. Tests may fake external processes, networks, clocks, and providers, but not the internal component being integrated. Relay validates every structured result before changing state. Blocking findings get one planning repair and an exact verification; no second full review runs. Unresolved findings fail without writing `PLAN.md`, and a clean draft skips both repair calls. The planning budget is scouts plus four calls plus the format-retry allowance.
 
 Successful planning creates `PLAN.md`, then `AGENTS.md` only if it is still missing; all other entries are preserved. `PLAN.md` fixes each task's dependencies, allowed paths, acceptance criteria, focused commands, attempt limit, shared fix-loop limit, and mandatory campaign commands. Relay-owned backlogs are parsed structurally and require exactly one task per `<origin-campaign>/<BUG-NNNN>` source reference, a declared test path, and a runnable regression command. Ordinary prose requirements and existing schema-v2 plans remain compatible. Planner `START`, `WAIT`, `DONE`, `RETRY`, and `FAILED` events go to stderr, raw agent output remains separate, stdout contains the generated path, and stderr ends with deterministic `SUMMARY` and executable `NEXT` lines.
 
@@ -172,17 +173,19 @@ Relay honors existing tracked or untracked `AGENTS.md`. Its generic template lim
 
 `run.py` initializes the active ledgers and state and excludes coordinator runtime files from Git. Ready tasks run concurrently only after dependencies complete and only when their literal or glob scopes cannot overlap. Literal files match only themselves, literal directories include descendants, `*`, `?`, and character classes stay within one segment, and `**` spans complete segments, including zero segments. The same normalized policy validates candidates, repairs, recovery, audits, deleted files, and backlog tests. Each Worker is the sole write-capable role in its isolated branch and worktree. It traces the real entrypoint and direct callers/callees, builds the complete slice, exercises production composition, runs focused tests, and returns one clean commit. Relay checks ancestry, reported SHA, and changed paths; backlog candidates must change a declared test path. It then runs focused validation, including the mandatory regression command, followed by campaign validation. After ordinary attempts are exhausted, or the same stable failure repeats twice, Relay automatically repairs a clean candidate within the remaining shared fix-loop budget. A timed-out command first replays once on the unchanged candidate.
 
-Relay pushes a validated candidate, creates or recovers one PR, and refreshes its canonical campaign-qualified title and multiline body after every repaired push. The body records the source reference, current SHA, paths, criteria, focused/regression commands, and campaign validation. Two independent read-only reviews and one triage decision follow. Accepted blockers enter bounded Worker repair and focused verification. Normal implementation scope is the slice; maximum repair scope adds only paths owned by completed transitive dependencies. Relay persists the exact granted repair paths before reserving the Worker and uses those same paths in its prompt and candidate validation. Paths owned by incomplete, parallel, or unrelated slices are never granted automatically. The reviewed SHA must remain unchanged and provider checks and approvals must pass before merge. Squash/merge messages carry Relay campaign, assignment, optional source, and candidate trailers; GitHub rebase keeps the updated PR as the durable authority. Completed worktrees and local branches are removed.
+One read-only slice reviewer sees the fully validated candidate and complete ownership graph. It dispositions each finding as `repair`, `backlog`, `discard`, or `needs-user`, with a reason and exact repair paths. Repair is limited to candidate-introduced P0/P1 findings; P2 and supported pre-existing findings become backlog, P3 and unsupported findings are retained only in review state, and `needs-user` requires a concrete human decision. Accepted bugs are written before repair. Normal implementation scope is the slice; maximum repair scope adds only paths owned by completed transitive dependencies. Relay persists the exact granted repair paths before reserving the Worker and uses those same paths in its prompt and candidate validation. Paths owned by incomplete, parallel, or unrelated slices are never granted automatically.
+
+Relay creates or updates the PR only after the slice is approved. A repair reruns focused and campaign validation, then an exact verifier checks only the accepted findings and repair diff; it cannot reopen full review. Existing migrated campaigns keep their already-created PR. Provider-check repairs use the same fix and review budgets and receive the same exact verification. The pushed and provider-reported head must equal the final reviewed SHA before merge. The review-call limit is one initial slice review, two calls per possible repair, plus the format-retry allowance. Squash/merge messages carry Relay campaign, assignment, optional source, and candidate trailers; GitHub rebase keeps the updated PR as the durable authority. Completed worktrees and local branches are removed.
 
 ### Audit and backlog
 
-After planned tasks merge, Relay fast-forwards local `main` and plans exactly one audit. Read-only Audit Workers inspect finite scopes with explicit commands, and triage classifies their reproduction evidence once. Accepted P0/P1 findings become bounded bug assignments validated by their originating scope commands; P2 findings may be deferred. Fixes never plan another audit. Relay atomically publishes deferred bugs to `BACKLOG.md`, never deletes an existing backlog merely because the new campaign found none, then reaches `complete` when no active bugs remain. Provider checks may produce `waiting-provider`; blockers needing judgment produce `needs-user`.
+After planned tasks merge, Relay fast-forwards local `main` and plans exactly one audit. Read-only Audit Workers inspect finite scopes with explicit commands and return their own validated dispositions and repair paths; there is no audit triage call. P0/P1 repairs stay inside the finite audit scope, P2 becomes backlog, P3 is discarded, and real decisions or paths outside the scope stop in `needs-user`. An audit bug Worker runs audit-scope and campaign validation, then an exact finding verifier; no full slice review or recursive audit follows. The audit budget is one planner, one call per scope, plus the format-retry allowance. Relay atomically publishes deferred bugs to `BACKLOG.md`, never deletes an existing backlog merely because the new campaign found none, then reaches `complete` when no active bugs remain.
 
 ### Recovery
 
 Recovery resumes only a phase safe for the recorded base, worktree, SHA, provider operation, or validation result. Clean committed candidates survive coordinator exceptions, interrupted validation, path-policy failures, ledger/review persistence interruptions, and publication interruption; Relay resumes validation, review, journal replay, or publication at the recorded SHA instead of launching a replacement Worker. One validation timeout replay keeps the same timeout identity, and the same coordinator failure identity stops as `blocked` after its second occurrence.
 
-The forward-only `scope-resolution` phase can move a `needs-user` review into the next numbered repair without returning to initial review or triage. For a schema-2 review such as `TASK-0007`, `--recover` validates saved structured reviewer results (never raw logs), deterministically retains candidate-introduced P0/P1 findings for repair, backlogs P2 or supported pre-existing findings, discards P3, preserves distinct finding IDs, and offers only the slice plus completed transitive dependencies. Preview does not mutate state. `--recover --confirm` journals the bug ledger and recovery state, preserves the campaign, candidate, worktree, counters, validation evidence, and existing PR, then exits; the next normal run performs the repair.
+New campaigns use state schema 3 and the forward-only phases `slice-review`, `scope-resolution`, `repair-N`, `verify-N`, `approved`, and `needs-user`; a session never returns to full review or triage. When `--recover` sees schema 2, it validates ledger ownership plus saved worktree, candidate, and PR heads before offering migration. Saved structured reviewer results—not raw logs—become one persisted review result with deterministic dispositions. Approved/integrated work maps directly, legacy numbered repair/verify phases retain their number, and out-of-scope findings enter `scope-resolution`. Preview does not mutate state. `--recover --confirm` journals the migration and bug-ledger changes, preserves counters, validation/audit evidence, PRs, branches, worktrees, provider deadlines, and SHAs, then exits without launching an agent. The next normal run resumes schema 3. A `TASK-0007`-shaped review uses the slice plus completed transitive dependencies and enters `repair-1` without spending the repair until its Worker is reserved.
 
 Relay refuses active campaigns and drifted paths, worktrees, SHAs, ledgers, or provider state; an out-of-scope deletion is adoptable only when the target contains the same user-owned deletion. Confirmed recovery validates current state, journals its action, and exits; it never silently grants attempts, restarts planning, or launches Workers. `needs-user` means credentials/authorization, conflicting requirements, destructive ambiguity, unrelated-scope authorization, or an explicit budget decision. `waiting-provider` means checks or approvals are still pending. `blocked` means repeated coordinator/infrastructure failure, corrupt or unsupported state, deterministic recovery failure, or a non-authentication provider failure with no safe retry; it returns exit code 1 and does not print a pretend recovery command.
 
@@ -214,10 +217,11 @@ Relay refuses active campaigns and drifted paths, worktrees, SHAs, ledgers, or p
 | --- | --- | --- |
 | Scout | Inspect a planning scope. | Read-only |
 | Planning PM | Produce bounded tasks and campaign commands. | Read-only |
-| Contract, risk, and verification reviewers | Check requirements and acceptance criteria; assess correctness, regressions, security, data loss, tests, and feasibility; verify only an accepted repair delta. | Read-only |
-| Triage PM | Classify findings as blocker, backlog, discard, or needs-user. | Read-only |
+| Plan reviewer | Review the complete plan once; trace criteria through production composition. | Read-only |
+| Slice reviewer | Review one validated slice once and disposition every finding with exact repair paths. | Read-only |
+| Verification reviewer | Verify only accepted findings against an exact repair diff. | Read-only |
 | Worker | Implement one assigned task, bug, or repair and commit it. | Assigned worktree only |
-| Audit planner and workers | Define one finite audit and inspect one explicit scope with evidence. | Read-only |
+| Audit planner and workers | Define one finite audit; inspect and disposition findings inside one explicit scope. | Read-only |
 
 ## Operational guarantees
 
@@ -248,7 +252,7 @@ Copy the exact printed `NEXT` command after inspecting its cited evidence; it in
 | --- | --- |
 | Baseline failure | Fix the recorded external condition and use the printed replay. No Worker attempt was consumed. |
 | Candidate validation failure | Relay spends ordinary attempts first, then remaining shared repairs; a timeout replays the preserved SHA once before repair. After exhaustion, inspect the exact command and log and use only a printed recovery or grant action. |
-| Schema-2 review scope | Preview `--recover`; if saved structured findings, candidate, worktree, PR head, and ledger ownership are intact, confirm once and resume normally. Raw reviewer logs are not used. |
+| Schema-2 campaign | Preview `--recover`; if saved structured findings, candidate, worktree, PR head, and ledger ownership are intact, confirm migration once, then run the printed normal resume command. Raw reviewer logs are not used. |
 | Blocked coordinator/infrastructure | Inspect the persisted evidence. Relay prints no automatic recovery command unless it can prove one is executable and safe. |
 | Provider wait | Use `status.py`, satisfy the external check or approval, then run the printed resume command. |
 | Provider publication failure | Restore access, preview the printed publication recovery, confirm it, then follow `NEXT`. |
@@ -261,7 +265,7 @@ Validation failures record the command, category, outcome, affected assignments,
 
 Schema-v2 campaigns without campaign validation are readable but cannot execute. Migration runs each shared validation command once at the historical base and offers archive-and-handoff only for a confirmed baseline defect. Confirmation creates immutable `relay/archive/<campaign>/<task>` refs, verifies a byte-stable archive and managed `HANDOFF.md`, then removes old worktrees and active ledgers. Relay validates markers, hashes, ancestry, and refs, preserves seed metadata, promotes the shared full-build command, and requires seeded Workers to reapply archived diffs onto a newly planned base.
 
-When `--repo` points to a repository subdirectory, Relay preserves that prefix in bootstrap and Worker worktrees and rejects changes outside it. Campaign state versions are strict; unsupported state requires a newly reviewed plan rather than heuristic recovery.
+When `--repo` points to a repository subdirectory, Relay preserves that prefix in bootstrap and Worker worktrees and rejects changes outside it. Schema 2 has the explicit migration above; any other unsupported state is rejected rather than guessed.
 
 Cleanup is permanent and allowed only for a complete, inactive campaign with no worktrees or open Relay PRs. Every integrated task and audit bug must also have matching proof of its final candidate, source reference, PR metadata hash, and merged provider record. Cleanup removes `tasks.md`, `bugs.md`, Relay-format root plan files, and `.relay`; it preserves `.relay-archive/`, `BACKLOG.md`, human-authored plans, `AGENTS.md`, source, and Git history. Paths are resolved and validated before removal.
 

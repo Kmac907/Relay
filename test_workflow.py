@@ -236,27 +236,27 @@ class ContractTests(unittest.TestCase):
             run.parse_tasks(plan.render_tasks([escaped], "0123456", "abc123"))
 
     def test_backward_review_transitions_rejected(self):
-        forbidden = [("verify-1", "initial-review"), ("verify-1", "triage"), ("repair-1", "initial-review"), ("approved", "initial-review"), ("needs-user", "repair-2")]
+        forbidden = [("verify-1", "slice-review"), ("repair-1", "slice-review"), ("approved", "slice-review"), ("needs-user", "repair-2")]
         for source, target in forbidden:
             with self.subTest(source=source, target=target), self.assertRaises(ValueError):
                 run.transition_review({"phase": source}, target, 2)
 
     def test_forward_review_transitions(self):
-        session = {"phase": "initial-review"}
-        for phase in ("triage", "repair-1", "verify-1", "repair-2", "verify-2", "approved"):
+        session = {"phase": "slice-review", "repairAttemptsStarted": 0}
+        for phase in ("repair-1", "verify-1", "repair-2", "verify-2", "approved"):
             run.transition_review(session, phase, 2)
         self.assertEqual(session["phase"], "approved")
 
     def test_scope_resolution_is_forward_only(self):
-        session = {"phase": "needs-user", "repairAttemptsStarted": 0}
+        session = {"phase": "slice-review", "repairAttemptsStarted": 0}
         run.transition_review(session, "scope-resolution", 2)
         run.transition_review(session, "repair-1", 2)
         with self.assertRaisesRegex(ValueError, "illegal review transition"):
-            run.transition_review(session, "initial-review", 2)
+            run.transition_review(session, "slice-review", 2)
 
     def test_vertical_slice_prompts_require_production_composition(self):
         planning = plan.planning_prompt("requirements", "instructions", ["app.py"], "abc", [])
-        review = plan.plan_review_prompt("contract-reviewer", "requirements", "instructions", [self.task()], "digest")
+        review = plan.plan_review_prompt("plan-reviewer", "requirements", "instructions", [self.task()], "digest")
         worker = run.worker_prompt("task", self.task())
         for phrase in ("vertical slices", "production composition", "real entrypoint", "internal component"):
             self.assertIn(phrase, planning)
@@ -266,7 +266,7 @@ class ContractTests(unittest.TestCase):
             self.assertIn(phrase, worker)
 
     def test_pre_review_repair_advances_the_shared_fix_sequence(self):
-        session = {"phase": "triage", "repairAttemptsStarted": 1}
+        session = {"phase": "slice-review", "repairAttemptsStarted": 1}
         with self.assertRaises(ValueError):
             run.transition_review(session, "repair-1", 2)
         run.transition_review(session, "repair-2", 2)
@@ -276,13 +276,27 @@ class ContractTests(unittest.TestCase):
         value = {"mode": "repair", "assignmentId": "TASK-0001", "status": "candidate", "candidateSha": "abc", "validation": [], "summary": ""}
         with self.assertRaises(ValueError):
             run.validate_agent_result("worker", value, "TASK-0001", "task")
+
+    def test_slice_reviewer_dispositions_are_strict_and_unique(self):
+        finding = {"id": "one", "severity": "P1", "location": "src/app.py:1", "failure": "fails", "reproduction": "run test", "requirement": "works", "evidence": "exit 1", "candidateIntroduced": True, "action": "repair", "reason": "release blocker", "repairPaths": ["src/app.py"]}
+        value = {"assignmentId": "TASK-0001", "candidateSha": "abc", "findings": [finding]}
+        self.assertIs(run.validate_agent_result("slice-reviewer", value, "TASK-0001"), value)
+        for changed, message in (
+            (finding | {"repairPaths": ["../escape.py"]}, "disposition"),
+            (finding | {"severity": "P2"}, "repair requires"),
+            (finding | {"action": "backlog", "severity": "P1", "repairPaths": []}, "backlog requires"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                run.validate_agent_result("slice-reviewer", value | {"findings": [changed]}, "TASK-0001")
+        with self.assertRaisesRegex(ValueError, "duplicate finding ID"):
+            run.validate_agent_result("slice-reviewer", value | {"findings": [finding, finding]}, "TASK-0001")
         value["mode"], value["status"] = "task", "completed"
         with self.assertRaises(ValueError):
             run.validate_agent_result("worker", value, "TASK-0001", "task")
 
     def test_review_budget_formula(self):
-        self.assertEqual(run.review_call_limit(2, 2), 9)
-        self.assertNotIn("repair-1", run.legal_review_targets("triage", 0))
+        self.assertEqual(run.review_call_limit(2, 2), 7)
+        self.assertNotIn("repair-1", run.legal_review_targets("slice-review", 0))
 
     def test_positive_deadlines_cannot_be_disabled(self):
         with self.assertRaises(SystemExit):
@@ -453,18 +467,14 @@ class PlanningTests(unittest.TestCase):
             plan.invoke_validated(Path("."), "prompt", plan.planning_schema(True), lambda value: plan.validate_plan(value, [entry]), 10, budget, 1)
         self.assertEqual(budget.started, 2)
 
-    def test_plan_review_accepts_after_one_review_and_one_audit(self):
+    def test_plan_review_accepts_after_one_review(self):
         tasks = [ContractTests().task()]
         digest = plan.plan_digest(tasks)
-        results = [
-            {"assignmentId": "PLAN", "candidateSha": digest, "findings": []},
-            {"assignmentId": "PLAN", "candidateSha": digest, "findings": []},
-        ]
+        results = [{"assignmentId": "PLAN", "candidateSha": digest, "findings": []}]
         with patch("plan.invoke_validated", side_effect=results) as invoke:
             self.assertIs(plan.reviewed_plan(Path("."), "requirements", "instructions", [], "base", tasks, 10, plan.CallBudget(7), 2), tasks)
-        self.assertEqual(invoke.call_count, 2)
-        self.assertIn("Role: contract-reviewer", invoke.call_args_list[0].args[1])
-        self.assertIn("Role: risk-reviewer", invoke.call_args_list[1].args[1])
+        self.assertEqual(invoke.call_count, 1)
+        self.assertIn("Role: plan-reviewer", invoke.call_args_list[0].args[1])
 
     def test_plan_findings_get_one_repair_and_scoped_verification(self):
         tasks = [ContractTests().task()]
@@ -472,28 +482,26 @@ class PlanningTests(unittest.TestCase):
         finding = {"id": "plan-command", "severity": "P1", "location": "TASK-0001 Validation", "failure": "command is invalid", "reproduction": "bad command", "requirement": "validation must run", "evidence": "unsupported syntax", "candidateIntroduced": True}
         results = [
             {"assignmentId": "PLAN", "candidateSha": plan.plan_digest(tasks), "findings": [finding]},
-            {"assignmentId": "PLAN", "candidateSha": plan.plan_digest(tasks), "findings": []},
             revised,
             {"assignmentId": "PLAN", "candidateSha": plan.plan_digest(revised), "status": "resolved"},
         ]
         with patch("plan.invoke_validated", side_effect=results) as invoke:
             self.assertEqual(plan.reviewed_plan(Path("."), "requirements", "instructions", [], "base", tasks, 10, plan.CallBudget(7), 2), revised)
-        self.assertEqual(invoke.call_count, 4)
-        self.assertIn("Repair only the supplied findings", invoke.call_args_list[2].args[1])
-        self.assertIn("Verify only that every supplied finding", invoke.call_args_list[3].args[1])
+        self.assertEqual(invoke.call_count, 3)
+        self.assertIn("Repair only the supplied findings", invoke.call_args_list[1].args[1])
+        self.assertIn("Verify only that every supplied finding", invoke.call_args_list[2].args[1])
 
     def test_unresolved_plan_repair_stops_without_another_loop(self):
         tasks = [ContractTests().task()]
         finding = {"id": "plan-command", "severity": "P1", "location": "TASK-0001 Validation", "failure": "command is invalid", "reproduction": "bad command", "requirement": "validation must run", "evidence": "unsupported syntax", "candidateIntroduced": True}
         results = [
             {"assignmentId": "PLAN", "candidateSha": plan.plan_digest(tasks), "findings": [finding]},
-            {"assignmentId": "PLAN", "candidateSha": plan.plan_digest(tasks), "findings": []},
             tasks,
             {"assignmentId": "PLAN", "candidateSha": plan.plan_digest(tasks), "status": "unresolved"},
         ]
         with patch("plan.invoke_validated", side_effect=results) as invoke, self.assertRaisesRegex(RuntimeError, "verification unresolved"):
             plan.reviewed_plan(Path("."), "requirements", "instructions", [], "base", tasks, 10, plan.CallBudget(7), 2)
-        self.assertEqual(invoke.call_count, 4)
+        self.assertEqual(invoke.call_count, 3)
 
     def test_delayed_agent_keeps_wait_live_while_concurrent_agent_completes(self):
         result = {"scope": "src", "implemented": [], "missing": [], "conflicts": [], "relevantPaths": [], "validationCommands": [], "evidence": []}
@@ -714,7 +722,7 @@ class DeterministicCoreTests(unittest.TestCase):
 
             def agent(command, **kwargs):
                 output = Path(command[command.index("--output-last-message") + 1])
-                if "contract-reviewer" in output.name:
+                if "slice-reviewer" in output.name:
                     captured["reviewer"] = kwargs["env"]
                     result = {"assignmentId": assignment["id"], "candidateSha": "abc", "findings": []}
                 else:
@@ -732,7 +740,7 @@ class DeterministicCoreTests(unittest.TestCase):
                 with patch("run.bounded_run", side_effect=agent):
                     run.invoke_agent(store, threading.Semaphore(1), worktree, assignment["id"], "worker", "prompt", mode="task")
                     run.ensure_review_session(store, assignment["id"], "abc")
-                    run.invoke_agent(store, threading.Semaphore(1), worktree, assignment["id"], "contract-reviewer", "prompt", review=True)
+                    run.invoke_agent(store, threading.Semaphore(1), worktree, assignment["id"], "slice-reviewer", "prompt", review=True)
                 with patch("run.validation_command", return_value=["shell"]), patch("run.run_validation_command", side_effect=validation):
                     run.run_validations(store, assignment, worktree, commands=["test"])
                 other = run.assignment_environment(store, "TASK-0002", other_worktree)
@@ -1082,7 +1090,7 @@ class DeterministicCoreTests(unittest.TestCase):
                 self.assertNotEqual(repaired, candidate)
                 self.assertEqual(calls, ["task", "campaign"])
                 session = run.ensure_review_session(store, assignment_id, repaired)
-                self.assertEqual((session["phase"], session["initialCandidateSha"], session["repairAttemptsStarted"], session["reviewCallsStarted"]), ("initial-review", repaired, 1, 1))
+                self.assertEqual((session["phase"], session["initialCandidateSha"], session["repairAttemptsStarted"], session["reviewCallsStarted"]), ("slice-review", repaired, 1, 1))
 
     def test_validation_timeout_replays_once_before_worker_repair(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1543,20 +1551,21 @@ class DeterministicCoreTests(unittest.TestCase):
                 self.assertIn(f"reason=verification {verification_status}", output)
                 self.assertNotIn("reason=passed", output)
 
-    def test_triage_needs_user_records_review_error(self):
+    def test_slice_review_needs_user_records_review_error(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
             assignment = ContractTests().task()
-            store.state["taskStates"][assignment["id"]] = {"phase": "triage", "providerStatus": "passed"}
+            store.state["taskStates"][assignment["id"]] = {"phase": "slice-review", "providerStatus": "passed"}
             store.state["reviewSessions"][assignment["id"]] = {
-                "phase": "triage", "initialResults": {"contract-reviewer": {"findings": [{"id": "finding"}]}},
+                "phase": "slice-review", "reviewResult": None,
                 "acceptedBlockerIds": [], "repairAttemptsStarted": 0, "reviewCallsStarted": 0,
-                "reviewCallLimit": 9, "triageCompleted": False,
+                "reviewCallLimit": 7,
             }
-            triage = {"assignmentId": assignment["id"], "decisions": [{"findingId": "finding", "action": "needs-user", "reason": "operator decision"}]}
-            with patch("run.invoke_with_replacements", return_value=triage):
+            finding = {"id": "finding", "severity": "P1", "location": "src/file.py:1", "failure": "decision required", "reproduction": "run it", "requirement": "choose", "evidence": "conflict", "candidateIntroduced": True, "action": "needs-user", "reason": "operator decision", "repairPaths": []}
+            review = {"assignmentId": assignment["id"], "candidateSha": "candidate", "findings": [finding]}
+            with patch("run.invoke_with_replacements", return_value=review):
                 self.assertFalse(run.run_review(store, threading.Semaphore(1), assignment, Path(root), "candidate"))
-            self.assertEqual(store.state["taskStates"][assignment["id"]]["error"], "review requires user")
+            self.assertEqual(store.state["taskStates"][assignment["id"]]["error"], "review requires a human decision")
 
     def test_real_cumulative_candidate_and_one_file_repair_validate(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1871,6 +1880,68 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(store.state["pullRequests"][assignment["id"]]["number"], 8)
             self.assertEqual(run.load_bugs(store)[0]["sourceFindingId"], "saved-1")
 
+    def test_schema_two_migration_preview_is_read_only_and_confirmation_preserves_pr(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            finding = {"id": "legacy-one", "severity": "P1", "location": "src/app.py:1", "failure": "fails", "reproduction": "run test", "requirement": "works", "evidence": "exit 1", "candidateIntroduced": True}
+            store.state.update(schemaVersion=2, phase="needs-user")
+            store.state["taskStates"][assignment["id"]] = {"phase": "needs-user", "candidateSha": "candidate"}
+            store.state["reviewSessions"][assignment["id"]] = {
+                "phase": "needs-user", "initialCandidateSha": "candidate", "repairAttemptsStarted": 0,
+                "reviewCallsStarted": 3, "reviewCallLimit": 9,
+                "initialResults": {"contract-reviewer": {"assignmentId": assignment["id"], "candidateSha": "candidate", "findings": [finding]}},
+            }
+            record = {"path": str(root), "root": str(root), "branch": "relay/TASK-0001", "baseSha": "base"}
+            store.state["worktrees"][assignment["id"]] = record
+            store.state["pullRequests"][assignment["id"]] = {"number": 8, "headRefOid": "candidate", "state": "OPEN"}
+            store.save()
+            before = store.path.read_bytes()
+            def migration_git(_repo, *args, **_kwargs):
+                return subprocess.CompletedProcess([], 0, "candidate\n" if args[0] == "rev-parse" else "", "")
+            with patch("run.recovery_worktree", return_value=(root, record)), patch("run.git", side_effect=migration_git):
+                migration = run.plan_schema_two_migration(store, [assignment])
+                self.assertEqual(store.path.read_bytes(), before)
+                run.apply_schema_two_migration(store, [assignment], migration)
+            session = store.state["reviewSessions"][assignment["id"]]
+            self.assertEqual((store.state["schemaVersion"], session["phase"], session["repairAttemptsStarted"]), (3, "repair-1", 0))
+            self.assertEqual((store.state["pullRequests"][assignment["id"]]["number"], session["reviewCallsStarted"]), (8, 3))
+            self.assertEqual(run.load_bugs(store)[0]["sourceFindingId"], "legacy-one")
+
+    def test_bug_dispositions_persist_reasons_and_discard_stays_out_of_ledger(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            base = {"location": "src/app.py:1", "failure": "fails", "reproduction": "run", "requirement": "works", "evidence": "proof", "candidateIntroduced": True, "repairPaths": ["src/app.py"]}
+            findings = [
+                base | {"id": "repair", "severity": "P1", "action": "repair", "reason": "fix it"},
+                base | {"id": "later", "severity": "P2", "action": "backlog", "reason": "defer it"},
+                base | {"id": "choice", "severity": "P1", "action": "needs-user", "reason": "choose behavior"},
+                base | {"id": "noise", "severity": "P3", "action": "discard", "reason": "minor"},
+            ]
+            accepted = run.record_findings(store, "TASK-0001", findings)
+            bugs = run.load_bugs(store)
+            self.assertEqual(([bug["sourceFindingId"] for bug in bugs], [bug["id"] for bug in accepted]), (["repair", "later", "choice"], ["BUG-0001"]))
+            self.assertEqual(next(bug for bug in bugs if bug["sourceFindingId"] == "later")["deferralReason"], "defer it")
+            self.assertEqual(next(bug for bug in bugs if bug["sourceFindingId"] == "choice")["decisionReason"], "choose behavior")
+
+    def test_slice_review_precedes_first_publication(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            store.state["taskStates"][assignment["id"]] = {"phase": "slice-review", "mode": "task", "candidateSha": "abc", "pushed": False, "merged": False}
+            order = []
+            def review(*_args):
+                order.append("review")
+                store.state["reviewSessions"][assignment["id"]] = {"phase": "approved", "reviewedSha": "abc", "finalReviewedSha": "abc"}
+                return True
+            def publish(*_args):
+                order.append("publish")
+                return {"number": 1, "headRefOid": "abc"}
+            with patch("run.create_worktree", return_value=(Path(root), "branch")), patch("run.run_review", side_effect=review), patch("run.publish_candidate", side_effect=publish), patch("run.merge_assignment", return_value=False), patch("run.clear_operation"):
+                self.assertFalse(run.process_assignment(store, threading.Semaphore(1), assignment, "task"))
+            self.assertEqual(order, ["review", "publish"])
+
     def test_recovery_resumes_audit_bug_with_scope_commands_without_worker_attempt(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
@@ -2026,19 +2097,19 @@ class DeterministicCoreTests(unittest.TestCase):
             output = io.StringIO()
             with patch("sys.stdout", output):
                 self.assertEqual(status.main(["--repo", root]), 0)
-            self.assertIn("fixes=1/2 review-calls=2/9", output.getvalue())
+            self.assertIn("fixes=1/2 review-calls=2/7", output.getvalue())
 
     def test_runtime_progress_counts_running_and_queued_agents_once(self):
         state = {
             "workerLimit": 3, "taskTotal": 5,
             "taskStates": {"TASK-0001": {"phase": "ready"}, "BUG-0001": {"phase": "integrated"}},
             "activeProcesses": {
-                "one": {"assignmentId": "TASK-0001", "role": "contract-reviewer", "status": "running", "operationDeadline": 1},
-                "two": {"assignmentId": "TASK-0001", "role": "risk-reviewer", "status": "running", "operationDeadline": 1},
-                "three": {"assignmentId": "TASK-0003", "role": "triage-pm", "status": "running", "operationDeadline": 1},
+                "one": {"assignmentId": "TASK-0001", "role": "slice-reviewer", "status": "running", "operationDeadline": 1},
+                "two": {"assignmentId": "TASK-0001", "role": "verification-reviewer", "status": "running", "operationDeadline": 1},
+                "three": {"assignmentId": "TASK-0003", "role": "slice-reviewer", "status": "running", "operationDeadline": 1},
                 "four": {"assignmentId": "TASK-0003", "role": "verification-reviewer", "status": "queued", "operationDeadline": 1},
-                "five": {"assignmentId": "TASK-0001", "role": "contract-reviewer", "status": "queued", "operationDeadline": 1},
-                "six": {"assignmentId": "TASK-0003", "role": "risk-reviewer", "status": "queued", "operationDeadline": 1},
+                "five": {"assignmentId": "TASK-0001", "role": "slice-reviewer", "status": "queued", "operationDeadline": 1},
+                "six": {"assignmentId": "TASK-0003", "role": "verification-reviewer", "status": "queued", "operationDeadline": 1},
             },
         }
         line = run.runtime_progress(state, [])
@@ -2860,7 +2931,7 @@ class FakeEndToEndTests(unittest.TestCase):
             self.assertEqual(state["phase"], "complete")
             self.assertNotIn("tasks", state)
             self.assertNotIn("bugs", state)
-            self.assertTrue(state["auditPlanStarted"] and state["auditPlanCompleted"] and state["auditTriageCompleted"])
+            self.assertTrue(state["auditPlanStarted"] and state["auditPlanCompleted"] and state["auditDispositionsCompleted"])
             self.assertEqual(len(state["auditScopes"]), 1)
             self.assertTrue(next(iter(state["auditScopes"].values()))["completed"])
             self.assertLessEqual(state["auditCallsStarted"], state["auditCallLimit"])
@@ -2868,7 +2939,7 @@ class FakeEndToEndTests(unittest.TestCase):
             self.assertEqual(state["agentsBootstrap"]["phase"], "complete")
             self.assertNotIn("AGENTS", state["reviewSessions"])
             self.assertTrue(all(value["phase"] == "integrated" for value in state["taskStates"].values()))
-            self.assertTrue(all(session["initialReviewAssignmentsStarted"] == 2 and session["initialReviewAssignmentsCompleted"] == 2 and session["triageCompleted"] and session["reviewCallsStarted"] == 3 for session in state["reviewSessions"].values()))
+            self.assertTrue(all(session["reviewResult"] is not None and session["reviewCallsStarted"] == 1 for session in state["reviewSessions"].values()))
             spans = {task: {action: float(Path(f"{events}.{task}.{action}").read_text()) for action in ("start", "end")} for task in ("TASK-0001", "TASK-0002")}
             self.assertLess(max(spans[task]["start"] for task in spans), min(spans[task]["end"] for task in spans))
             self.assertEqual(len(list(provider.glob("*.json"))), 3)
@@ -2901,7 +2972,7 @@ class FakeEndToEndTests(unittest.TestCase):
             state = json.loads((target / ".relay" / "state.json").read_text(encoding="utf-8"))
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr + json.dumps(state, indent=2))
             self.assertEqual((state["phase"], state["taskStates"]["BUG-0001"]["mode"], state["taskStates"]["BUG-0001"]["phase"]), ("complete", "bug", "integrated"))
-            self.assertEqual(state["auditCallsStarted"], 3)
+            self.assertEqual(state["auditCallsStarted"], 2)
             self.assertEqual(run.parse_bugs((target / "bugs.md").read_text(encoding="utf-8"))[1][0]["status"], "resolved")
             self.assertEqual(len(list(provider.glob("*.json"))), 3)
 
@@ -3010,6 +3081,8 @@ elif prompt.startswith("Role: Planning Project Manager"):
     if os.environ.get("FAKE_TWO_TASKS"):
         tasks.append({"id": "TASK-0002", "title": "Add another file", "status": "ready", "priority": "P1", "dependencies": [], "allowedPaths": ["two.txt"], "acceptanceCriteria": ["File exists."], "validationCommands": ["python -c \"from pathlib import Path; assert Path('two.txt').is_file()\""]})
     result = {"campaignValidationCommands": ["python -c \"print('baseline')\""], "tasks": tasks}
+elif "Role: plan-reviewer" in prompt:
+    result = {"assignmentId": "PLAN", "candidateSha": candidate, "findings": []}
 elif "Role: Worker" in prompt:
     mode = re.search(r"Mode: (task|bug|repair)", prompt).group(1)
     allowed = json.loads(re.search(r"Allowed paths: (\[[^\n]+\])", prompt).group(1))
@@ -3031,27 +3104,18 @@ elif "Role: Worker" in prompt:
     if events and mode == "task":
         with open(f"{events}.{assignment}.end", "w", encoding="utf-8") as stream: stream.write(str(time.time()))
     result = {"mode": mode, "assignmentId": assignment, "status": "candidate", "candidateSha": sha, "validation": [], "summary": "done"}
-elif "Role: contract-reviewer" in prompt or "Role: risk-reviewer" in prompt:
-    role = "contract-reviewer" if "Role: contract-reviewer" in prompt else "risk-reviewer"
+elif "Role: slice-reviewer" in prompt:
     findings = []
     if os.environ.get("FAKE_ADVERSARIAL"):
-        findings = [{"id": role, "severity": "P1", "location": "file.txt:1", "failure": "always fails", "reproduction": "python -c \"raise SystemExit(1)\"", "requirement": "must pass", "evidence": "deterministic failure", "candidateIntroduced": True}]
+        findings = [{"id": "slice-review", "severity": "P1", "location": "file.txt:1", "failure": "always fails", "reproduction": "python -c \"raise SystemExit(1)\"", "requirement": "must pass", "evidence": "deterministic failure", "candidateIntroduced": True, "action": "repair", "reason": "reproduced", "repairPaths": ["file.txt"]}]
     result = {"assignmentId": assignment, "candidateSha": candidate, "findings": findings}
-elif "Role: triage-pm" in prompt:
-    if os.environ.get("FAKE_ADVERSARIAL") and assignment != "AUDIT":
-        decisions = [{"findingId": role, "action": "accept-blocker", "reason": "reproduced"} for role in ("contract-reviewer", "risk-reviewer")]
-    elif os.environ.get("FAKE_AUDIT_BUG") and assignment == "AUDIT":
-        decisions = [{"findingId": "audit-bug", "action": "accept-blocker", "reason": "reproduced"}]
-    else:
-        decisions = []
-    result = {"assignmentId": assignment, "decisions": decisions}
 elif "Role: verification-reviewer" in prompt:
     result = {"assignmentId": assignment, "candidateSha": candidate, "status": "unresolved" if os.environ.get("FAKE_ADVERSARIAL") else "resolved"}
 elif "Role: audit-planner" in prompt:
     paths = ["audit_fix.txt"] if os.environ.get("FAKE_AUDIT_BUG") else ["README.md"]
     result = {"scopes": [{"scopeId": "AUDIT-0001", "scope": "fixture", "requirements": ["fixture"], "paths": paths, "commands": ["python -c \"from pathlib import Path; assert Path('audit_fix.txt').is_file()\""] if os.environ.get("FAKE_AUDIT_BUG") else ["python -c \"print('audited')\""], "completionCondition": "scope inspected"}]} if os.environ.get("FAKE_AUDIT_SCOPE") else {"scopes": []}
 elif "Role: audit-worker" in prompt:
-    findings = [{"id": "audit-bug", "severity": "P1", "location": "audit_fix.txt:1", "failure": "audit fix is missing", "reproduction": "Observe that audit_fix.txt is absent.", "requirement": "audit fix exists", "evidence": "file absent", "candidateIntroduced": False}] if os.environ.get("FAKE_AUDIT_BUG") else []
+    findings = [{"id": "audit-bug", "severity": "P1", "location": "audit_fix.txt:1", "failure": "audit fix is missing", "reproduction": "Observe that audit_fix.txt is absent.", "requirement": "audit fix exists", "evidence": "file absent", "candidateIntroduced": True, "action": "repair", "reason": "reproduced", "repairPaths": ["audit_fix.txt"]}] if os.environ.get("FAKE_AUDIT_BUG") else []
     result = {"scopeId": assignment, "findings": findings}
 else:
     raise SystemExit("unknown prompt")

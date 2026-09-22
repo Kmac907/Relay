@@ -39,27 +39,29 @@ WORKER_MODES = {"task", "bug", "repair"}
 TERMINAL_REVIEW_PHASES = {"approved", "needs-user", "blocked"}
 CHILD_LOCK = threading.Lock()
 ACTIVE_CHILDREN: set[subprocess.Popen] = set()
-STATE_SCHEMA_VERSION = 2
+STATE_SCHEMA_VERSION = 3
 ORIGINAL_PYTHON_USER_SITE = site.getusersitepackages()
 
 AGENT_SCHEMAS = {
     "worker": {"mode": str, "assignmentId": str, "status": str, "candidateSha": str, "validation": list, "summary": str},
-    "contract-reviewer": {"assignmentId": str, "candidateSha": str, "findings": list},
-    "risk-reviewer": {"assignmentId": str, "candidateSha": str, "findings": list},
-    "triage-pm": {"assignmentId": str, "decisions": list},
+    "plan-reviewer": {"assignmentId": str, "candidateSha": str, "findings": list},
+    "slice-reviewer": {"assignmentId": str, "candidateSha": str, "findings": list},
     "verification-reviewer": {"assignmentId": str, "candidateSha": str, "status": str},
     "audit-planner": {"scopes": list},
     "audit-worker": {"scopeId": str, "findings": list},
 }
+LEGACY_AGENT_SCHEMAS = {
+    "contract-reviewer": {"assignmentId": str, "candidateSha": str, "findings": list},
+    "risk-reviewer": {"assignmentId": str, "candidateSha": str, "findings": list},
+}
 
 FINDING_FIELDS = {"id": str, "severity": str, "location": str, "failure": str, "reproduction": str, "requirement": str, "evidence": str, "candidateIntroduced": bool}
 ROLE_PROMPTS = {
-    "contract-reviewer": "Check only acceptance criteria, required behavior/tests, and candidate-introduced regressions. Finding severity must be exactly P0, P1, P2, or P3. Do not inspect unrelated code. Do not block on work explicitly owned by a later task.",
-    "risk-reviewer": "Independently check only candidate correctness, regression, security/data-loss, changed error paths, and missing candidate tests. Finding severity must be exactly P0, P1, P2, or P3. Do not block on work explicitly owned by a later task.",
-    "triage-pm": "Decide each supplied finding once: accept-blocker, backlog, discard, or needs-user. Unsupported, pre-existing, deferred, and out-of-scope findings cannot enter repair.",
+    "plan-reviewer": "Review the complete plan once. Trace every acceptance criterion through real production entrypoints and collaborators; reject layer-only decomposition, missing production or integration paths, internal-component fakes, and validation that cannot prove the composed slice works.",
+    "slice-reviewer": "Review the complete validated slice once against its acceptance criteria and ownership graph. Disposition every finding as repair, backlog, discard, or needs-user, with a reason and exact repairPaths. Do not inspect unrelated code or defer work that belongs to this slice.",
     "verification-reviewer": "Verify only the accepted blocker and exact repair delta. Return resolved, unresolved, or invalid-result; do not reopen full review.",
     "audit-planner": "Define one finite list of explicit audit scopes with nonempty executable validation commands. Every scopeId must be AUDIT-NNNN, starting at AUDIT-0001. Never request an unrestricted search or another audit.",
-    "audit-worker": "Inspect only the assigned finite scope, read-only, and return evidence-backed findings with severity exactly P0, P1, P2, or P3. Reproduction is human-readable evidence; Relay uses the audit scope commands for execution. Do not create more work.",
+    "audit-worker": "Inspect only the assigned finite scope, read-only, and disposition every evidence-backed finding as repair, backlog, discard, or needs-user with exact repairPaths. Reproduction is human-readable evidence; Relay uses the audit scope commands for execution. Do not create more work.",
 }
 
 
@@ -76,6 +78,10 @@ FINDING_JSON = _json_object({
     "failure": {"type": "string"}, "reproduction": {"type": "string"}, "requirement": {"type": "string"},
     "evidence": {"type": "string"}, "candidateIntroduced": {"type": "boolean"},
 })
+DISPOSITION_FINDING_JSON = _json_object(FINDING_JSON["properties"] | {
+    "action": {"type": "string", "enum": ["repair", "backlog", "discard", "needs-user"]},
+    "reason": {"type": "string"}, "repairPaths": _string_array(),
+})
 ROLE_JSON_SCHEMAS = {
     "worker": _json_object({
         "mode": {"type": "string", "enum": ["task", "bug", "repair"]}, "assignmentId": {"type": "string"}, "status": {"type": "string", "enum": ["candidate"]},
@@ -83,12 +89,11 @@ ROLE_JSON_SCHEMAS = {
         "validation": {"type": "array", "items": _json_object({"command": {"type": "string"}, "exitCode": {"type": "integer"}})},
         "summary": {"type": "string"},
     }),
-    "contract-reviewer": _json_object({"assignmentId": {"type": "string"}, "candidateSha": {"type": "string"}, "findings": {"type": "array", "items": FINDING_JSON}}),
-    "risk-reviewer": _json_object({"assignmentId": {"type": "string"}, "candidateSha": {"type": "string"}, "findings": {"type": "array", "items": FINDING_JSON}}),
-    "triage-pm": _json_object({"assignmentId": {"type": "string"}, "decisions": {"type": "array", "items": _json_object({"findingId": {"type": "string"}, "action": {"type": "string"}, "reason": {"type": "string"}})}}),
+    "plan-reviewer": _json_object({"assignmentId": {"type": "string"}, "candidateSha": {"type": "string"}, "findings": {"type": "array", "items": FINDING_JSON}}),
+    "slice-reviewer": _json_object({"assignmentId": {"type": "string"}, "candidateSha": {"type": "string"}, "findings": {"type": "array", "items": DISPOSITION_FINDING_JSON}}),
     "verification-reviewer": _json_object({"assignmentId": {"type": "string"}, "candidateSha": {"type": "string"}, "status": {"type": "string"}}),
     "audit-planner": _json_object({"scopes": {"type": "array", "items": _json_object({"scopeId": {"type": "string", "pattern": "^AUDIT-\\d{4}$"}, "scope": {"type": "string"}, "requirements": _string_array(), "paths": _string_array(), "commands": _string_array(), "completionCondition": {"type": "string"}})}}),
-    "audit-worker": _json_object({"scopeId": {"type": "string"}, "findings": {"type": "array", "items": FINDING_JSON}}),
+    "audit-worker": _json_object({"scopeId": {"type": "string"}, "findings": {"type": "array", "items": DISPOSITION_FINDING_JSON}}),
 }
 
 
@@ -161,7 +166,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--plan", type=Path, help="plan path (default for new campaigns: <repo>/PLAN.md)")
     result.add_argument("--dry-run", action="store_true")
     result.add_argument("--cleanup", action="store_true")
-    result.add_argument("--recover", action="store_true", help="preview or apply recovery of a needs-user campaign")
+    result.add_argument("--recover", action="store_true", help="preview or apply needs-user recovery or schema-2 migration")
     result.add_argument("--defer-blocker", action="append", default=[], metavar="BUG-NNNN")
     result.add_argument("--grant-attempt", action="append", default=[], metavar="TASK-NNNN")
     result.add_argument("--confirm", action="store_true")
@@ -316,7 +321,7 @@ def parse_tasks(text: str, runtime: bool = False) -> tuple[dict, list[dict]]:
 
 
 def validate_agent_result(role: str, value: object, assignment_id: str | None = None, mode: str | None = None) -> dict:
-    schema = AGENT_SCHEMAS[role]
+    schema = AGENT_SCHEMAS.get(role) or LEGACY_AGENT_SCHEMAS[role]
     if not isinstance(value, dict):
         raise ValueError("agent result must be an object")
     for key, kind in schema.items():
@@ -327,32 +332,44 @@ def validate_agent_result(role: str, value: object, assignment_id: str | None = 
         raise ValueError("agent changed assignment ID")
     if role == "worker" and (mode not in WORKER_MODES or value["mode"] != mode or value["status"] != "candidate"):
         raise ValueError("agent changed Worker mode or candidate status")
-    if role in {"contract-reviewer", "risk-reviewer", "audit-worker"}:
+    if role in {"plan-reviewer", "slice-reviewer", "contract-reviewer", "risk-reviewer", "audit-worker"}:
+        ids = []
         for finding in value["findings"]:
             if not isinstance(finding, dict) or any(not isinstance(finding.get(key), kind) for key, kind in FINDING_FIELDS.items()):
                 raise ValueError("invalid evidence-backed finding")
-            if finding["severity"] not in {"P0", "P1", "P2", "P3"}:
+            if finding["severity"] not in {"P0", "P1", "P2", "P3"} or any(not finding[key].strip() for key in ("id", "location", "failure", "reproduction", "requirement", "evidence")):
                 raise ValueError("invalid finding severity")
-    if role == "triage-pm" and any(not isinstance(item, dict) or set(("findingId", "action", "reason")) - item.keys() or item.get("action") not in {"accept-blocker", "backlog", "discard", "needs-user"} for item in value["decisions"]):
-        raise ValueError("invalid triage decision")
+            ids.append(finding["id"])
+            if role in {"slice-reviewer", "audit-worker"}:
+                if not isinstance(finding.get("action"), str) or not isinstance(finding.get("reason"), str) or not finding["reason"].strip() or not isinstance(finding.get("repairPaths"), list) or any(not isinstance(path, str) or not valid_relative_path(path) for path in finding["repairPaths"]):
+                    raise ValueError("invalid finding disposition")
+                action = finding["action"]
+                if action == "repair" and (finding["severity"] not in {"P0", "P1"} or not finding["candidateIntroduced"] or not finding["repairPaths"]):
+                    raise ValueError("repair requires a candidate-introduced P0/P1 finding and repair paths")
+                if action != "repair" and finding["repairPaths"]:
+                    raise ValueError("only repair findings may contain repair paths")
+                if action == "backlog" and finding["severity"] != "P2" and finding["candidateIntroduced"]:
+                    raise ValueError("backlog requires P2 or pre-existing evidence")
+                if action == "discard" and finding["severity"] != "P3" and "unsupported" not in finding["reason"].lower():
+                    raise ValueError("discard requires P3 or unsupported evidence")
+                if action == "needs-user" and not finding["reason"].strip():
+                    raise ValueError("needs-user requires a concrete reason")
+        if len(ids) != len(set(ids)):
+            raise ValueError("duplicate finding ID")
     if role == "verification-reviewer" and value["status"] not in {"resolved", "unresolved", "invalid-result"}:
         raise ValueError("invalid verification status")
     return value
 
 
 def review_call_limit(fix_loops: int, format_retries: int) -> int:
-    return 2 + 1 + 2 * fix_loops + format_retries
+    return 1 + 2 * fix_loops + format_retries
 
 
 def legal_review_targets(phase: str, fix_loop_limit: int) -> set[str]:
-    if phase == "initial-review":
-        return {"triage", "needs-user"}
-    if phase == "triage":
+    if phase == "slice-review":
         return {"approved", "scope-resolution", "needs-user"} | ({"repair-1"} if fix_loop_limit else set())
     if phase == "scope-resolution":
         return {"needs-user"} | ({f"repair-{number}" for number in range(1, fix_loop_limit + 1)})
-    if phase == "needs-user":
-        return {"scope-resolution"}
     match = re.fullmatch(r"repair-(\d+)", phase)
     if match:
         number = int(match.group(1))
@@ -372,8 +389,8 @@ def legal_review_targets(phase: str, fix_loop_limit: int) -> set[str]:
 
 def transition_review(session: dict, target: str, fix_loop_limit: int) -> None:
     phase = session["phase"]
-    pre_review_repair = phase == "triage" and target == f"repair-{session.get('repairAttemptsStarted', 0) + 1}" and session.get("repairAttemptsStarted", 0) < fix_loop_limit
-    if phase == "triage" and target.startswith("repair-"):
+    pre_review_repair = phase == "slice-review" and target == f"repair-{session.get('repairAttemptsStarted', 0) + 1}" and session.get("repairAttemptsStarted", 0) < fix_loop_limit
+    if phase == "slice-review" and target.startswith("repair-"):
         allowed = pre_review_repair
     else:
         allowed = target in legal_review_targets(phase, fix_loop_limit)
@@ -472,7 +489,7 @@ def initial_state(repo: Path, metadata: dict, args: argparse.Namespace) -> dict:
         "activeProcesses": {}, "worktrees": {}, "candidateShas": {}, "attemptCounters": {}, "validationCommandsStarted": {}, "taskStates": {},
         "auditBugValidationCommands": {},
         "reviewSessions": {}, "pullRequests": {}, "providerAttemptCounters": {}, "providerOperationsStarted": 0, "providerDeadlines": {},
-        "auditPlanStarted": False, "auditPlanCompleted": False, "auditCallsStarted": 0,
+        "auditPlanStarted": False, "auditPlanCompleted": False, "auditDispositionsCompleted": False, "auditCallsStarted": 0,
         "auditCallLimit": 0, "auditScopes": {}, "pendingLedgerOperation": None,
         "targetInstructions": "", "agentsBootstrap": None, "taskProvenance": {}, "pathDirectories": [],
         "campaignValidationCommands": campaign_commands,
@@ -540,9 +557,8 @@ def _progress_role(operation: str, mode: str | None = None) -> str:
         return "repair"
     return {
         "worker": "implement",
-        "contract-reviewer": "review",
-        "risk-reviewer": "review",
-        "triage-pm": "review",
+        "plan-reviewer": "review",
+        "slice-reviewer": "review",
         "verification-reviewer": "review",
         "audit-planner": "audit",
         "provider-approve": "publish",
@@ -770,6 +786,7 @@ def render_bugs(campaign: str, repo: Path, bugs: list[dict] | None = None) -> st
             f"- Location: {bug['location']}", f"- Observable failure: {bug['failure']}",
             f"- Reproduction: `{bug['reproduction']}`", f"- Requirement: {bug['requirement']}", f"- Evidence: {bug['evidence']}",
             *([f"- Deferral reason: {bug['deferralReason']}"] if bug.get("deferralReason") else []),
+            *([f"- Decision reason: {bug['decisionReason']}"] if bug.get("decisionReason") else []),
             "- Allowed paths:", *[f"  - `{item}`" for item in bug.get("allowedPaths", [finding_path(bug["location"])])],
             f"- Branch: {bug.get('branch', 'pending')}", f"- Pull request: {bug.get('pullRequest', 'pending')}", f"- Candidate: {bug.get('candidate', 'pending')}", "",
         ]
@@ -799,6 +816,7 @@ def parse_bugs(text: str) -> tuple[dict, list[dict]]:
             "reproduction": reproduction[1:-1] if reproduction.startswith("`") and reproduction.endswith("`") else reproduction,
             "requirement": values["Requirement"], "evidence": values["Evidence"], "branch": values["Branch"],
             "deferralReason": _field(block, "Deferral reason") if any(line.startswith("- Deferral reason:") for line in block) else None,
+            "decisionReason": _field(block, "Decision reason") if any(line.startswith("- Decision reason:") for line in block) else None,
             "pullRequest": values["Pull request"], "candidate": values["Candidate"],
         })
     ids = [bug["id"] for bug in bugs]
@@ -1327,7 +1345,7 @@ def validate_candidate(store: StateStore, assignment: dict, worktree: Path, resu
         run_validations(store, assignment, worktree, "campaign", campaign_commands)
     def accepted(state: dict) -> None:
         state["candidateShas"][assignment["id"]] = sha
-        state["taskStates"][assignment["id"]].update(candidateSha=sha, phase="push-and-open-pr")
+        state["taskStates"][assignment["id"]].update(candidateSha=sha, phase="slice-review")
         state["taskStates"][assignment["id"]].pop("error", None)
         state["taskStates"][assignment["id"]].pop("pendingWorkerSha", None)
         state["taskStates"][assignment["id"]].pop("validationFailure", None)
@@ -1826,106 +1844,129 @@ def publish_candidate(store: StateStore, assignment: dict, worktree: Path, branc
         body.unlink(missing_ok=True)
 
 
-def record_findings(store: StateStore, assignment_id: str, findings: list[dict], decisions: list[dict]) -> list[dict]:
-    actions = {item["findingId"]: item["action"] for item in decisions}
-    reasons = {item["findingId"]: item["reason"] for item in decisions}
+def record_findings(store: StateStore, assignment_id: str, findings: list[dict], decisions: list[dict] | None = None) -> list[dict]:
+    actions = {item["findingId"]: item["action"] for item in decisions or []}
+    reasons = {item["findingId"]: item["reason"] for item in decisions or []}
     accepted = []
     bugs = load_bugs(store)
     known = {(bug["source"], bug["sourceFindingId"]) for bug in bugs}
     for finding in findings:
-        action = actions.get(finding["id"], "discard")
+        action = finding.get("action", actions.get(finding["id"], "discard"))
+        action = "accept-blocker" if action == "repair" else action
+        reason = finding.get("reason") or reasons.get(finding["id"])
         if action == "accept-blocker" and (finding["severity"] not in {"P0", "P1"} or not finding["candidateIntroduced"] or not all(finding[key] for key in ("location", "failure", "reproduction", "requirement", "evidence"))):
             action = "discard"
         if finding["severity"] == "P2" and action == "accept-blocker":
             action = "backlog"
         if finding["severity"] == "P3":
             action = "discard"
-        if action in {"accept-blocker", "backlog"}:
+        if action in {"accept-blocker", "backlog", "needs-user"}:
             finding_key = (assignment_id, finding["id"])
             if finding_key not in known:
                 bug = {
                     "id": f"BUG-{len(bugs) + 1:04d}", "title": finding["failure"][:80], "severity": finding["severity"],
-                    "status": "active" if action == "accept-blocker" else "backlog", "source": assignment_id,
+                    "status": "active" if action == "accept-blocker" else action, "source": assignment_id,
                     "sourceFindingId": finding["id"], "location": finding["location"], "failure": finding["failure"],
                     "reproduction": finding["reproduction"], "requirement": finding["requirement"], "evidence": finding["evidence"],
-                    "allowedPaths": [finding_path(finding["location"])],
+                    "allowedPaths": list(finding.get("repairPaths") or [finding_path(finding["location"])]),
                 }
                 if action == "backlog":
-                    bug["deferralReason"] = reasons.get(finding["id"]) or "Reason not recorded by the originating campaign"
+                    bug["deferralReason"] = reason or "Reason not recorded by the originating campaign"
+                if action == "needs-user":
+                    bug["decisionReason"] = reason
                 bugs.append(bug)
                 known.add(finding_key)
             else:
                 bug = next(item for item in bugs if (item["source"], item["sourceFindingId"]) == finding_key)
+                bug.update(
+                    title=finding["failure"][:80], severity=finding["severity"], status="active" if action == "accept-blocker" else action,
+                    location=finding["location"], failure=finding["failure"], reproduction=finding["reproduction"],
+                    requirement=finding["requirement"], evidence=finding["evidence"],
+                    allowedPaths=list(finding.get("repairPaths") or bug.get("allowedPaths") or [finding_path(finding["location"])]),
+                )
                 if action == "backlog" and not bug.get("deferralReason"):
-                    bug["deferralReason"] = reasons.get(finding["id"]) or "Reason not recorded by the originating campaign"
+                    bug["deferralReason"] = reason or "Reason not recorded by the originating campaign"
+                if action == "needs-user" and not bug.get("decisionReason"):
+                    bug["decisionReason"] = reason
             if action == "accept-blocker":
                 accepted.append(bug)
     write_bugs(store, bugs)
     return accepted
 
 
-def ensure_review_session(store: StateStore, assignment_id: str, sha: str) -> dict:
+def ensure_review_session(store: StateStore, assignment_id: str, sha: str, assignment: dict | None = None) -> dict:
     if assignment_id not in store.state["reviewSessions"]:
         def create(state: dict) -> None:
             task_state = state["taskStates"][assignment_id]
+            audit = (assignment or {}).get("auditFinding")
+            base = state["worktrees"].get(assignment_id, {}).get("baseSha", state["baseSha"])
             state["reviewSessions"][assignment_id] = {
                 "reviewSessionId": f"{assignment_id}-REVIEW-1", "initialCandidateSha": sha, "reviewedSha": "",
-                "phase": "initial-review", "initialReviewAssignmentsStarted": 0, "initialReviewAssignmentsCompleted": 0,
-                "initialAssignmentsStartedRoles": [], "initialResults": {}, "triageCompleted": False, "acceptedBlockerIds": [],
-                "repairAttemptsStarted": task_state.get("validationRepairAttemptsStarted", 0),
+                "phase": "verify-1" if audit else "slice-review", "reviewResult": None,
+                "acceptedBlockerIds": [audit["id"]] if audit else [],
+                "repairAttemptsStarted": max(1, task_state.get("validationRepairAttemptsStarted", 0)) if audit else task_state.get("validationRepairAttemptsStarted", 0),
                 "reviewCallsStarted": task_state.get("validationRepairCallsStarted", 0),
                 "reviewCallLimit": review_call_limit(state["fixLoopLimit"], state["formatRetryAllowance"]),
             }
+            if audit:
+                state["reviewSessions"][assignment_id].update(previousCandidateSha=base, currentCandidateSha=sha, pendingRepairSha=sha, pendingRepairNumber=1, approvedRepairPaths=list(assignment["allowedPaths"]))
         store.update(create)
     return store.state["reviewSessions"][assignment_id]
 
 
 def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: dict, worktree: Path, sha: str) -> bool:
     assignment_id = assignment["id"]
-    session = ensure_review_session(store, assignment_id, sha)
+    session = ensure_review_session(store, assignment_id, sha, assignment)
     try:
-        if session["phase"] == "initial-review":
-            ownership = task_ownership(store)
-            roles = [role for role in ("contract-reviewer", "risk-reviewer") if role not in session["initialResults"]]
-            if roles:
-                def start_logical_assignments(state: dict) -> None:
-                    current = state["reviewSessions"][assignment_id]
-                    started = current.setdefault("initialAssignmentsStartedRoles", [])
-                    new_roles = [role for role in roles if role not in started]
-                    started.extend(new_roles)
-                    current["initialReviewAssignmentsStarted"] += len(new_roles)
-                store.update(start_logical_assignments)
-                with ThreadPoolExecutor(max_workers=len(roles)) as pool:
-                    futures = {pool.submit(invoke_with_replacements, store, semaphore, worktree, assignment_id, role, role_prompt(role, assignment, sha, {"taskOwnership": ownership}), review=True): role for role in roles}
-                    for future in as_completed(futures):
-                        role, result = futures[future], future.result()
-                        if result["candidateSha"] != sha:
-                            raise ValueError(f"{role} changed candidate SHA")
-                        store.update(lambda state, r=role, value=result: (state["reviewSessions"][assignment_id]["initialResults"].__setitem__(r, value), state["reviewSessions"][assignment_id].__setitem__("initialReviewAssignmentsCompleted", state["reviewSessions"][assignment_id]["initialReviewAssignmentsCompleted"] + 1)))
-            transition_review(session, "triage", store.state["fixLoopLimit"])
+        if session["phase"] == "scope-resolution":
+            transition_review(session, "needs-user", store.state["fixLoopLimit"])
+            store.state["taskStates"][assignment_id]["error"] = "repair paths require explicit scope authorization or replanning"
             store.save()
-        if session["phase"] == "triage":
-            findings = [finding for result in session["initialResults"].values() for finding in result["findings"]]
-            triage = invoke_with_replacements(store, semaphore, worktree, assignment_id, "triage-pm", role_prompt("triage-pm", assignment, sha, {"findings": findings, "taskOwnership": task_ownership(store)}), review=True)
-            if any(item["action"] == "needs-user" for item in triage["decisions"]):
+            return False
+        if session["phase"] == "slice-review":
+            result = session.get("reviewResult")
+            if result is None:
+                result = invoke_with_replacements(
+                    store, semaphore, worktree, assignment_id, "slice-reviewer",
+                    role_prompt("slice-reviewer", assignment, sha, {"taskOwnership": task_ownership(store), "validatedCandidate": sha}),
+                    review=True,
+                )
+                if result["candidateSha"] != sha:
+                    raise ValueError("slice reviewer changed candidate SHA")
+                store.update(lambda state: state["reviewSessions"][assignment_id].__setitem__("reviewResult", result))
+            findings = result["findings"]
+            maximum = maximum_repair_paths(store, assignment)
+            directories = scope_directories(store, maximum)
+            requested = sorted({path for finding in findings if finding["action"] == "repair" for path in finding["repairPaths"]})
+            outside = [path for path in requested if not allowed_change(path, maximum, directories)]
+            with store.lock:
+                accepted = record_findings(store, assignment_id, findings)
+            def reviewed(state: dict) -> None:
+                current = state["reviewSessions"][assignment_id]
+                current["acceptedBlockerIds"] = [item["id"] for item in accepted]
+                current["approvedRepairPaths"] = requested
+                current["currentCandidateSha"] = sha
+                if any(finding["action"] == "needs-user" for finding in findings):
+                    target = "needs-user"
+                elif outside:
+                    target = "scope-resolution"
+                elif accepted and current["repairAttemptsStarted"] < state["fixLoopLimit"]:
+                    target = f"repair-{current['repairAttemptsStarted'] + 1}"
+                elif accepted:
+                    target = "needs-user"
+                else:
+                    target = "approved"
+                    current["reviewedSha"] = sha
+                    current["finalReviewedSha"] = sha
+                transition_review(current, target, state["fixLoopLimit"])
+                if target in {"needs-user", "scope-resolution"}:
+                    state["taskStates"][assignment_id]["error"] = "review requires a human decision" if target == "needs-user" else f"repair paths outside bounded scope: {', '.join(outside)}"
+            store.update(reviewed)
+            console("DONE", f"operation=slice-review assignment={assignment_id} repairs={len(accepted)}")
+            if session["phase"] == "scope-resolution":
                 transition_review(session, "needs-user", store.state["fixLoopLimit"])
-                session["triageCompleted"] = True
-                if not store.state["taskStates"][assignment_id].get("error"):
-                    store.state["taskStates"][assignment_id]["error"] = "review requires user"
                 store.save()
                 return False
-            with store.lock:
-                accepted = record_findings(store, assignment_id, findings, triage["decisions"])
-            def triaged(state: dict) -> None:
-                current = state["reviewSessions"][assignment_id]
-                current["triageCompleted"] = True
-                current["acceptedBlockerIds"] = [item["id"] for item in accepted]
-                next_repair = current["repairAttemptsStarted"] + 1
-                transition_review(current, f"repair-{next_repair}" if accepted and next_repair <= state["fixLoopLimit"] else "needs-user" if accepted else "approved", state["fixLoopLimit"])
-                current["reviewedSha"] = sha if not accepted else ""
-                current["currentCandidateSha"] = sha
-            store.update(triaged)
-            console("DONE", f"operation=internal-review assignment={assignment_id} blockers={len(accepted)}")
         while session["phase"] not in TERMINAL_REVIEW_PHASES:
             number = int(session["phase"].split("-")[1])
             blockers = [bug for bug in load_bugs(store) if bug["id"] in session["acceptedBlockerIds"]]
@@ -2005,6 +2046,7 @@ def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: di
             if verification["status"] == "resolved":
                 transition_review(session, "approved", store.state["fixLoopLimit"])
                 session["reviewedSha"] = repaired_sha
+                session["finalReviewedSha"] = repaired_sha
                 session.pop("pendingRepairSha", None)
                 session.pop("pendingRepairNumber", None)
                 with store.lock:
@@ -2435,15 +2477,6 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
             console("BLOCKED", f"operation=worker assignment={assignment_id} reason={task_state.get('error', 'attempt budget exhausted')}")
             clear_operation(store, assignment_id)
             return False
-        session = store.state.get("reviewSessions", {}).get(assignment_id)
-        if session:
-            pr = task_state.get("pr") or store.state.get("pullRequests", {}).get(assignment_id)
-            if not pr:
-                pr = publish_candidate(store, assignment, worktree, branch, session.get("initialCandidateSha", sha))
-        else:
-            pr = publish_candidate(store, assignment, worktree, branch, sha)
-            task_state["phase"] = "initial-review"
-            store.save()
         if not run_review(store, semaphore, assignment, worktree, sha):
             task_state["phase"] = store.state["reviewSessions"][assignment_id]["phase"]
             store.save()
@@ -2515,7 +2548,7 @@ def run_audit(store: StateStore, semaphore: threading.Semaphore, tasks: list[dic
             return []
         def fixed(state: dict) -> None:
             state["auditScopes"] = {scope["scopeId"]: {**scope, "started": False, "completed": False, "findings": []} for scope in scopes}
-            state["auditCallLimit"] = 1 + len(scopes) + 1 + state["formatRetryAllowance"]
+            state["auditCallLimit"] = 1 + len(scopes) + state["formatRetryAllowance"]
             state["auditPlanCompleted"] = True
         store.update(fixed)
     pending = [scope for scope in store.state["auditScopes"].values() if not scope["completed"]]
@@ -2535,46 +2568,23 @@ def run_audit(store: StateStore, semaphore: threading.Semaphore, tasks: list[dic
                 store.save()
     else:
         findings = [finding for scope in store.state["auditScopes"].values() for finding in scope["findings"]]
-    if not store.state.get("auditTriageCompleted"):
-        triage_assignment = {"id": "AUDIT", "allowedPaths": [], "acceptanceCriteria": [], "validationCommands": []}
-        triage = invoke_with_replacements(store, semaphore, Path(store.state["repository"]), "AUDIT", "triage-pm", role_prompt("triage-pm", triage_assignment, audit_sha, findings), audit=True)
-        if any(item["action"] == "needs-user" for item in triage["decisions"]):
-            store.update(lambda state: state.update(phase="needs-user", auditTriageCompleted=True))
-            return []
-        actions = {item["findingId"]: item["action"] for item in triage["decisions"]}
-        reasons = {item["findingId"]: item["reason"] for item in triage["decisions"]}
-        accepted = []
-        validation_commands = {}
-        bugs = load_bugs(store)
-        known = {(bug["source"], bug["sourceFindingId"]): bug for bug in bugs}
+    if not store.state.get("auditDispositionsCompleted"):
+        dispositions = []
         for finding in findings:
-            action = actions.get(finding["id"], "discard")
-            if action == "accept-blocker" and finding["severity"] in {"P0", "P1"} and all(finding[key] for key in ("location", "failure", "reproduction", "requirement", "evidence")):
-                bug = known.get(("audit", finding["id"]))
-                if bug is None:
-                    bug = {
-                        "id": f"BUG-{len(bugs) + 1:04d}", "title": finding["failure"][:80],
-                        "severity": finding["severity"], "status": "active", "source": "audit", "sourceFindingId": finding["id"],
-                        "location": finding["location"], "failure": finding["failure"], "reproduction": finding["reproduction"],
-                        "requirement": finding["requirement"], "evidence": finding["evidence"],
-                    }
-                    bugs.append(bug)
-                    known[("audit", finding["id"])] = bug
-                scope = next((item for item in store.state["auditScopes"].values() if finding in item.get("findings", [])), None)
-                if scope is None:
-                    raise ValueError(f"accepted audit finding has no scope: {finding['id']}")
-                bug["allowedPaths"] = (scope or {}).get("paths") or [finding["location"].replace("\\", "/").split(":", 1)[0]]
-                validation_commands[bug["id"]] = list(scope["commands"])
-                accepted.append(bug)
-            elif action == "backlog" and finding["severity"] == "P2":
-                if ("audit", finding["id"]) not in known:
-                    bug = {"id": f"BUG-{len(bugs) + 1:04d}", "title": finding["failure"][:80], "severity": "P2", "status": "backlog", "source": "audit", "sourceFindingId": finding["id"], "location": finding["location"], "failure": finding["failure"], "reproduction": finding["reproduction"], "requirement": finding["requirement"], "evidence": finding["evidence"], "deferralReason": reasons.get(finding["id"]) or "Reason not recorded by the originating campaign"}
-                    bugs.append(bug)
-                    known[("audit", finding["id"])] = bug
-                elif not known[("audit", finding["id"])].get("deferralReason"):
-                    known[("audit", finding["id"])]["deferralReason"] = reasons.get(finding["id"]) or "Reason not recorded by the originating campaign"
-        write_bugs(store, bugs)
-        store.update(lambda state: (state.setdefault("auditBugValidationCommands", {}).update(validation_commands), state.__setitem__("auditTriageCompleted", True)))
+            scope = next((item for item in store.state["auditScopes"].values() if finding in item.get("findings", [])), None)
+            if scope is None:
+                raise ValueError(f"audit finding has no scope: {finding['id']}")
+            outside = [path for path in finding["repairPaths"] if not allowed_change(path, scope["paths"], scope_directories(store, scope["paths"]))]
+            dispositions.append(finding if not outside else finding | {"action": "needs-user", "reason": f"Repair path outside audit scope: {', '.join(outside)}", "repairPaths": []})
+        accepted = record_findings(store, "audit", dispositions)
+        validation_commands = {}
+        for bug in accepted:
+            scope = next(item for item in store.state["auditScopes"].values() if any(finding["id"] == bug["sourceFindingId"] for finding in item.get("findings", [])))
+            validation_commands[bug["id"]] = list(scope["commands"])
+        store.update(lambda state: (state.setdefault("auditBugValidationCommands", {}).update(validation_commands), state.__setitem__("auditDispositionsCompleted", True)))
+        if any(finding["action"] == "needs-user" for finding in dispositions):
+            store.update(lambda state: state.__setitem__("phase", "needs-user"))
+            return []
         return accepted
     return [bug for bug in load_bugs(store) if bug["source"] == "audit" and bug["status"] == "active"]
 
@@ -2590,7 +2600,7 @@ def audit_bug_validation_commands(store: StateStore, bug: dict) -> list[str]:
 
 
 def bug_assignment(store: StateStore, bug: dict) -> dict:
-    return {"id": bug["id"], "title": bug["title"], "status": "ready", "priority": bug["severity"], "dependencies": [], "allowedPaths": bug["allowedPaths"], "acceptanceCriteria": [f"Resolve: {bug['failure']}", f"Meet requirement: {bug['requirement']}"], "validationCommands": audit_bug_validation_commands(store, bug)}
+    return {"id": bug["id"], "title": bug["title"], "status": "ready", "priority": bug["severity"], "dependencies": [], "allowedPaths": bug["allowedPaths"], "acceptanceCriteria": [f"Resolve: {bug['failure']}", f"Meet requirement: {bug['requirement']}"], "validationCommands": audit_bug_validation_commands(store, bug), "auditFinding": bug}
 
 
 def target_instructions(repo: Path, create: bool = False) -> tuple[str, bytes]:
@@ -3327,7 +3337,7 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
             accepted = record_findings(store, assignment_id, action["findings"], action["decisions"])
             session["acceptedBlockerIds"] = [bug["id"] for bug in accepted]
             session["approvedRepairPaths"] = list(action["repairPaths"])
-            transition_review(session, "scope-resolution", store.state["fixLoopLimit"])
+            session["phase"] = "scope-resolution"
             transition_review(session, f"repair-{action['repair']}", store.state["fixLoopLimit"])
             task_state.update(phase=f"repair-{action['repair']}")
             task_state.pop("error", None)
@@ -4014,6 +4024,116 @@ def initialize_campaign(repo: Path, text: str, args: argparse.Namespace) -> tupl
     return store, tasks
 
 
+def _schema_two_findings(store: StateStore, assignment: dict, session: dict) -> tuple[list[dict], list[str]]:
+    results = session.get("initialResults") or {}
+    findings = []
+    for role, result in sorted(results.items()):
+        if role not in {"contract-reviewer", "risk-reviewer"}:
+            raise RuntimeError(f"schema-2 migration refused: {assignment['id']} has unsupported saved reviewer role {role}")
+        try:
+            validated = validate_agent_result(role, result, assignment["id"])
+        except ValueError as error:
+            raise RuntimeError(f"schema-2 migration refused: {assignment['id']} saved {role} result is invalid: {error}") from error
+        if validated["candidateSha"] != session.get("initialCandidateSha"):
+            raise RuntimeError(f"schema-2 migration refused: {assignment['id']} saved reviewer candidate SHA drifted")
+        findings.extend(validated["findings"])
+    ids = [finding["id"] for finding in findings]
+    if len(ids) != len(set(ids)):
+        raise RuntimeError(f"schema-2 migration refused: {assignment['id']} saved finding IDs are not unique")
+    maximum = maximum_repair_paths(store, assignment)
+    dispositions = []
+    for finding in findings:
+        if finding["candidateIntroduced"] and finding["severity"] in {"P0", "P1"}:
+            action, reason, paths = "repair", "Candidate-introduced release blocker retained for bounded repair.", list(maximum)
+        elif finding["severity"] == "P3":
+            action, reason, paths = "discard", "P3 finding is non-blocking.", []
+        else:
+            action, reason, paths = "backlog", "Non-blocking or pre-existing finding deferred deterministically.", []
+        dispositions.append(finding | {"action": action, "reason": reason, "repairPaths": paths})
+    return dispositions, maximum
+
+
+def plan_schema_two_migration(store: StateStore, tasks: list[dict]) -> dict:
+    if store.state.get("schemaVersion") != 2:
+        raise RuntimeError("schema-2 migration requires schema 2")
+    if store.state.get("activeProcesses"):
+        raise RuntimeError("schema-2 migration refused: campaign has active processes")
+    load_tasks(store)
+    load_bugs(store)
+    by_id = {task["id"]: task for task in tasks}
+    sessions = {}
+    review_ids = set(store.state.get("reviewSessions", {})) | {
+        assignment_id for assignment_id, task_state in store.state.get("taskStates", {}).items()
+        if task_state.get("phase") in {"initial-review", "triage", "slice-review"}
+    }
+    for assignment_id in sorted(review_ids):
+        if assignment_id not in by_id:
+            continue
+        session = store.state.get("reviewSessions", {}).get(assignment_id) or {
+            "phase": "initial-review", "initialCandidateSha": store.state.get("taskStates", {}).get(assignment_id, {}).get("candidateSha"),
+            "repairAttemptsStarted": 0, "reviewCallsStarted": 0,
+        }
+        task_state = store.state.get("taskStates", {}).get(assignment_id, {})
+        candidate = session.get("currentCandidateSha") or session.get("reviewedSha") or session.get("initialCandidateSha") or task_state.get("candidateSha")
+        record = store.state.get("worktrees", {}).get(assignment_id)
+        if record:
+            worktree, _ = recovery_worktree(store, assignment_id)
+            head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
+            dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout
+            if not candidate or head != candidate or dirty:
+                raise RuntimeError(f"schema-2 migration refused: {assignment_id} worktree or candidate SHA drifted")
+        pr = task_state.get("pr") or store.state.get("pullRequests", {}).get(assignment_id)
+        if pr and candidate and pr.get("headRefOid") not in {None, candidate}:
+            raise RuntimeError(f"schema-2 migration refused: {assignment_id} pull request head drifted")
+        findings, maximum = _schema_two_findings(store, by_id[assignment_id], session)
+        phase = session.get("phase", "initial-review")
+        if phase in {"initial-review", "triage"}:
+            phase = "slice-review"
+        if phase == "needs-user" and findings:
+            repair_paths = sorted({path for finding in findings if finding["action"] == "repair" for path in finding["repairPaths"]})
+            directories = scope_directories(store, maximum)
+            locations = [finding_path(finding["location"]) for finding in findings if finding["action"] == "repair"]
+            next_repair = session.get("repairAttemptsStarted", 0) + 1
+            phase = "scope-resolution" if any(not allowed_change(path, maximum, directories) for path in locations) else (f"repair-{next_repair}" if repair_paths and next_repair <= store.state["fixLoopLimit"] else "needs-user" if repair_paths else "approved")
+        numbered = re.fullmatch(r"(?:repair|verify)-(\d+)", phase)
+        if numbered and int(numbered.group(1)) > store.state["fixLoopLimit"]:
+            raise RuntimeError(f"schema-2 migration refused: {assignment_id} review phase exceeds its repair budget")
+        sessions[assignment_id] = {"phase": phase, "candidateSha": candidate, "findings": findings, "maximumRepairPaths": maximum}
+    return {"action": "migrate-schema-2", "campaignId": store.state.get("campaignId"), "fromSchema": 2, "toSchema": 3, "sessions": sessions}
+
+
+def apply_schema_two_migration(store: StateStore, tasks: list[dict], planned: dict) -> None:
+    if plan_schema_two_migration(store, tasks) != planned:
+        raise RuntimeError("schema-2 migration refused: campaign state drifted after preview")
+    store.state["pendingSchemaMigration"] = planned
+    store.save()
+    for assignment_id, migration in planned["sessions"].items():
+        session = store.state["reviewSessions"].setdefault(assignment_id, {
+            "reviewSessionId": f"{assignment_id}-REVIEW-1", "initialCandidateSha": migration["candidateSha"],
+            "reviewedSha": "", "repairAttemptsStarted": 0, "reviewCallsStarted": 0,
+        })
+        legacy = {key: session.pop(key) for key in ("initialResults", "initialAssignmentsStartedRoles", "initialReviewAssignmentsStarted", "initialReviewAssignmentsCompleted", "triageCompleted") if key in session}
+        if legacy:
+            session["legacyReviewState"] = legacy
+        findings = migration["findings"]
+        accepted = record_findings(store, assignment_id, findings) if findings else []
+        session.update(
+            phase=migration["phase"], reviewResult={"assignmentId": assignment_id, "candidateSha": migration["candidateSha"], "findings": findings} if findings else None,
+            acceptedBlockerIds=[bug["id"] for bug in accepted], currentCandidateSha=migration["candidateSha"],
+            approvedRepairPaths=sorted({path for finding in findings if finding["action"] == "repair" for path in finding["repairPaths"]}),
+            reviewCallLimit=max(session.get("reviewCallsStarted", 0), review_call_limit(store.state["fixLoopLimit"], store.state["formatRetryAllowance"])),
+        )
+        if migration["phase"] == "approved":
+            session["reviewedSha"] = migration["candidateSha"]
+            session["finalReviewedSha"] = migration["candidateSha"]
+        store.state["taskStates"].setdefault(assignment_id, {})["phase"] = migration["phase"]
+    store.state["schemaVersion"] = STATE_SCHEMA_VERSION
+    store.state["auditDispositionsCompleted"] = store.state.pop("auditTriageCompleted", store.state.get("auditDispositionsCompleted", False))
+    store.state.setdefault("schemaMigrationHistory", []).append({"from": 2, "to": 3, "migratedAt": datetime.now(timezone.utc).isoformat()})
+    store.state["pendingSchemaMigration"] = None
+    store.save()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     repo = args.repo.resolve()
@@ -4048,10 +4168,27 @@ def main(argv: list[str] | None = None) -> int:
             if stdin_text.strip() or args.plan:
                 raise RuntimeError("resume does not accept a new plan")
             state = json.loads(relay_state.read_text(encoding="utf-8"))
-            if state.get("schemaVersion") != STATE_SCHEMA_VERSION:
+            if state.get("schemaVersion") not in {2, STATE_SCHEMA_VERSION}:
                 raise RuntimeError(f"unsupported campaign state schema {state.get('schemaVersion')!r}; create a reviewed plan and start a new campaign")
             if Path(state["repository"]).resolve() != repo:
                 raise RuntimeError("campaign repository mismatch")
+            if state.get("schemaVersion") == 2:
+                if not args.recover:
+                    raise RuntimeError("schema-2 campaign requires explicit migration; preview with --recover")
+                if args.defer_blocker or args.grant_attempt:
+                    raise RuntimeError("schema-2 migration does not accept blocker deferrals or attempt grants")
+                store = StateStore(relay_state, state)
+                tasks = load_tasks(store)
+                with coordinator_lock(store.path.parent):
+                    migration = plan_schema_two_migration(store, tasks)
+                    print(f"RECOVER assignment=CAMPAIGN action=migrate-schema-2 sessions={len(migration['sessions'])}")
+                    if not args.confirm:
+                        relay_console.close()
+                        return 0
+                    apply_schema_two_migration(store, tasks, migration)
+                stderr_event("NEXT", f"Resume with: {_shell_join([sys.executable, str(Path(__file__).resolve()), '--repo', str(repo)])}")
+                relay_console.close()
+                return 0
             store, tasks = StateStore(relay_state, state), None
             resuming = True
         else:
