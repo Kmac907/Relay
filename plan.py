@@ -52,7 +52,7 @@ def nonnegative(value: str) -> int:
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description="Create a bounded Relay task plan.")
+    result = argparse.ArgumentParser(description="Create a bounded Relay plan of independently usable vertical slices.")
     result.add_argument("--repo", required=True, type=Path)
     result.add_argument("--requirements", required=True, type=Path)
     result.add_argument("--workers", type=positive, default=3)
@@ -108,8 +108,7 @@ def validate_tasks(value: object, backlog_entries: list[dict] | None = None) -> 
                     raise ValueError(f"backlog task {key} must contain nonempty strings")
             if any(not valid_relative_path(path) for path in task["testPaths"]):
                 raise ValueError("test paths must stay relative to the repository")
-            allowed = {path.replace("\\", "/").strip("/") for path in task["allowedPaths"]}
-            if any(path.replace("\\", "/").strip("/") not in allowed for path in task["testPaths"]):
+            if any(not run.allowed_change(path, task["allowedPaths"]) for path in task["testPaths"]):
                 raise ValueError("test paths must be included in allowedPaths")
             if any(command not in task["validationCommands"] for command in task["regressionValidationCommands"]):
                 raise ValueError("regression validation commands must be included in validationCommands")
@@ -502,8 +501,14 @@ Structured backlog entries:\n{json.dumps(backlog['entries'])}
     return f"""Role: Planning Project Manager (read-only).
 Reconcile requirements with the existing repository. Return bounded tasks only for missing work.
 Do not edit, spawn agents, request another pass, or create historical ordering dependencies.
-Every task needs a unique TASK-NNNN ID, ready/blocked/satisfied status, P0-P3 priority,
-genuine dependencies, allowed paths, explicit acceptance criteria, and validation commands.
+Prefer the fewest independently usable vertical slices, normally three to five but with no hard limit.
+Reject layer-only decomposition: each slice must own every production, entrypoint, contract, and test
+path needed by its acceptance criteria. Dependencies must reflect genuine runtime prerequisites, not
+historical implementation order. Every task needs a unique TASK-NNNN ID, ready/blocked/satisfied
+status, P0-P3 priority, genuine dependencies, allowed paths, explicit acceptance criteria, and
+validation commands that exercise the production composition through its real entrypoint.
+Tests may fake external processes, networks, clocks, and providers, but never the internal component
+being integrated. Keep the existing task contract; do not invent a redundant production-test field.
 Return at least one campaignValidationCommands entry: a full build, full test suite, lint, or
 repository-wide analyzer that must pass on the untouched base and every accepted candidate.
 Keep task validation focused on each task's new behavior. Never promote task commands merely
@@ -535,6 +540,10 @@ Candidate SHA: {digest}
 The draft below is the exact contract used to create both PLAN.md and tasks.md.
 Return only execution-blocking, evidence-backed plan defects; do not report style preferences,
 edit files, widen requirements, spawn agents, or request another review.
+Trace every acceptance criterion through the real production entrypoint and its direct collaborators.
+Reject missing production or integration paths, tests that replace the internal component under test,
+validation commands that cannot prove the composed slice works, and layer-only decomposition that
+delays integration to a later task.
 Target instructions:\n{instructions}
 Requirements:\n{requirements}
 Campaign validation commands:\n{json.dumps(campaign_validation_commands or [])}
@@ -548,6 +557,8 @@ def plan_repair_prompt(requirements: str, instructions: str, files: list[str], b
 Repair only the supplied findings and return the complete revised task graph.
 Do not edit files, spawn agents, widen requirements, create another review, or omit unaffected tasks.
 Every validation command must use syntax supported by the target environment and every task must allow all paths required by its acceptance criteria.
+Each repaired task must remain an independently usable vertical slice whose validation exercises the
+real production entrypoint and collaborators without replacing internal production components.
 Return at least one campaign validation command that must pass on the untouched base and every candidate; keep task-specific regression commands separate.
 Base SHA: {base}
 Target instructions:\n{instructions}

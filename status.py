@@ -12,7 +12,7 @@ from run import _blocker_detail, _blocker_log, _publication_retry_key, display_a
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description="Show a Relay campaign without changing it.")
+    result = argparse.ArgumentParser(description="Show Relay work, human decisions, provider waits, and blocked operational failures without changing state.")
     result.add_argument("--repo", required=True, type=Path)
     return result
 
@@ -74,9 +74,9 @@ def main(argv: list[str] | None = None) -> int:
     blockers = []
     if state.get("error"):
         blockers.append(("CAMPAIGN", str(state["error"])))
-    if bootstrap.get("phase") == "needs-user":
-        blockers.append(("AGENTS", str(bootstrap.get("providerStatus") or "needs-user")))
-    blockers += [(assignment_id, str(task.get("error") or task.get("providerStatus") or "needs-user")) for assignment_id, task in task_states.items() if task.get("phase") == "needs-user"]
+    if bootstrap.get("phase") in {"blocked", "needs-user"}:
+        blockers.append(("AGENTS", str(bootstrap.get("providerStatus") or bootstrap["phase"])))
+    blockers += [(assignment_id, str(task.get("error") or task.get("providerStatus") or task["phase"])) for assignment_id, task in task_states.items() if task.get("phase") in {"blocked", "needs-user"}]
     if blockers:
         print("\nBlockers")
         groups = {}
@@ -92,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
     if bootstrap:
         pr = bootstrap.get("pr") or {}
         print(f"\nAGENTS.md bootstrap\n  Phase: {bootstrap['phase']}\n  PR: {pr.get('url', pr.get('number', 'not-created'))}\n  Checks: {bootstrap.get('providerStatus', 'pending')}")
-    ready = sum(task["status"] != "satisfied" and set(task["dependencies"]) <= integrated and task["id"] not in integrated and state.get("taskStates", {}).get(task["id"], {}).get("phase") not in {"needs-user", "waiting-provider"} for task in tasks)
+    ready = sum(task["status"] != "satisfied" and set(task["dependencies"]) <= integrated and task["id"] not in integrated and state.get("taskStates", {}).get(task["id"], {}).get("phase") not in {"blocked", "needs-user", "waiting-provider"} for task in tasks)
     print(f"\nTasks\n  Total: {len(tasks)}\n  Ready: {ready}")
     phases = Counter(value.get("phase", "unknown") for key, value in task_states.items() if key in task_ids)
     for phase, count in sorted(phases.items()): print(f"  {phase}: {count}")
