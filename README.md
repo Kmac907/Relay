@@ -110,7 +110,7 @@ Only a reviewed SHA is published. Relay requires the provider-reported head to m
 
 After planned slices merge, Relay runs exactly one finite audit. Audit scopes and calls are bounded. Accepted audit fixes validate and merge without starting another full review or audit. Deferred findings are written to human-readable `BACKLOG.md` with title, severity, requirement, failure, and evidence. A later `plan.py --requirements BACKLOG.md` treats it as ordinary requirements and plans its tests and commands normally.
 
-Coordinator output is a synchronous timestamped event stream. There is no spinner, console thread, TTY rewriting, or periodic display process. Raw agent, provider, and validation logs remain under `.relay/logs/`.
+Coordinator output combines timestamped events with a live TTY spinner showing compact campaign progress. Redirected output receives the same progress as rate-limited `WAIT` events. Raw agent, provider, and validation logs remain under `.relay/logs/`.
 
 ## State contract
 
