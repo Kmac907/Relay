@@ -247,6 +247,24 @@ class ContractTests(unittest.TestCase):
             run.transition_review(session, phase, 2)
         self.assertEqual(session["phase"], "approved")
 
+    def test_scope_resolution_is_forward_only(self):
+        session = {"phase": "needs-user", "repairAttemptsStarted": 0}
+        run.transition_review(session, "scope-resolution", 2)
+        run.transition_review(session, "repair-1", 2)
+        with self.assertRaisesRegex(ValueError, "illegal review transition"):
+            run.transition_review(session, "initial-review", 2)
+
+    def test_vertical_slice_prompts_require_production_composition(self):
+        planning = plan.planning_prompt("requirements", "instructions", ["app.py"], "abc", [])
+        review = plan.plan_review_prompt("contract-reviewer", "requirements", "instructions", [self.task()], "digest")
+        worker = run.worker_prompt("task", self.task())
+        for phrase in ("vertical slices", "production composition", "real entrypoint", "internal component"):
+            self.assertIn(phrase, planning)
+        for phrase in ("production entrypoint", "integration paths", "layer-only decomposition"):
+            self.assertIn(phrase, review)
+        for phrase in ("direct callers and callees", "production composition", "one clean"):
+            self.assertIn(phrase, worker)
+
     def test_pre_review_repair_advances_the_shared_fix_sequence(self):
         session = {"phase": "triage", "repairAttemptsStarted": 1}
         with self.assertRaises(ValueError):
@@ -606,6 +624,7 @@ class DeterministicCoreTests(unittest.TestCase):
         campaign_commands = ["python -c \"pass\""]
         state = run.initial_state(Path(root), {"baseSha": "0123456", "requirementsHash": "abc123", "campaignValidationCommands": campaign_commands, "legacyCampaignValidation": False}, args)
         state["campaignId"] = "test"
+        state["pathDirectories"] = ["src"]
         path = Path(root) / ".relay" / "state.json"
         Path(root, "tasks.md").write_text(plan.render_tasks([ContractTests().task()], "0123456", "abc123", args.task_attempts, args.fix_loops, campaign_commands), encoding="utf-8")
         Path(root, "bugs.md").write_text(run.render_bugs("test", Path(root)), encoding="utf-8")
@@ -631,6 +650,38 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(run.validation_command(command), [r"C:\Tools\pwsh.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command])
         with patch.object(run.os, "name", "posix"):
             self.assertEqual(run.validation_command(command), ["/bin/sh", "-c", command])
+
+    def test_shared_path_policy_handles_files_directories_and_segment_globs(self):
+        self.assertTrue(run.allowed_change("tests/fixtures/offline/case.json", ["tests/fixtures/offline/**"]))
+        self.assertTrue(run.allowed_change("tests/fixtures/offline/nested/case.json", ["tests/fixtures/offline/**"]))
+        self.assertTrue(run.allowed_change("src/a/test_1.py", ["src/*/test_?.py"]))
+        self.assertFalse(run.allowed_change("src/a/nested/test_1.py", ["src/*/test_?.py"]))
+        self.assertTrue(run.allowed_change("src/nested/app.py", ["src"], {"src"}))
+        self.assertFalse(run.allowed_change("src/app.py/generated", ["src/app.py"], set()))
+        self.assertTrue(run.allowed_change("deleted.py", ["deleted.py"], set()))
+
+    def test_glob_scopes_conservatively_serialize_possible_overlap(self):
+        self.assertTrue(run.paths_conflict(["src/**"], {"src/generated/*.py"}))
+        self.assertTrue(run.paths_conflict(["src/*/app.py"], {"src/service/*.py"}))
+        self.assertFalse(run.paths_conflict(["src/api/**"], {"src/ui/**"}))
+
+    def test_completed_transitive_dependencies_bound_repair_scope(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            first = ContractTests().task("TASK-0001"); first["allowedPaths"] = ["src/base.py"]
+            second = ContractTests().task("TASK-0002", ["TASK-0001"]); second["allowedPaths"] = ["src/feature.py"]
+            future = ContractTests().task("TASK-0003"); future["allowedPaths"] = ["src/future.py"]
+            Path(root, "tasks.md").write_text(plan.render_tasks([first, second, future], "0123456", "abc123", campaign_validation_commands=store.state["campaignValidationCommands"]), encoding="utf-8")
+            store.state["taskStates"]["TASK-0001"] = {"phase": "integrated"}
+            paths = run.maximum_repair_paths(store, second)
+            self.assertEqual(paths, ["src/feature.py", "src/base.py"])
+            self.assertEqual(run.approved_repair_paths(store, second, [{"allowedPaths": ["src/base.py"]}]), (["src/base.py"], []))
+            self.assertEqual(run.approved_repair_paths(store, second, [{"allowedPaths": ["src/future.py"]}])[1], ["src/future.py"])
+
+    def test_stop_states_distinguish_human_decisions_from_failures(self):
+        self.assertEqual(run.stop_phase("credentials require authorization"), "needs-user")
+        self.assertEqual(run.stop_phase("unrelated path requires paths outside assignment scope"), "needs-user")
+        self.assertEqual(run.stop_phase("provider API returned malformed JSON"), "blocked")
 
     def test_validation_subprocesses_get_unique_existing_temp_directories(self):
         seen = []
@@ -1780,6 +1831,45 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(actions[0]["action"], "resume-review")
             self.assertEqual(store.state["reviewSessions"][assignment["id"]]["phase"], "repair-1")
             self.assertEqual(store.state["reviewSessions"][assignment["id"]]["repairAttemptsStarted"], 0)
+
+    def test_schema_two_scope_recovery_preserves_candidate_and_enters_repair(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            store = self.state_store(root)
+            tasks = []
+            for number in range(2, 8):
+                dependencies = [f"TASK-{item:04d}" for item in range(2, number)] if number == 7 else []
+                task = ContractTests().task(f"TASK-{number:04d}", dependencies)
+                task["allowedPaths"] = [f"slice/{number}.py"]
+                tasks.append(task)
+            Path(root, "tasks.md").write_text(plan.render_tasks(tasks, "0123456", "abc123", campaign_validation_commands=store.state["campaignValidationCommands"]), encoding="utf-8")
+            for task in tasks[:-1]:
+                store.state["taskStates"][task["id"]] = {"phase": "integrated"}
+            assignment = tasks[-1]
+            finding = {"id": "saved-1", "severity": "P1", "location": "slice/2.py:1", "failure": "fails", "reproduction": "run test", "requirement": "works", "evidence": "exit 1", "candidateIntroduced": True}
+            store.state.update(phase="needs-user")
+            store.state["taskStates"][assignment["id"]] = {"phase": "needs-user", "candidateSha": "candidate", "error": "accepted blocker requires paths outside assignment scope: slice/2.py"}
+            store.state["reviewSessions"][assignment["id"]] = {
+                "phase": "needs-user", "initialCandidateSha": "candidate", "acceptedBlockerIds": ["BUG-0001"],
+                "repairAttemptsStarted": 0, "reviewCallsStarted": 3, "reviewCallLimit": 9,
+                "initialResults": {"contract-reviewer": {"assignmentId": assignment["id"], "candidateSha": "candidate", "findings": [finding]}},
+            }
+            record = {"path": str(root), "root": str(root), "branch": "relay/TASK-0007", "baseSha": "base"}
+            store.state["worktrees"][assignment["id"]] = record
+            store.state["pullRequests"][assignment["id"]] = {"number": 8, "headRefOid": "candidate", "state": "OPEN"}
+            store.save()
+            before = store.path.read_bytes()
+            def recovery_git(_repo, *args, **_kwargs):
+                return subprocess.CompletedProcess([], 0, "candidate\n" if args[0] == "rev-parse" else "", "")
+            with patch("run.recovery_worktree", return_value=(root, record)), patch("run.git", side_effect=recovery_git):
+                actions = run.plan_recovery(store, tasks, [], [])
+                self.assertEqual(store.path.read_bytes(), before)
+                self.assertEqual(actions[0]["repairPaths"], ["slice/7.py", *[f"slice/{number}.py" for number in range(2, 7)]])
+                run.apply_recovery(store, tasks, actions)
+            self.assertEqual(store.state["reviewSessions"][assignment["id"]]["phase"], "repair-1")
+            self.assertEqual(store.state["reviewSessions"][assignment["id"]]["repairAttemptsStarted"], 0)
+            self.assertEqual(store.state["pullRequests"][assignment["id"]]["number"], 8)
+            self.assertEqual(run.load_bugs(store)[0]["sourceFindingId"], "saved-1")
 
     def test_recovery_resumes_audit_bug_with_scope_commands_without_worker_attempt(self):
         with tempfile.TemporaryDirectory() as root:
