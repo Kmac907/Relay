@@ -562,7 +562,7 @@ def start_operation(store: StateStore, assignment_id: str, operation: str, timeo
             if operation == "provider-checks" and assignment_id != "AGENTS":
                 target["phase"] = "provider-checks"
     store.update(change)
-    relay_console.emit("WAIT", runtime_progress(store.state, load_bugs(store)))
+    relay_console.update(runtime_progress(store.state, load_bugs(store)))
 
 
 def clear_operation(store: StateStore, assignment_id: str, operation: str | None = None) -> None:
@@ -572,7 +572,7 @@ def clear_operation(store: StateStore, assignment_id: str, operation: str | None
             for field in OPERATION_FIELDS:
                 target.pop(field, None)
     store.update(change)
-    relay_console.emit("WAIT", runtime_progress(store.state, load_bugs(store)))
+    relay_console.update(runtime_progress(store.state, load_bugs(store)))
 
 
 @contextlib.contextmanager
@@ -1184,7 +1184,7 @@ def run_validations(store: StateStore, assignment: dict, worktree: Path, categor
             if assignment_id == "BASELINE":
                 target.update(phase="running", commandsStarted=count, currentCommand=command, startedAt=target.get("startedAt") or datetime.now(timezone.utc).isoformat(), deadline=target["operationDeadline"])
         store.update(consume)
-        relay_console.emit("WAIT", runtime_progress(store.state, load_bugs(store)))
+        relay_console.update(runtime_progress(store.state, load_bugs(store)))
         relay_console.emit("START", f"operation=validate category={category} assignment={assignment_id} command={command_number}/{len(commands)} attempt={started['number']} deadline={store.state['validationTimeoutSeconds']}s")
         shell = validation_command(command)
         middle = "" if category == "task" else f"-{category}"
@@ -1879,7 +1879,7 @@ def wait_for_checks(store: StateStore, assignment_id: str, pr: dict, reviewed_sh
             if target is not None:
                 target.update(providerStatus=status, providerPolicyCounts=counts or {}, nextAction=next_action)
         store.update(change)
-        relay_console.emit("WAIT", runtime_progress(store.state, load_bugs(store)))
+        relay_console.update(runtime_progress(store.state, load_bugs(store)))
 
     first = True
     while first or time.time() < deadline:
@@ -2876,7 +2876,10 @@ def reconcile(store: StateStore) -> None:
 def heartbeat_loop(store: StateStore, stop: threading.Event) -> None:
     save_interval = min(30, max(1, store.state["agentTimeoutSeconds"] // 2))
     last_save = time.monotonic()
+    relay_console.update(runtime_progress(store.state, load_bugs(store)))
     while not stop.wait(1):
+        if relay_console.interactive():
+            relay_console.update(runtime_progress(store.state, load_bugs(store)))
         if time.monotonic() - last_save >= save_interval:
             store.save()
             last_save = time.monotonic()
@@ -3381,11 +3384,13 @@ def main(argv: list[str] | None = None) -> int:
             finally:
                 stop.set()
                 heartbeat.join()
+                relay_console.close()
     except Exception as error:
         if not (args.recover and not args.confirm) and "store" in locals() and isinstance(store, StateStore):
             with contextlib.suppress(Exception):
                 store.update(lambda state: state.update(phase="blocked", error=str(error), blockedEvidence={"type": type(error).__name__, "message": str(error)}))
         relay_console.emit("FAILED", operation="campaign", reason=str(error).splitlines()[0])
+        relay_console.close()
         return 1
 
 

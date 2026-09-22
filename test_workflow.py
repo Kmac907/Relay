@@ -28,16 +28,77 @@ class TTYBuffer(io.StringIO):
 
 
 class ConsoleTests(unittest.TestCase):
-    def test_emit_is_a_plain_synchronous_event(self):
-        stream = io.StringIO()
-        with patch.object(relay_console.sys, "stderr", stream):
-            relay_console.emit("WAIT", "working", deadline="30s")
-            relay_console.emit("DONE", operation="step")
+    def test_timed_status_recalculates_for_tty_and_redirected_waits(self):
+        clock = [5.0]
+        stream = TTYBuffer()
+        console = relay_console.Console(stream, interval=3600, monotonic=lambda: clock[0], width=lambda: 80)
+        console.update("working", started=10.0, timeout=30)
+        clock[0] = 17.0
+        console.update("working", started=10.0, timeout=30)
+        console.close()
+        self.assertIn("working | elapsed 0s / 30s", stream.getvalue())
+        self.assertIn("working | elapsed 7s / 30s", stream.getvalue())
+
+        stream, clock = io.StringIO(), [10.0]
+        console = relay_console.Console(stream, interval=3600, wait_interval=5, monotonic=lambda: clock[0])
+        console.update("working", started=clock[0], timeout=30)
+        clock[0] = 15.0
+        console.update("working", started=10.0, timeout=30)
+        console.close()
+        self.assertEqual(stream.getvalue().count("WAIT"), 2)
+        self.assertIn("working | elapsed 5s / 30s", stream.getvalue())
+
+    def test_tty_rewrites_one_truncated_line_without_wait_events(self):
+        stream = TTYBuffer()
+        console = relay_console.Console(stream, interval=3600, width=lambda: 20)
+        console.update("assignment worker with a long description")
+        console.update("assignment validate")
+        console.close()
         output = stream.getvalue()
-        self.assertIn("WAIT", output)
-        self.assertIn("deadline=30s", output)
-        self.assertIn("DONE", output)
-        self.assertNotIn("\\r", output)
+        self.assertIn("\r", output)
+        self.assertNotIn("WAIT", output)
+        self.assertTrue(all(len(part) <= 19 for part in output.split("\r") if part.strip()))
+
+    def test_redirected_waits_are_plain_and_rate_limited(self):
+        stream, clock = io.StringIO(), [0.0]
+        console = relay_console.Console(stream, interval=3600, monotonic=lambda: clock[0])
+        console.update("TASK-0001 worker")
+        console.update("TASK-0001 worker")
+        clock[0] = 299
+        console.update("TASK-0001 worker")
+        clock[0] = 300
+        console.update("TASK-0001 worker")
+        console.close()
+        output = stream.getvalue()
+        self.assertEqual(output.count("WAIT"), 2)
+        self.assertNotIn("\r", output)
+        self.assertNotRegex(output, r"WAIT\s+[|/\\-]\s")
+
+    def test_concurrent_events_clear_and_redraw_without_interleaving(self):
+        stream = TTYBuffer()
+        console = relay_console.Console(stream, interval=3600, width=lambda: 80)
+        console.update("TASK-0001 worker")
+        threads = [threading.Thread(target=console.emit, args=("DONE",), kwargs={"operation": f"step-{number}"}) for number in range(8)]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join()
+        console.close()
+        output = stream.getvalue()
+        for number in range(8):
+            self.assertEqual(output.count(f"operation=step-{number}"), 1)
+        self.assertEqual(output.count("DONE"), 8)
+
+    def test_close_cleans_live_line_after_failures_and_interrupts(self):
+        for failure in (RuntimeError("failure"), KeyboardInterrupt()):
+            stream = TTYBuffer()
+            console = relay_console.Console(stream, interval=3600)
+            try:
+                console.update("working")
+                raise failure
+            except (RuntimeError, KeyboardInterrupt):
+                pass
+            finally:
+                console.close()
+            self.assertRegex(stream.getvalue(), r"\r +\r$")
 
 
 class ContractTests(unittest.TestCase):
@@ -1262,6 +1323,34 @@ class DeterministicCoreTests(unittest.TestCase):
         bugs = [{"status": status} for status in ("backlog", "resolved", "active", "needs-user", "waiting-provider", "resolved")]
         line = run.runtime_progress(state, bugs)
         self.assertEqual(line, "tasks 1/1 integrated | bugs active=1 needs-user=1 waiting-provider=1 resolved=2 backlog=1 | agents 0/1 | idle")
+
+    def test_heartbeat_only_refreshes_progress_and_preserves_periodic_save(self):
+        class Store:
+            state = {"agentTimeoutSeconds": 2, "workerLimit": 1, "taskTotal": 1, "taskStates": {}, "activeProcesses": {}}
+            saves = 0
+
+            def save(self):
+                self.saves += 1
+
+        class Stop:
+            waits = 0
+
+            def wait(self, _timeout):
+                self.waits += 1
+                return self.waits > 1
+
+        class Time:
+            values = iter((0, 1, 1))
+
+            def monotonic(self):
+                return next(self.values)
+
+        store = Store()
+        with patch("run.load_bugs", return_value=[]), patch("run.relay_console.interactive", return_value=True), patch("run.relay_console.update") as update, patch("run.time", Time()):
+            run.heartbeat_loop(store, Stop())
+        self.assertEqual(update.call_count, 2)
+        update.assert_called_with("tasks 0/1 integrated | bugs 0 | agents 0/1 | idle")
+        self.assertEqual(store.saves, 1)
 
     def test_azure_policy_pass_failure_conflict_and_timeout(self):
         with tempfile.TemporaryDirectory() as root:
