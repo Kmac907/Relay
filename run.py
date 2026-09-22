@@ -4076,7 +4076,7 @@ def plan_schema_two_migration(store: StateStore, tasks: list[dict]) -> dict:
         task_state = store.state.get("taskStates", {}).get(assignment_id, {})
         candidate = session.get("currentCandidateSha") or session.get("reviewedSha") or session.get("initialCandidateSha") or task_state.get("candidateSha")
         record = store.state.get("worktrees", {}).get(assignment_id)
-        if record:
+        if record and task_state.get("phase") != "integrated":
             worktree, _ = recovery_worktree(store, assignment_id)
             head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
             dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout
@@ -4116,18 +4116,22 @@ def apply_schema_two_migration(store: StateStore, tasks: list[dict], planned: di
         if legacy:
             session["legacyReviewState"] = legacy
         findings = migration["findings"]
-        accepted = record_findings(store, assignment_id, findings) if findings else []
+        accepted = record_findings(store, assignment_id, findings) if findings and migration["phase"] != "approved" else []
         session.update(
             phase=migration["phase"], reviewResult={"assignmentId": assignment_id, "candidateSha": migration["candidateSha"], "findings": findings} if findings else None,
-            acceptedBlockerIds=[bug["id"] for bug in accepted], currentCandidateSha=migration["candidateSha"],
+            acceptedBlockerIds=[bug["id"] for bug in accepted] if migration["phase"] != "approved" else session.get("acceptedBlockerIds", []), currentCandidateSha=migration["candidateSha"],
             approvedRepairPaths=sorted({path for finding in findings if finding["action"] == "repair" for path in finding["repairPaths"]}),
             reviewCallLimit=max(session.get("reviewCallsStarted", 0), review_call_limit(store.state["fixLoopLimit"], store.state["formatRetryAllowance"])),
         )
         if migration["phase"] == "approved":
             session["reviewedSha"] = migration["candidateSha"]
             session["finalReviewedSha"] = migration["candidateSha"]
-        store.state["taskStates"].setdefault(assignment_id, {})["phase"] = migration["phase"]
-    store.state["schemaVersion"] = STATE_SCHEMA_VERSION
+        task_state = store.state["taskStates"].setdefault(assignment_id, {})
+        if task_state.get("phase") != "integrated":
+            task_state["phase"] = migration["phase"]
+    store.state.update(schemaVersion=STATE_SCHEMA_VERSION, phase="build")
+    store.state.pop("error", None)
+    store.state.pop("blockedEvidence", None)
     store.state["auditDispositionsCompleted"] = store.state.pop("auditTriageCompleted", store.state.get("auditDispositionsCompleted", False))
     store.state.setdefault("schemaMigrationHistory", []).append({"from": 2, "to": 3, "migratedAt": datetime.now(timezone.utc).isoformat()})
     store.state["pendingSchemaMigration"] = None
@@ -4265,7 +4269,7 @@ def main(argv: list[str] | None = None) -> int:
                 heartbeat.join()
                 relay_console.close()
     except Exception as error:
-        if "store" in locals() and isinstance(store, StateStore):
+        if not (args.recover and not args.confirm) and "store" in locals() and isinstance(store, StateStore):
             with contextlib.suppress(Exception):
                 store.update(lambda state: state.update(phase="blocked", error=str(error), blockedEvidence={"type": type(error).__name__, "message": str(error)}))
         relay_console.emit("FAILED", operation="campaign", reason=str(error).splitlines()[0])
