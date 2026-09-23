@@ -4,14 +4,28 @@
   <img src="assets/relay-icon.png" alt="Relay" width="180">
 </p>
 
-Relay is a bounded, resumable coordinator that turns requirements into isolated GitHub or Azure DevOps pull requests. Its workflow is:
+Relay is a crash-safe, parallel Ralph-style scheduler. It gives each agent one small assignment in a fresh context, validates the resulting commit independently, reviews it, and serializes integration through the provider.
 
 ```text
-vertical slice -> focused validation -> campaign validation -> one review
--> bounded blocker repair -> merge -> next slice -> one finite audit
+reviewed finite plan
+        |
+        v
+ready queue ----> fresh Worker ----> focused + campaign validation
+   ^                                      |
+   |                                      v
+   +---- repair/bug <---- incremental review <---- initial review
+   |                                                   |
+   |                                               approved
+   |                                                   v
+   +---- dependencies unlocked <---- serialized integration + provider checks
+                                                        |
+                                                        v
+                                              one audit -> final validation
 ```
 
-The four public tools are directly executable Python 3.11+ scripts and use only the standard library. Relay shells out to `git`, `codex`, and either `gh` or `az`.
+Independent assignments, reviews, and repairs run concurrently. Integration is serialized, and only the exact SHA that passed validation, review, and provider checks may merge.
+
+Relay is a set of directly executable Python 3.11+ scripts using only the standard library. It shells out to `git`, `codex`, and either `gh` or `az`.
 
 ## Requirements
 
@@ -32,166 +46,132 @@ python repo.py --path C:\Code\Projects\Example --github OWNER/Example --private
 python repo.py --path C:\Code\Projects\Example --azure-devops ORGANIZATION PROJECT Example
 ```
 
-GitHub requires exactly one of `--private` or `--public`. Azure repository visibility comes from its project. The provider options are mutually exclusive.
-
-Native tools are equally valid alternatives:
-
-```powershell
-gh repo create OWNER/Example --private --clone
-az repos create --organization https://dev.azure.com/ORGANIZATION --project PROJECT --name Example
-```
-
-For an existing repository, skip repository creation.
+For an existing repository, skip this step.
 
 ## Plan and run
-
-Create requirements in Markdown, then generate and inspect a bounded plan:
 
 ```powershell
 python plan.py `
   --repo C:\Code\Projects\Example `
   --requirements C:\path\to\requirements.md `
   --workers 3 `
-  --task-attempts 3 `
-  --fix-loops 2
+  --campaign-active-timeout 86400 `
+  --campaign-agent-calls 100
 
 python run.py --repo C:\Code\Projects\Example --dry-run
+python run.py --repo C:\Code\Projects\Example
 ```
 
-`PLAN.md` records the selected base SHA, vertical-slice dependencies and paths, acceptance criteria, focused validation, mandatory campaign validation, task-attempt limit, and shared fix limit. The first run must use matching limits and an unchanged base.
+The planner creates the smallest independently verifiable assignments that fit one fresh context. It prefers vertical behavior; an enabling assignment is valid only with focused validation and a named consumer in the same finite plan. The plan receives one bounded review before execution.
 
-```powershell
-python run.py `
-  --repo C:\Code\Projects\Example `
-  --workers 3 `
-  --task-attempts 3 `
-  --fix-loops 2
-```
+`PLAN.md` is a reviewed immutable contract containing the requirement source or snapshot, objective, task graph, paths, non-goals, acceptance criteria, validation, campaign resource ceilings, and prompt-template digest. `tasks.md` is its coordinator-owned mutable execution projection.
 
-Normal restarts use the same short command. Relay reloads persisted limits and provider identity, replays ledger intents, and continues a safe recorded phase. Read status without changing the campaign:
+Read status without changing state:
 
 ```powershell
 python status.py --repo C:\Code\Projects\Example
+python status.py --repo C:\Code\Projects\Example --markdown
 ```
 
-`status.py` uses the same campaign summary as `run.py`: phase, completed work, blockers, attempt/fix budgets, and an exact `NEXT` command.
+## Agents and prompts
 
-## Architecture
+Relay has seven agent roles:
+
+| Role | Access | Responsibility |
+| --- | --- | --- |
+| Scout | Read-only | Optional bounded repository discovery during planning. |
+| Planner | Read-only | Produce the finite task graph and repair a rejected plan. |
+| Plan Reviewer | Read-only | Review the plan and verify its one repair. |
+| Worker | Worktree write | Implement task, repair, bug, or integration-repair mode. |
+| Reviewer | Read-only | Perform one initial review or an incremental repair review. |
+| Audit Planner | Read-only | Define one finite final audit scope set. |
+| Auditor | Read-only | Inspect one audit scope and return evidence-backed findings. |
+
+Scheduling, tests, Git/worktree operations, provider polling, integration, output validation, state changes, and cycle detection are coordinator functions, not agents.
+
+Stable role policy lives in `prompts/*.md`. Python appends a canonical JSON handoff packet built from applicable `AGENTS.md` files, the assignment contract, Git SHAs, dependency results, bugs, validation evidence, prior attempts, review epochs, and relevant merged learnings. The fully rendered execution prompt and its template/context/prompt hashes are recorded under `.relay/logs/prompts/` and `.relay/state.json`. Safety boundaries are also enforced by Python; prompt text is not a security boundary.
+
+Only relevant context is selected. Workers receive path- or dependency-related learnings and history; reviewers and auditors remain independent. Raw logs are referenced when needed rather than appended wholesale.
+
+## Information model
+
+| Artifact | Authority |
+| --- | --- |
+| `AGENTS.md` | Tracked project rules, commands, architecture, and conventions. |
+| `PLAN.md` | Immutable reviewed campaign contract and requirement snapshot. |
+| `tasks.md` | Mutable task execution ledger derived from the plan. |
+| `bugs.md` | Active and resolved defect ledger. |
+| `BACKLOG.md` | Deferred supported findings retained after cleanup. |
+| Git and provider PRs | Implementation history and merged SHAs. |
+| `.relay/state.json` | Runtime phases, work items, leases, evidence, review epochs, fingerprints, prompt records, dependency summaries, and scoped learnings. |
+| `.relay/logs/` | Raw agent, validation, provider, and rendered-prompt evidence. |
+
+There is no authoritative `implementation.md` or `learnings.jsonl`. `status.py --markdown` is a derived human view. Only `run.py` writes active ledgers and runtime state.
+
+Relay accepts a tracked project-owned `AGENTS.md` as authoritative. It creates the generic target file only when one is absent. Project instructions must not contain Relay orchestration commands such as selecting work, managing PRs, or editing ledgers.
+
+## Autonomous execution
+
+The unified queue contains planned tasks, validation repairs, review repairs, bugs, and integration repairs. Each work item is leased to an isolated worktree and fresh Worker. Provider polling remains a coordinator operation and does not occupy an agent slot.
 
 ```text
-[Requirements] -> [Plan] -> [Vertical slice]
-                              ^       |
-                              |       v
-                              |  [Focused validation] -> [Campaign validation] -> [One review]
-                              |          ^                                         |  \
-                              |          +-------------- bounded repair -----------+   +-> [needs-user]
-                              |                                                    |      unsafe or exhausted
-                              |                                           approved v
-                              |                                              [Pull request]
-                              |                                                    |
-                              |                                                    v
-                              |                                                 [Merge]
-                              |                                                    |
-                              |                                                    v
-                              |                                             <More slices?>
-                              |                                               /         \
-                              +-------------------------- [Next slice] <- yes           no -> [One finite audit]
+ready -> leased -> running -> candidate -> accepted -> integrated
+                           |
+                           +-> repair or bug work item
 ```
 
-`plan.py` reads the requirements, tracked tree, base SHA, and target `AGENTS.md`. It may run fixed read-only scout scopes concurrently, then creates the fewest independently useful vertical slices. One read-only plan review may trigger one bounded repair and exact verification. Every structured agent result is validated before output is accepted.
+Every candidate runs focused validation followed by campaign validation. A task receives one initial review. Later epochs verify only unresolved findings, claimed resolutions, and the repair delta; they may add only blockers introduced by that delta. Review never returns to the initial phase or widens the assignment.
 
-`run.py` is the only writer of active campaign state and ledgers. Before any Worker starts, it validates the campaign commands at the planned base in a detached worktree. It optionally publishes a generated target `AGENTS.md` in its own PR. Ready slices then run concurrently when dependencies and path ownership allow it.
+Relay does not stop a productive repair because an arbitrary per-task count was reached. It persists fingerprints containing the candidate tree, validation failure evidence, open finding IDs, integration base, repair scope, and provider state. An unchanged candidate, repeated fingerprint, A-B-A cycle, or irrelevant code change with unchanged failures/findings stops the affected work item. Relevant changes may continue until evidence advances, a state cycles, or the campaign resource ceiling is reached. Process deadlines, provider deadlines, the campaign active-time ceiling, and the campaign agent-call ceiling still bound resource use.
 
-Each Worker receives one isolated branch and worktree. Relay persists the task attempt before launch, requires a clean committed descendant, validates ancestry and changed paths, runs focused validation followed by campaign validation, and records the exact command, result, and log. A failed candidate may return to the same Worker path only while both task and shared fix budgets remain. The fix is reserved and persisted before launch.
+Workers may propose concise path-scoped learnings. Relay activates them only after the evidence candidate merges, marks them stale when supporting paths change, and injects only relevant active learnings into later Worker contexts.
 
-One read-only slice review runs after validation. Candidate-introduced P0/P1 blockers may be repaired; P2 or supported pre-existing findings enter the backlog; P3 findings are discarded; genuine decisions stop in `needs-user`. Review repairs move only forward through `repair-N` and `verify-N`. Validation, review, integration, merge-conflict, and provider-check repairs all consume `taskStates[id].fixAttemptsStarted`.
+## Findings, bugs, and integration
 
-Only a reviewed SHA is published. Relay requires the provider-reported head to match that SHA, waits within bounded provider deadlines, and merges through GitHub or Azure DevOps policy. Completed worktrees and branches are removed after integration.
+Reviewers and auditors report evidence only: severity, location, observable failure, reproduction text, an exact requirement citation, evidence, candidate provenance, and affected evidence paths. They never select actions, IDs, status, or repair scope, and Relay never executes their reproduction text. `affectedPaths` must be repository-relative, must contain the location file, and never grants write access.
 
-After planned slices merge, Relay runs exactly one finite audit. Audit scopes and calls are bounded. Accepted audit fixes validate and merge without starting another full review or audit. Deferred findings are written to human-readable `BACKLOG.md` with title, severity, requirement, failure, and evidence. A later `plan.py --requirements BACKLOG.md` treats it as ordinary requirements and plans its tests and commands normally.
+`run.py` derives stable IDs and dispositions. Unsupported provenance and P3 findings are discarded; P2 findings enter `BACKLOG.md`; candidate-introduced P0/P1 findings become bounded review repairs or `needs-user` when they exceed the existing maximum scope. Pre-existing and audit P0/P1 findings become bug work only when their normalized requirement exactly matches supplied requirement or acceptance text; otherwise they enter the backlog. Coordinator disposition and reason are persisted with every finding and bug. Backlog and discarded findings do not block a candidate; `needs-user` takes priority over repair, and incremental approval requires every prior blocker to be explicitly resolved with no new blocker.
 
-Coordinator output combines timestamped events with a live TTY spinner showing compact campaign progress. Redirected output receives the same progress as rate-limited `WAIT` events. Raw agent, provider, and validation logs remain under `.relay/logs/`.
+Bugs carry stable IDs, provenance, requirement, reproduction, evidence, paths, validation, and prior fingerprints. Their fixes use the same validation and incremental-review pipeline as tasks.
 
-## State contract
+Approved candidates enter one integration lock. Relay refreshes `main`, reconciles the candidate, validates any changed SHA, incrementally reviews an integration-resolution diff, pushes the exact reviewed SHA, verifies the provider-reported head and checks, merges, records proof, and then unlocks dependents.
 
-Schema 3 is the only executable campaign schema. Extra obsolete keys in schema-3 state are ignored. Earlier schemas are rejected before mutation.
+After planned work integrates, Relay runs one finite audit. Audit bugs use the normal queue; fixes never start another audit. Final campaign validation runs after the audit queue settles. A concrete final-validation failure becomes a bug, not a recursive audit.
 
-To replace an unsupported campaign, extract its incomplete requirements and backlog items, archive the old campaign outside the active repository state, and generate a fresh schema-3 plan. Do not edit `state.json` directly. A schema-3 campaign stopped in a removed recovery phase is also rejected and must be replanned.
-
-The authoritative runtime facts are:
-
-- `tasks.md` and `bugs.md` for active ledgers;
-- `.relay/state.json` for phases, counters, deadlines, provider identity, PRs, and worktrees;
-- one `attemptCounters[id]` task-attempt counter;
-- one `taskStates[id].fixAttemptsStarted` shared repair counter.
-
-Only `run.py` changes those files. Reservations and counters are saved before external processes, so crashes never create free retries.
+Completion requires all planned tasks satisfied or integrated, all blocking findings and included audit bugs resolved, deferred findings recorded, no active candidate or PR, final campaign validation passing, and all worktrees safely removed.
 
 ## Recovery
 
-Recovery has three explicit intents and always previews before mutation:
+Normal restarts reload schema-4 state, reconcile persisted reservations and live provider state, and continue a safe recorded phase. Resource exhaustion or a genuine decision requires an explicit recovery action, which previews before mutation:
+
+Malformed JSON and schema or validator failures use `--format-retries` as a fresh-agent correction allowance. Relay freezes the original context and schema, records the failed call and next reservation, and supplies the correction agent with exact JSON paths, stable error codes, and the rejected response as delimited untrusted data. Rejected responses are secret-redacted, included up to 64 KiB with a full hash and truncation flag, and saved under `.relay/logs/rejected/`. Corrections consume the campaign agent-call ceiling but do not rerun implementation or validation, increment Worker implementation attempts, create repair work, or advance review epochs. Process failures and timeouts are operational failures and are not corrected this way. Exhaustion records a `protocol-failed` coordinator operation while preserving the candidate and workflow phase.
 
 ```powershell
-# Resume the exact safe phase after repairing an external condition
 python run.py --repo C:\Code\Projects\Example --recover
 python run.py --repo C:\Code\Projects\Example --recover --confirm
 
-# Grant one persisted additional Worker assignment
-python run.py --repo C:\Code\Projects\Example --recover --grant-attempt TASK-0001
-python run.py --repo C:\Code\Projects\Example --recover --grant-attempt TASK-0001 --confirm
+python run.py --repo C:\Code\Projects\Example --recover --grant-agent-calls 20
+python run.py --repo C:\Code\Projects\Example --recover --grant-agent-calls 20 --confirm
 
-# Move all selected blockers for an assignment to BACKLOG.md
+python run.py --repo C:\Code\Projects\Example --recover --grant-active-seconds 3600
+python run.py --repo C:\Code\Projects\Example --recover --grant-active-seconds 3600 --confirm
+
 python run.py --repo C:\Code\Projects\Example --recover --defer-blocker BUG-0001
 python run.py --repo C:\Code\Projects\Example --recover --defer-blocker BUG-0001 --confirm
 ```
 
-Preview is read-only. Confirmation journals the action, applies it, and exits without launching a Worker; follow the printed `NEXT` command.
+Reservations are persisted before external processes so crashes never grant a free call. Unexpected dirt, SHA drift, path drift, provider-head drift, active processes, missing authority, and unknown phases stop without guessing.
 
-`resume` revalidates ledger ownership, the resolved worktree path, cleanliness, candidate ancestry and SHA, changed paths, recorded phase, and provider state. Interrupted validation reruns its recorded command without refunding its counter. Provider recovery queries the live PR and source SHA; confirmed resume may grant one provider retry after credentials or authorization are repaired. `defer` restores the initial reviewed candidate and moves every selected blocker for that assignment to the backlog.
-
-Unexpected dirt, SHA drift, scope drift, provider-head drift, active processes, or an unknown phase stops in `needs-user`. Relay preserves evidence and does not guess. `waiting-provider` means checks or approvals are still pending.
-
-## Providers
-
-| | GitHub | Azure DevOps Services |
-| --- | --- | --- |
-| Origin | Canonical HTTPS or SSH | Canonical Azure HTTPS or SSH, including `visualstudio.com` |
-| PR text | Multiline body file and idempotent `pr edit` | Multiline Markdown description and idempotent `repos pr update` |
-| Merge | `squash`, `merge`, or `rebase` | `squash` or no-fast-forward `merge`; `rebase` fails preflight |
-| Gate | Required checks and approvals | Blocking branch policies; queued/running waits, rejected/broken fails |
-
-Relay never bypasses provider policy. Push, PR creation, metadata refresh, checks, merge, and reconciliation have hard deadlines and persisted retry counters.
-
-## Cleanup and next campaign
-
-After completion, preview and confirm cleanup:
+## Cleanup
 
 ```powershell
 python run.py --repo C:\Code\Projects\Example --cleanup
 python run.py --repo C:\Code\Projects\Example --cleanup --confirm
 ```
 
-Cleanup is permanent and only allowed for a complete inactive campaign with no worktrees or open Relay PRs. It validates resolved paths and merge proof before removing `tasks.md`, `bugs.md`, Relay-format plan files, and `.relay`. It preserves `BACKLOG.md`, `AGENTS.md`, source, and Git history.
+Cleanup is allowed only for a complete inactive campaign. It validates resolved paths and merge proof, then removes `tasks.md`, `bugs.md`, Relay plan files, and `.relay`. It preserves `BACKLOG.md`, `AGENTS.md`, source, and Git history.
 
-Start the next campaign directly from the backlog:
-
-```powershell
-python plan.py --repo C:\Code\Projects\Example --requirements C:\Code\Projects\Example\BACKLOG.md
-python run.py --repo C:\Code\Projects\Example
-```
-
-## Files and development
-
-| File | Responsibility |
-| --- | --- |
-| `repo.py` | Create and optionally publish a repository. |
-| `plan.py` | Inspect, plan, review, and validate before writing `PLAN.md`. |
-| `run.py` | Coordinate the campaign and exclusively write active state and ledgers. |
-| `status.py` | Print the shared read-only campaign summary. |
-| `relay_console.py` | Emit synchronous timestamped coordinator events. |
-| `test_workflow.py` | Deterministic workflow, recovery, provider, concurrency, and cleanup checks. |
-
-Run the complete local gate:
+## Development
 
 ```powershell
 python -m unittest -v test_workflow.py
