@@ -12,6 +12,7 @@ from run import campaign_summary, parse_bugs, parse_tasks
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Show the persisted Relay campaign summary without changing state.")
     result.add_argument("--repo", required=True, type=Path)
+    result.add_argument("--markdown", action="store_true", help="render a non-authoritative Markdown campaign report")
     return result
 
 
@@ -25,7 +26,10 @@ def main(argv: list[str] | None = None) -> int:
     _, tasks = parse_tasks(tasks_path.read_text(encoding="utf-8"), runtime=True)
     _, bugs = parse_bugs(bugs_path.read_text(encoding="utf-8"))
     lines, next_line = campaign_summary(state, tasks, bugs)
-    print("\n".join([*lines, f"NEXT {next_line}"]))
+    if args.markdown:
+        print("\n".join(["# Relay campaign status", "", *[f"- {line.removeprefix('- ')}" for line in lines], "", "## Next action", "", next_line]))
+    else:
+        print("\n".join([*lines, f"NEXT {next_line}"]))
     return 0
 
 
