@@ -84,12 +84,12 @@ ROLE_JSON_SCHEMAS = {
     }),
     "plan-reviewer": _json_object({"assignmentId": {"type": "string"}, "candidateSha": {"type": "string"}, "findings": {"type": "array", "items": FINDING_JSON}}),
     "slice-reviewer": _json_object({
-        "assignmentId": {"type": "string"}, "mode": {"const": "initial"}, "reviewEpoch": {"type": "integer", "minimum": 0},
+        "assignmentId": {"type": "string"}, "mode": {"type": "string", "enum": ["initial"]}, "reviewEpoch": {"type": "integer", "minimum": 0},
         "candidateSha": {"type": "string"}, "resolvedFindingIds": {"type": "array", "maxItems": 0},
         "findings": {"type": "array", "items": EVIDENCE_FINDING_JSON},
     }),
     "verification-reviewer": _json_object({
-        "assignmentId": {"type": "string"}, "mode": {"const": "incremental"}, "reviewEpoch": {"type": "integer", "minimum": 1},
+        "assignmentId": {"type": "string"}, "mode": {"type": "string", "enum": ["incremental"]}, "reviewEpoch": {"type": "integer", "minimum": 1},
         "candidateSha": {"type": "string"}, "resolvedFindingIds": _string_array(),
         "findings": {"type": "array", "items": EVIDENCE_FINDING_JSON},
     }),
@@ -1389,7 +1389,7 @@ def invoke_agent(store: StateStore, semaphore: threading.Semaphore, repo: Path, 
             store.update(lambda state: state["activeProcesses"][process_id].update(status="running", startedAt=datetime.now(timezone.utc).isoformat()))
             start_operation(store, assignment_id, operation, store.state["agentTimeoutSeconds"])
             relay_console.emit("START", f"operation={operation}" + (f" mode={mode}" if mode else "") + f" assignment={assignment_id} call={number} deadline={store.state['agentTimeoutSeconds']}s")
-            completed = bounded_run(command, input=prompt, timeout=store.state["agentTimeoutSeconds"], env=assignment_environment(store, assignment_id, repo))
+            completed = bounded_run(command, input=prompt, timeout=store.state["agentTimeoutSeconds"], env=assignment_environment(store, assignment_id, repo), check=False)
         atomic_write(log, completed.stdout + ("\n--- stderr ---\n" + completed.stderr if completed.stderr else ""))
         if completed.returncode or not output.is_file():
             raise RuntimeError(f"{role} failed with exit code {completed.returncode}; log: {log}")
