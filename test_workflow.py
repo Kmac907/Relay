@@ -1269,13 +1269,15 @@ class DeterministicCoreTests(unittest.TestCase):
                 "error": "slice-reviewer failed with exit code 1", "validationHistory": [{"outcome": "passed"}],
             }
             store.state["reviewSessions"][assignment_id] = {
-                "phase": "slice-review", "initialCandidateSha": "candidate", "reviewResult": None,
+                "phase": "blocked", "initialCandidateSha": "candidate", "reviewResult": None,
                 "acceptedBlockerIds": [], "reviewCallsStarted": 1,
             }
             store.state["worktrees"][assignment_id] = {"path": root, "root": root, "branch": "relay/test/TASK-0001", "baseSha": "base"}
+            schema_json = json.dumps(run.ROLE_JSON_SCHEMAS["slice-reviewer"], sort_keys=True, separators=(",", ":"))
             store.state["protocolSequences"]["review"] = {
                 "assignmentId": assignment_id, "role": "slice-reviewer", "status": "operational-failed",
-                "attemptsStarted": 1, "attemptLimit": 3,
+                "attemptsStarted": 1, "attemptLimit": 3, "schemaSha256": hashlib.sha256(schema_json.encode()).hexdigest(),
+                "context": {"candidateSha": "candidate"},
             }
             store.save()
             snapshot = {"headSha": "candidate", "branch": "relay/test/TASK-0001"}
@@ -1285,10 +1287,23 @@ class DeterministicCoreTests(unittest.TestCase):
                 self.assertEqual(actions[0]["protocolAttemptsStarted"], 1)
                 run.apply_recovery(store, [assignment], actions)
             self.assertEqual(store.state["taskStates"][assignment_id]["phase"], "slice-review")
+            self.assertEqual(store.state["reviewSessions"][assignment_id]["phase"], "slice-review")
             self.assertEqual(store.state["protocolSequences"]["review"]["status"], "open")
             self.assertEqual(store.state["protocolSequences"]["review"]["attemptsStarted"], 1)
             self.assertEqual(store.state["campaignAgentCallsStarted"], before_calls)
             self.assertEqual(store.state["reviewSessions"][assignment_id]["reviewCallsStarted"], 1)
+
+            store.state["phase"] = store.state["taskStates"][assignment_id]["phase"] = "blocked"
+            store.state["taskStates"][assignment_id]["error"] = "slice-reviewer failed with exit code 1"
+            store.state["reviewSessions"][assignment_id]["phase"] = "blocked"
+            store.state["protocolSequences"]["review"]["status"] = "operational-failed"
+            corrected = run.ROLE_JSON_SCHEMAS["slice-reviewer"] | {"title": "corrected"}
+            with patch.dict(run.ROLE_JSON_SCHEMAS, {"slice-reviewer": corrected}), patch("run._recovery_snapshot", return_value=snapshot):
+                actions = run.plan_recovery(store, [assignment], [])
+                self.assertNotIn("protocolSequenceId", actions[0])
+                run.apply_recovery(store, [assignment], actions)
+            self.assertEqual(store.state["protocolSequences"]["review"]["status"], "operational-failed")
+            self.assertEqual(store.state["protocolSequences"]["review"]["attemptsStarted"], 1)
 
     def test_reconcile_ignores_obsolete_extra_state_keys(self):
         with tempfile.TemporaryDirectory() as root:
