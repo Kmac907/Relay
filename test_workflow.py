@@ -1305,6 +1305,45 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(store.state["protocolSequences"]["review"]["status"], "operational-failed")
             self.assertEqual(store.state["protocolSequences"]["review"]["attemptsStarted"], 1)
 
+    def test_recovery_resumes_persisted_integration_candidate(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task(); assignment_id = assignment["id"]
+            pr = {"number": 11, "state": "OPEN", "headRefOid": "reviewed"}
+            store.state.update(phase="blocked")
+            store.state["taskStates"][assignment_id] = {
+                "phase": "blocked", "candidateSha": "reviewed", "pendingWorkerSha": "repair",
+                "error": "repeated progress fingerprint detected", "pr": pr,
+            }
+            store.state["reviewSessions"][assignment_id] = {"phase": "approved", "reviewedSha": "reviewed"}
+            store.state["worktrees"][assignment_id] = {"path": root, "root": root, "branch": "relay/test/TASK-0001", "baseSha": "base"}
+            snapshot = {"headSha": "repair", "branch": "relay/test/TASK-0001"}
+            with patch("run._recovery_snapshot", return_value=snapshot), patch("run._inspect_pr_readonly", return_value=pr):
+                actions = run.plan_recovery(store, [assignment], [])
+                self.assertEqual(actions[0]["toPhase"], "approved")
+                run.apply_recovery(store, [assignment], actions)
+            self.assertEqual(store.state["taskStates"][assignment_id]["phase"], "approved")
+            self.assertEqual(store.state["taskStates"][assignment_id]["pendingWorkerSha"], "repair")
+
+    def test_recovery_validates_pending_integration_delta_from_reviewed_sha(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task(); assignment_id = assignment["id"]
+            record = {"path": root, "root": root, "branch": "relay/test/TASK-0001", "baseSha": "new-main"}
+            store.state["taskStates"][assignment_id] = {
+                "phase": "blocked", "pendingWorkerSha": "repair", "error": "repeated progress fingerprint detected",
+            }
+            store.state["reviewSessions"][assignment_id] = {"phase": "approved", "reviewedSha": "reviewed", "approvedRepairPaths": []}
+            commands = [
+                subprocess.CompletedProcess([], 0, "repair\n", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ]
+            with patch("run.recovery_worktree", return_value=(Path(root), record)), patch("run.git", side_effect=commands) as git, patch("run.target_changes", return_value=["src/app.py"]) as changes:
+                self.assertEqual(run._recovery_snapshot(store, assignment), {"headSha": "repair", "branch": record["branch"]})
+            self.assertEqual(git.call_args_list[2].args[1:5], ("merge-base", "--is-ancestor", "reviewed", "repair"))
+            changes.assert_called_once_with(store, Path(root), "reviewed", "repair")
+
     def test_reconcile_ignores_obsolete_extra_state_keys(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
@@ -1834,6 +1873,31 @@ class DeterministicCoreTests(unittest.TestCase):
             session = store.state["reviewSessions"][assignment["id"]]
             self.assertEqual((run.fix_attempts_started(store.state, assignment["id"]), session["reviewCallsStarted"], session["reviewedSha"]), (1, 5, "new"))
             self.assertEqual(session["phase"], "approved")
+
+    def test_provider_repair_resumes_candidate_and_verifies_matching_backlog(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task(); assignment_id = assignment["id"]
+            pr = {"number": 1, "state": "OPEN", "url": "x", "headRefOid": "new"}
+            store.state["taskStates"][assignment_id] = {
+                "phase": "approved", "pendingWorkerSha": "new", "fixAttemptsStarted": 1,
+            }
+            store.state["worktrees"][assignment_id] = {"path": root, "branch": "relay/TASK-0001", "baseSha": "base"}
+            store.state["reviewSessions"][assignment_id] = {"phase": "approved", "reviewedSha": "old", "reviewCallsStarted": 1, "reviewCallLimit": 9}
+            bug = ContractTests().backlog_bug(); bug.update(source=assignment_id, allowedPaths=["src/app.py"])
+            run.write_bugs(store, [bug])
+            verification = {"assignmentId": assignment_id, "mode": "incremental", "reviewEpoch": 1, "candidateSha": "new", "resolvedFindingIds": [bug["sourceFindingId"]], "findings": []}
+            def validated(*_args):
+                store.state["taskStates"][assignment_id].pop("pendingWorkerSha")
+                return "new"
+            completed = subprocess.CompletedProcess([], 0, "base\n", "")
+            with patch("run.refresh_integration_base", side_effect=[False, True, True]), patch("run.wait_for_checks", return_value="passed"), patch("run.record_progress") as progress, patch("run.reserve_fix") as reserve, patch("run.invoke_with_replacements", return_value=verification) as agent, patch("run.candidate_integrity"), patch("run.validate_candidate", side_effect=validated), patch("run.publish_candidate", return_value=pr), patch("run.target_changes", return_value=["src/app.py"]), patch("run.validate_publication_proof"), patch("run.inspect_merged_pr", return_value=pr | {"state": "MERGED"}), patch("run.provider_with_retries", return_value=completed), patch("run.mark_integrated"):
+                self.assertTrue(run.merge_assignment(store, threading.Semaphore(1), assignment, Path(root), "relay/TASK-0001", pr, "old"))
+            progress.assert_not_called()
+            reserve.assert_not_called()
+            self.assertEqual(agent.call_args.args[4], "verification-reviewer")
+            self.assertEqual(run.load_bugs(store)[0]["status"], "resolved")
+            self.assertEqual(run.fix_attempts_started(store.state, assignment_id), 1)
 
     def test_existing_pr_and_merged_pr_are_not_duplicated(self):
         with tempfile.TemporaryDirectory() as root:
