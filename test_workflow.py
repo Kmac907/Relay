@@ -1325,13 +1325,23 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(store.state["taskStates"][assignment_id]["phase"], "approved")
             self.assertEqual(store.state["taskStates"][assignment_id]["pendingWorkerSha"], "repair")
 
+            key = f"{assignment_id}:integration-fetch:abc123"
+            store.state.update(phase="blocked")
+            store.state["taskStates"][assignment_id].update(phase="blocked", error=f"Git provider operation exhausted attempts: {key}; log: provider.log")
+            store.state["providerAttemptCounters"][key] = 3
+            with patch("run._recovery_snapshot", return_value=snapshot), patch("run._inspect_pr_readonly", return_value=pr):
+                actions = run.plan_recovery(store, [assignment], [])
+                self.assertNotIn("providerRetryKey", actions[0])
+                run.apply_recovery(store, [assignment], actions)
+            self.assertEqual(store.state["providerAttemptCounters"][key], 3)
+
     def test_recovery_validates_pending_integration_delta_from_reviewed_sha(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
             assignment = ContractTests().task(); assignment_id = assignment["id"]
             record = {"path": root, "root": root, "branch": "relay/test/TASK-0001", "baseSha": "new-main"}
             store.state["taskStates"][assignment_id] = {
-                "phase": "blocked", "pendingWorkerSha": "repair", "error": "repeated progress fingerprint detected",
+                "phase": "blocked", "pendingWorkerSha": "repair", "error": "Git provider operation exhausted attempts: TASK-0001:integration-fetch:abc123; log: provider.log",
             }
             store.state["reviewSessions"][assignment_id] = {"phase": "approved", "reviewedSha": "reviewed", "approvedRepairPaths": []}
             commands = [
@@ -1898,6 +1908,31 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(agent.call_args.args[4], "verification-reviewer")
             self.assertEqual(run.load_bugs(store)[0]["status"], "resolved")
             self.assertEqual(run.fix_attempts_started(store.state, assignment_id), 1)
+
+    def test_successful_git_provider_operation_closes_retry_sequence(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            failed = subprocess.CompletedProcess([], 1, "", "failed")
+            passed = subprocess.CompletedProcess([], 0, "ok", "")
+            with patch("run.git", side_effect=[failed, passed]) as provider:
+                self.assertIs(run.git_provider_with_retries(store, "fetch", Path(root), "fetch"), passed)
+            self.assertEqual(provider.call_count, 2)
+            self.assertNotIn("fetch", store.state["providerAttemptCounters"])
+
+            def timeout(*_args, **_kwargs):
+                persisted = json.loads(store.path.read_text(encoding="utf-8"))
+                self.assertGreaterEqual(persisted["providerAttemptCounters"]["fetch"], 1)
+                raise subprocess.TimeoutExpired("git", 1)
+            with patch("run.git", side_effect=timeout), self.assertRaisesRegex(RuntimeError, "exhausted attempts"):
+                run.git_provider_with_retries(store, "fetch", Path(root), "fetch")
+            self.assertEqual(store.state["providerAttemptCounters"]["fetch"], store.state["providerAttemptLimit"])
+
+            store.state["taskStates"]["TASK-0001"] = {"fixAttemptsStarted": 2}
+            store.state["worktrees"]["TASK-0001"] = {"baseSha": "old"}
+            git_results = [subprocess.CompletedProcess([], 0, "base\n", ""), subprocess.CompletedProcess([], 0, "", "")]
+            with patch("run.git_provider_with_retries") as fetch, patch("run.git", side_effect=git_results):
+                self.assertTrue(run.refresh_integration_base(store, "TASK-0001", Path(root), "candidate", "integration-fetch"))
+            self.assertEqual(fetch.call_args.args[1], "TASK-0001:integration-fetch:candidate:fix-2")
 
     def test_existing_pr_and_merged_pr_are_not_duplicated(self):
         with tempfile.TemporaryDirectory() as root:

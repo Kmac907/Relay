@@ -1882,6 +1882,7 @@ def git_provider_with_retries(store: StateStore, key: str, repo: Path, *args: st
             continue
         log_provider(store, f"{key} exit={last.returncode} git={args}\n{last.stdout}{last.stderr}")
         if last.returncode == 0:
+            store.update(lambda state: state["providerAttemptCounters"].pop(key, None))
             return last
     raise RuntimeError(f"Git provider operation exhausted attempts: {key}; log: {store.path.parent / 'logs' / 'provider.log'}")
 
@@ -2519,7 +2520,8 @@ def wait_for_checks(store: StateStore, assignment_id: str, pr: dict, reviewed_sh
 
 
 def refresh_integration_base(store: StateStore, assignment_id: str, worktree: Path, candidate_sha: str, operation: str) -> bool:
-    git_provider_with_retries(store, f"{assignment_id}:{operation}:{candidate_sha}", worktree, "fetch", "origin", "main")
+    epoch = fix_attempts_started(store.state, assignment_id)
+    git_provider_with_retries(store, f"{assignment_id}:{operation}:{candidate_sha}:fix-{epoch}", worktree, "fetch", "origin", "main")
     current_base = git(worktree, "rev-parse", "origin/main", timeout=store.state["providerTimeoutSeconds"]).stdout.strip()
     store.state["worktrees"][assignment_id]["baseSha"] = current_base
     store.save()
@@ -3280,7 +3282,7 @@ def _recovery_snapshot(store: StateStore, assignment: dict) -> dict:
     pending_integration = (
         head == task_state.get("pendingWorkerSha")
         and task_state.get("phase") == "blocked"
-        and task_state.get("error") == "repeated progress fingerprint detected"
+        and (task_state.get("error") == "repeated progress fingerprint detected" or _integration_failure_key(task_state.get("error"), assignment_id))
         and session.get("phase") == "approved"
         and session.get("reviewedSha")
     )
@@ -3374,7 +3376,8 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
             else:
                 continue
         elif phase == "blocked":
-            if task_state.get("pendingWorkerSha") and session.get("phase") == "approved" and task_state.get("error") == "repeated progress fingerprint detected":
+            error = task_state.get("error")
+            if task_state.get("pendingWorkerSha") and session.get("phase") == "approved" and (error == "repeated progress fingerprint detected" or _integration_failure_key(error, assignment_id)):
                 target = "approved"
                 candidate = None
             else:
@@ -3780,6 +3783,12 @@ def _worktree_setup_failure(value: object) -> bool:
 def _provider_exhaustion(value: object) -> tuple[str, str] | None:
     match = re.match(r"^(Azure DevOps|GitHub) operation exhausted attempts: ([^;\s]+)", _normalized_error(value))
     return (match.group(1), match.group(2)) if match else None
+
+
+def _integration_failure_key(value: object, assignment_id: str) -> str | None:
+    match = re.match(r"^Git provider operation exhausted attempts: ([^;\s]+)", _normalized_error(value))
+    key = match.group(1) if match else ""
+    return key if re.fullmatch(rf"{re.escape(assignment_id)}:integration-fetch:[0-9a-f]+", key) else None
 
 
 def _publication_retry_key(value: object, assignment_id: str) -> str | None:
