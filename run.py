@@ -1882,7 +1882,6 @@ def git_provider_with_retries(store: StateStore, key: str, repo: Path, *args: st
             continue
         log_provider(store, f"{key} exit={last.returncode} git={args}\n{last.stdout}{last.stderr}")
         if last.returncode == 0:
-            store.update(lambda state: state["providerAttemptCounters"].pop(key, None))
             return last
     raise RuntimeError(f"Git provider operation exhausted attempts: {key}; log: {store.path.parent / 'logs' / 'provider.log'}")
 
@@ -2520,8 +2519,7 @@ def wait_for_checks(store: StateStore, assignment_id: str, pr: dict, reviewed_sh
 
 
 def refresh_integration_base(store: StateStore, assignment_id: str, worktree: Path, candidate_sha: str, operation: str) -> bool:
-    epoch = fix_attempts_started(store.state, assignment_id)
-    git_provider_with_retries(store, f"{assignment_id}:{operation}:{candidate_sha}:fix-{epoch}", worktree, "fetch", "origin", "main")
+    git_provider_with_retries(store, f"{assignment_id}:{operation}:{candidate_sha}", worktree, "fetch", "origin", "main")
     current_base = git(worktree, "rev-parse", "origin/main", timeout=store.state["providerTimeoutSeconds"]).stdout.strip()
     store.state["worktrees"][assignment_id]["baseSha"] = current_base
     store.save()
@@ -2546,36 +2544,21 @@ def _merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignm
                     break
             elif status not in {"failed", "repair-required"}:
                 break
-        pending = store.state["taskStates"][assignment_id].get("pendingWorkerSha")
-        if not pending:
-            record_progress(store, assignment_id, worktree, reviewed_sha, assignment["allowedPaths"], f"provider:{status}")
+        record_progress(store, assignment_id, worktree, reviewed_sha, assignment["allowedPaths"], f"provider:{status}")
         repair_mode = "integration-repair" if status == "repair-required" else "repair"
-        fix_number = fix_attempts_started(store.state, assignment_id) if pending else reserve_fix(store, assignment_id, "integration-repair" if repair_mode == "integration-repair" else "validation-repair")
+        fix_number = reserve_fix(store, assignment_id, "integration-repair" if repair_mode == "integration-repair" else "validation-repair")
         blocker = [{"id": f"PROVIDER-{fix_number}", "failure": status, "evidence": f"{provider_name(store.state)} checks or merge readiness failed"}]
         try:
-            if pending:
-                result = {"candidateSha": pending}
-            else:
-                result = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt(repair_mode, assignment, reviewed_sha, blocker, store.state["taskStates"][assignment_id].get("error", "")), mode=repair_mode, review=True)
-                record_worker_output(store, assignment_id, result)
+            result = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt(repair_mode, assignment, reviewed_sha, blocker, store.state["taskStates"][assignment_id].get("error", "")), mode=repair_mode, review=True)
+            record_worker_output(store, assignment_id, result)
             candidate_integrity(store, assignment, worktree, result, reviewed_sha)
             replacement = validate_candidate(store, assignment, worktree, result)
             pr = publish_candidate(store, assignment, worktree, branch, replacement)
-            backlog_bugs = [bug for bug in load_bugs(store) if bug.get("source") == assignment_id and bug.get("status") == "backlog"]
-            changed = target_changes(store, worktree, reviewed_sha, replacement) if backlog_bugs else []
-            repair_bugs = [
-                bug for bug in backlog_bugs
-                if any(scopes_may_overlap(path, affected) for path in changed for affected in bug.get("allowedPaths", []))
-            ]
-            session.update(
-                pendingRepairNumber=fix_number,
-                acceptedBlockerIds=[bug["id"] for bug in repair_bugs],
-                openFindingIds=[bug["sourceFindingId"] for bug in repair_bugs],
-            )
+            session.update(pendingRepairNumber=fix_number, acceptedBlockerIds=[], openFindingIds=[])
             store.save()
             verification = invoke_with_replacements(
                 store, semaphore, worktree, assignment_id, "verification-reviewer",
-                role_prompt("verification-reviewer", assignment, replacement, {"blockers": repair_bugs, "previousCandidate": reviewed_sha, "repairDiff": f"{reviewed_sha}..{replacement}", "providerFailure": status, "expectedReviewEpoch": fix_number, "openFindingIds": session["openFindingIds"]}),
+                role_prompt("verification-reviewer", assignment, replacement, {"previousCandidate": reviewed_sha, "repairDiff": f"{reviewed_sha}..{replacement}", "providerFailure": status, "expectedReviewEpoch": fix_number, "openFindingIds": []}),
                 review=True, validator=lambda value: (validate_incremental_findings(store, worktree, reviewed_sha, replacement, value["findings"]), value)[1],
             )
         except ProtocolExhaustedError:
@@ -2590,15 +2573,7 @@ def _merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignm
             requirements=list(assignment.get("requirementContext", [])) + list(assignment.get("acceptanceCriteria", [])),
         )
         new_blockers = record_findings(store, assignment_id, dispositions)
-        resolved_ids = set(verification["resolvedFindingIds"])
-        if resolved_ids:
-            bugs = load_bugs(store)
-            for bug in bugs:
-                if bug.get("sourceFindingId") in resolved_ids:
-                    bug["status"] = "resolved"
-            write_bugs(store, bugs)
         session.pop("pendingRepairNumber", None)
-        session.update(acceptedBlockerIds=[], openFindingIds=[])
         if new_blockers or any(item["coordinatorDisposition"] == "needs-user" for item in dispositions):
             status = "failed"
             continue
@@ -3279,20 +3254,12 @@ def _recovery_snapshot(store: StateStore, assignment: dict) -> dict:
     }
     if head not in candidates:
         raise RuntimeError(f"recovery refused candidate SHA drift: {assignment_id}")
-    pending_integration = (
-        head == task_state.get("pendingWorkerSha")
-        and task_state.get("phase") == "blocked"
-        and (task_state.get("error") == "repeated progress fingerprint detected" or _integration_failure_key(task_state.get("error"), assignment_id))
-        and session.get("phase") == "approved"
-        and session.get("reviewedSha")
-    )
-    recovery_base = session["reviewedSha"] if pending_integration else record["baseSha"]
-    ancestry = git(worktree, "merge-base", "--is-ancestor", recovery_base, head, timeout=store.state["validationTimeoutSeconds"], check=False)
+    ancestry = git(worktree, "merge-base", "--is-ancestor", record["baseSha"], head, timeout=store.state["validationTimeoutSeconds"], check=False)
     if ancestry.returncode:
         raise RuntimeError(f"recovery refused candidate ancestry drift: {assignment_id}")
-    changed = target_changes(store, worktree, recovery_base, head)
+    changed = target_changes(store, worktree, record["baseSha"], head)
     allowed = assignment["allowedPaths"]
-    if not pending_integration and "approvedRepairPaths" in session:
+    if "approvedRepairPaths" in session:
         approved = session["approvedRepairPaths"]
         if not isinstance(approved, list) or any(not isinstance(path, str) or not valid_relative_path(path) for path in approved):
             raise RuntimeError(f"recovery refused invalid approved repair scope: {assignment_id}")
@@ -3358,7 +3325,6 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
             continue
         phase = task_state.get("phase")
         session = store.state.get("reviewSessions", {}).get(assignment_id, {})
-        protocol = None
         if re.fullmatch(r"(?:repair|verify)-\d+", str(phase)):
             safe = True
         else:
@@ -3375,43 +3341,6 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
                 target = "approved"
             else:
                 continue
-        elif phase == "blocked":
-            error = task_state.get("error")
-            if task_state.get("pendingWorkerSha") and session.get("phase") == "approved" and (error == "repeated progress fingerprint detected" or _integration_failure_key(error, assignment_id)):
-                target = "approved"
-                candidate = None
-            else:
-                candidate = task_state.get("candidateSha")
-            failed = [
-                (sequence_id, sequence) for sequence_id, sequence in store.state.get("protocolSequences", {}).items()
-                if sequence.get("assignmentId") == assignment_id
-                and sequence.get("role") == "slice-reviewer"
-                and sequence.get("status") == "operational-failed"
-            ]
-            schema_sha = hashlib.sha256(json.dumps(ROLE_JSON_SCHEMAS["slice-reviewer"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-            current = [
-                (sequence_id, sequence) for sequence_id, sequence in store.state.get("protocolSequences", {}).items()
-                if sequence.get("assignmentId") == assignment_id
-                and sequence.get("role") == "slice-reviewer"
-                and sequence.get("schemaSha256") == schema_sha
-                and sequence.get("context", {}).get("candidateSha") == candidate
-            ]
-            history = task_state.get("validationHistory", [])
-            if candidate is not None and (
-                not failed or len(current) > 1 or "slice-reviewer" not in str(task_state.get("error", ""))
-                or not candidate or task_state.get("validationCandidateSha") != candidate
-                or session.get("phase") not in {"slice-review", "blocked"} or session.get("initialCandidateSha") != candidate
-                or session.get("reviewResult") is not None or session.get("acceptedBlockerIds")
-                or not history or any(item.get("outcome") != "passed" for item in history)
-                or current and (
-                    current[0][1].get("status") != "operational-failed"
-                    or current[0][1].get("attemptsStarted", 0) >= current[0][1].get("attemptLimit", 0)
-                )
-            ):
-                raise RuntimeError(f"recovery refused removed or unknown phase {phase!r} for {assignment_id}; replan from the incomplete requirements and backlog")
-            if candidate is not None:
-                protocol = current[0] if current else None
-                target = "slice-review"
         elif safe:
             target = phase
             if phase == "implementing":
@@ -3422,10 +3351,6 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
             raise RuntimeError(f"recovery refused removed or unknown phase {phase!r} for {assignment_id}; replan from the incomplete requirements and backlog")
         snapshot = _recovery_snapshot(store, assignments[assignment_id])
         action = {"action": "resume", "assignmentId": assignment_id, "fromPhase": phase, "toPhase": target, **snapshot}
-        if phase == "blocked" and target == "slice-review":
-            action.update(reviewFromPhase=session["phase"], reviewToPhase="slice-review")
-        if protocol:
-            action.update(protocolSequenceId=protocol[0], protocolAttemptsStarted=protocol[1]["attemptsStarted"])
         if target == "candidate-validation":
             action["candidateSha"] = task_state.get("pendingWorkerSha") or task_state.get("validationCandidateSha")
         if target == "approved":
@@ -3501,16 +3426,6 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
                         raise RuntimeError(f"assignment changed after recovery preview: {assignment_id}")
                 if task_state.get("phase") != action["fromPhase"]:
                     raise RuntimeError(f"assignment phase changed after recovery preview: {assignment_id}")
-                if sequence_id := action.get("protocolSequenceId"):
-                    sequence = store.state.get("protocolSequences", {}).get(sequence_id, {})
-                    if sequence.get("status") != "operational-failed" or sequence.get("attemptsStarted") != action["protocolAttemptsStarted"]:
-                        raise RuntimeError(f"review protocol changed after recovery preview: {assignment_id}")
-                    sequence["status"] = "open"
-                if review_phase := action.get("reviewToPhase"):
-                    session = store.state.get("reviewSessions", {}).get(assignment_id, {})
-                    if session.get("phase") != action["reviewFromPhase"]:
-                        raise RuntimeError(f"review session changed after recovery preview: {assignment_id}")
-                    session["phase"] = review_phase
                 task_state["phase"] = action["toPhase"]
                 if action.get("candidateSha") and action["toPhase"] == "candidate-validation":
                     task_state["pendingWorkerSha"] = action["candidateSha"]
@@ -3783,12 +3698,6 @@ def _worktree_setup_failure(value: object) -> bool:
 def _provider_exhaustion(value: object) -> tuple[str, str] | None:
     match = re.match(r"^(Azure DevOps|GitHub) operation exhausted attempts: ([^;\s]+)", _normalized_error(value))
     return (match.group(1), match.group(2)) if match else None
-
-
-def _integration_failure_key(value: object, assignment_id: str) -> str | None:
-    match = re.match(r"^Git provider operation exhausted attempts: ([^;\s]+)", _normalized_error(value))
-    key = match.group(1) if match else ""
-    return key if re.fullmatch(rf"{re.escape(assignment_id)}:integration-fetch:[0-9a-f]+", key) else None
 
 
 def _publication_retry_key(value: object, assignment_id: str) -> str | None:
