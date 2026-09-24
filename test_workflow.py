@@ -632,6 +632,20 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertIn('"code": "json-parse"', prompts[1])
             self.assertRegex(prompts[1], r"line 2, column 1")
 
+    def test_agent_operational_failure_is_logged(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); store = self.state_store(root)
+            assignment = ContractTests().task(); assignment_id = assignment["id"]
+            store.state["taskStates"][assignment_id] = {"phase": "candidate-validation", "candidateSha": "abc"}
+            run.ensure_review_session(store, assignment_id, "abc")
+            failed = subprocess.CompletedProcess(["codex"], 1, "standard output", "invalid schema")
+            with patch("run.bounded_run", return_value=failed) as command, self.assertRaisesRegex(RuntimeError, r"slice-reviewer failed with exit code 1; log:"):
+                run.invoke_with_replacements(store, threading.Semaphore(1), root, assignment_id, "slice-reviewer", run.role_prompt("slice-reviewer", assignment, "abc", {"expectedReviewEpoch": 0, "openFindingIds": []}), review=True)
+            self.assertFalse(command.call_args.kwargs["check"])
+            log = root / ".relay" / "logs" / f"{assignment_id}-slice-reviewer-1.log"
+            self.assertEqual(log.read_text(encoding="utf-8"), "standard output\n--- stderr ---\ninvalid schema")
+            self.assertEqual(next(iter(store.state["protocolSequences"].values()))["status"], "operational-failed")
+
     def test_reviewer_protocol_exhaustion_preserves_candidate_and_epoch(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root); store = self.state_store(root, format_retries=1)
@@ -1999,6 +2013,8 @@ class DeterministicCoreTests(unittest.TestCase):
         self.assertEqual(set(run.ROLE_JSON_SCHEMAS), set(run.AGENT_SCHEMAS))
         self.assertNotIn("implementer", run.ROLE_JSON_SCHEMAS)
         self.assertNotIn("repairer", run.ROLE_JSON_SCHEMAS)
+        for role, mode in (("slice-reviewer", "initial"), ("verification-reviewer", "incremental")):
+            self.assertEqual(run.ROLE_JSON_SCHEMAS[role]["properties"]["mode"], {"type": "string", "enum": [mode]})
         self.assertEqual({path.name for path in run.PROMPTS.glob("*.md")}, {"scout.md", "planner.md", "plan-reviewer.md", "worker.md", "reviewer.md", "audit-planner.md", "auditor.md"})
         self.assertIn("AUDIT-NNNN", run.prompt_template("audit-planner"))
 
