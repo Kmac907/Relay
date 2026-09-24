@@ -85,7 +85,7 @@ ROLE_JSON_SCHEMAS = {
     "plan-reviewer": _json_object({"assignmentId": {"type": "string"}, "candidateSha": {"type": "string"}, "findings": {"type": "array", "items": FINDING_JSON}}),
     "slice-reviewer": _json_object({
         "assignmentId": {"type": "string"}, "mode": {"type": "string", "enum": ["initial"]}, "reviewEpoch": {"type": "integer", "minimum": 0},
-        "candidateSha": {"type": "string"}, "resolvedFindingIds": {"type": "array", "maxItems": 0},
+        "candidateSha": {"type": "string"}, "resolvedFindingIds": {**_string_array(), "maxItems": 0},
         "findings": {"type": "array", "items": EVIDENCE_FINDING_JSON},
     }),
     "verification-reviewer": _json_object({
