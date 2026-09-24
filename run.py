@@ -3343,24 +3343,35 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
             else:
                 continue
         elif phase == "blocked":
+            candidate = task_state.get("candidateSha")
             failed = [
                 (sequence_id, sequence) for sequence_id, sequence in store.state.get("protocolSequences", {}).items()
                 if sequence.get("assignmentId") == assignment_id
                 and sequence.get("role") == "slice-reviewer"
                 and sequence.get("status") == "operational-failed"
             ]
-            candidate = task_state.get("candidateSha")
+            schema_sha = hashlib.sha256(json.dumps(ROLE_JSON_SCHEMAS["slice-reviewer"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            current = [
+                (sequence_id, sequence) for sequence_id, sequence in store.state.get("protocolSequences", {}).items()
+                if sequence.get("assignmentId") == assignment_id
+                and sequence.get("role") == "slice-reviewer"
+                and sequence.get("schemaSha256") == schema_sha
+                and sequence.get("context", {}).get("candidateSha") == candidate
+            ]
             history = task_state.get("validationHistory", [])
             if (
-                len(failed) != 1 or "slice-reviewer" not in str(task_state.get("error", ""))
+                not failed or len(current) > 1 or "slice-reviewer" not in str(task_state.get("error", ""))
                 or not candidate or task_state.get("validationCandidateSha") != candidate
-                or session.get("phase") != "slice-review" or session.get("initialCandidateSha") != candidate
+                or session.get("phase") not in {"slice-review", "blocked"} or session.get("initialCandidateSha") != candidate
                 or session.get("reviewResult") is not None or session.get("acceptedBlockerIds")
                 or not history or any(item.get("outcome") != "passed" for item in history)
-                or failed[0][1].get("attemptsStarted", 0) >= failed[0][1].get("attemptLimit", 0)
+                or current and (
+                    current[0][1].get("status") != "operational-failed"
+                    or current[0][1].get("attemptsStarted", 0) >= current[0][1].get("attemptLimit", 0)
+                )
             ):
                 raise RuntimeError(f"recovery refused removed or unknown phase {phase!r} for {assignment_id}; replan from the incomplete requirements and backlog")
-            protocol = failed[0]
+            protocol = current[0] if current else None
             target = "slice-review"
         elif safe:
             target = phase
@@ -3372,6 +3383,8 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
             raise RuntimeError(f"recovery refused removed or unknown phase {phase!r} for {assignment_id}; replan from the incomplete requirements and backlog")
         snapshot = _recovery_snapshot(store, assignments[assignment_id])
         action = {"action": "resume", "assignmentId": assignment_id, "fromPhase": phase, "toPhase": target, **snapshot}
+        if phase == "blocked" and target == "slice-review":
+            action.update(reviewFromPhase=session["phase"], reviewToPhase="slice-review")
         if protocol:
             action.update(protocolSequenceId=protocol[0], protocolAttemptsStarted=protocol[1]["attemptsStarted"])
         if target == "candidate-validation":
@@ -3454,6 +3467,11 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
                     if sequence.get("status") != "operational-failed" or sequence.get("attemptsStarted") != action["protocolAttemptsStarted"]:
                         raise RuntimeError(f"review protocol changed after recovery preview: {assignment_id}")
                     sequence["status"] = "open"
+                if review_phase := action.get("reviewToPhase"):
+                    session = store.state.get("reviewSessions", {}).get(assignment_id, {})
+                    if session.get("phase") != action["reviewFromPhase"]:
+                        raise RuntimeError(f"review session changed after recovery preview: {assignment_id}")
+                    session["phase"] = review_phase
                 task_state["phase"] = action["toPhase"]
                 if action.get("candidateSha") and action["toPhase"] == "candidate-validation":
                     task_state["pendingWorkerSha"] = action["candidateSha"]
