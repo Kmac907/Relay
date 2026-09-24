@@ -1259,6 +1259,37 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(run.load_bugs(store)[0]["status"], "backlog")
             self.assertEqual(store.state["reviewSessions"][assignment["id"]]["reviewedSha"], "candidate")
 
+    def test_recovery_preserves_attempts_for_validated_reviewer_process_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task(); assignment_id = assignment["id"]
+            store.state.update(phase="blocked", campaignAgentCallsStarted=4)
+            store.state["taskStates"][assignment_id] = {
+                "phase": "blocked", "candidateSha": "candidate", "validationCandidateSha": "candidate",
+                "error": "slice-reviewer failed with exit code 1", "validationHistory": [{"outcome": "passed"}],
+            }
+            store.state["reviewSessions"][assignment_id] = {
+                "phase": "slice-review", "initialCandidateSha": "candidate", "reviewResult": None,
+                "acceptedBlockerIds": [], "reviewCallsStarted": 1,
+            }
+            store.state["worktrees"][assignment_id] = {"path": root, "root": root, "branch": "relay/test/TASK-0001", "baseSha": "base"}
+            store.state["protocolSequences"]["review"] = {
+                "assignmentId": assignment_id, "role": "slice-reviewer", "status": "operational-failed",
+                "attemptsStarted": 1, "attemptLimit": 3,
+            }
+            store.save()
+            snapshot = {"headSha": "candidate", "branch": "relay/test/TASK-0001"}
+            before_calls = store.state["campaignAgentCallsStarted"]
+            with patch("run._recovery_snapshot", return_value=snapshot):
+                actions = run.plan_recovery(store, [assignment], [])
+                self.assertEqual(actions[0]["protocolAttemptsStarted"], 1)
+                run.apply_recovery(store, [assignment], actions)
+            self.assertEqual(store.state["taskStates"][assignment_id]["phase"], "slice-review")
+            self.assertEqual(store.state["protocolSequences"]["review"]["status"], "open")
+            self.assertEqual(store.state["protocolSequences"]["review"]["attemptsStarted"], 1)
+            self.assertEqual(store.state["campaignAgentCallsStarted"], before_calls)
+            self.assertEqual(store.state["reviewSessions"][assignment_id]["reviewCallsStarted"], 1)
+
     def test_reconcile_ignores_obsolete_extra_state_keys(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)

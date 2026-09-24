@@ -3325,6 +3325,7 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
             continue
         phase = task_state.get("phase")
         session = store.state.get("reviewSessions", {}).get(assignment_id, {})
+        protocol = None
         if re.fullmatch(r"(?:repair|verify)-\d+", str(phase)):
             safe = True
         else:
@@ -3341,6 +3342,26 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
                 target = "approved"
             else:
                 continue
+        elif phase == "blocked":
+            failed = [
+                (sequence_id, sequence) for sequence_id, sequence in store.state.get("protocolSequences", {}).items()
+                if sequence.get("assignmentId") == assignment_id
+                and sequence.get("role") == "slice-reviewer"
+                and sequence.get("status") == "operational-failed"
+            ]
+            candidate = task_state.get("candidateSha")
+            history = task_state.get("validationHistory", [])
+            if (
+                len(failed) != 1 or "slice-reviewer" not in str(task_state.get("error", ""))
+                or not candidate or task_state.get("validationCandidateSha") != candidate
+                or session.get("phase") != "slice-review" or session.get("initialCandidateSha") != candidate
+                or session.get("reviewResult") is not None or session.get("acceptedBlockerIds")
+                or not history or any(item.get("outcome") != "passed" for item in history)
+                or failed[0][1].get("attemptsStarted", 0) >= failed[0][1].get("attemptLimit", 0)
+            ):
+                raise RuntimeError(f"recovery refused removed or unknown phase {phase!r} for {assignment_id}; replan from the incomplete requirements and backlog")
+            protocol = failed[0]
+            target = "slice-review"
         elif safe:
             target = phase
             if phase == "implementing":
@@ -3351,6 +3372,8 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
             raise RuntimeError(f"recovery refused removed or unknown phase {phase!r} for {assignment_id}; replan from the incomplete requirements and backlog")
         snapshot = _recovery_snapshot(store, assignments[assignment_id])
         action = {"action": "resume", "assignmentId": assignment_id, "fromPhase": phase, "toPhase": target, **snapshot}
+        if protocol:
+            action.update(protocolSequenceId=protocol[0], protocolAttemptsStarted=protocol[1]["attemptsStarted"])
         if target == "candidate-validation":
             action["candidateSha"] = task_state.get("pendingWorkerSha") or task_state.get("validationCandidateSha")
         if target == "approved":
@@ -3426,6 +3449,11 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
                         raise RuntimeError(f"assignment changed after recovery preview: {assignment_id}")
                 if task_state.get("phase") != action["fromPhase"]:
                     raise RuntimeError(f"assignment phase changed after recovery preview: {assignment_id}")
+                if sequence_id := action.get("protocolSequenceId"):
+                    sequence = store.state.get("protocolSequences", {}).get(sequence_id, {})
+                    if sequence.get("status") != "operational-failed" or sequence.get("attemptsStarted") != action["protocolAttemptsStarted"]:
+                        raise RuntimeError(f"review protocol changed after recovery preview: {assignment_id}")
+                    sequence["status"] = "open"
                 task_state["phase"] = action["toPhase"]
                 if action.get("candidateSha") and action["toPhase"] == "candidate-validation":
                     task_state["pendingWorkerSha"] = action["candidateSha"]
