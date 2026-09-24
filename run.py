@@ -2544,21 +2544,36 @@ def _merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignm
                     break
             elif status not in {"failed", "repair-required"}:
                 break
-        record_progress(store, assignment_id, worktree, reviewed_sha, assignment["allowedPaths"], f"provider:{status}")
+        pending = store.state["taskStates"][assignment_id].get("pendingWorkerSha")
+        if not pending:
+            record_progress(store, assignment_id, worktree, reviewed_sha, assignment["allowedPaths"], f"provider:{status}")
         repair_mode = "integration-repair" if status == "repair-required" else "repair"
-        fix_number = reserve_fix(store, assignment_id, "integration-repair" if repair_mode == "integration-repair" else "validation-repair")
+        fix_number = fix_attempts_started(store.state, assignment_id) if pending else reserve_fix(store, assignment_id, "integration-repair" if repair_mode == "integration-repair" else "validation-repair")
         blocker = [{"id": f"PROVIDER-{fix_number}", "failure": status, "evidence": f"{provider_name(store.state)} checks or merge readiness failed"}]
         try:
-            result = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt(repair_mode, assignment, reviewed_sha, blocker, store.state["taskStates"][assignment_id].get("error", "")), mode=repair_mode, review=True)
-            record_worker_output(store, assignment_id, result)
+            if pending:
+                result = {"candidateSha": pending}
+            else:
+                result = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt(repair_mode, assignment, reviewed_sha, blocker, store.state["taskStates"][assignment_id].get("error", "")), mode=repair_mode, review=True)
+                record_worker_output(store, assignment_id, result)
             candidate_integrity(store, assignment, worktree, result, reviewed_sha)
             replacement = validate_candidate(store, assignment, worktree, result)
             pr = publish_candidate(store, assignment, worktree, branch, replacement)
-            session.update(pendingRepairNumber=fix_number, acceptedBlockerIds=[], openFindingIds=[])
+            backlog_bugs = [bug for bug in load_bugs(store) if bug.get("source") == assignment_id and bug.get("status") == "backlog"]
+            changed = target_changes(store, worktree, reviewed_sha, replacement) if backlog_bugs else []
+            repair_bugs = [
+                bug for bug in backlog_bugs
+                if any(scopes_may_overlap(path, affected) for path in changed for affected in bug.get("allowedPaths", []))
+            ]
+            session.update(
+                pendingRepairNumber=fix_number,
+                acceptedBlockerIds=[bug["id"] for bug in repair_bugs],
+                openFindingIds=[bug["sourceFindingId"] for bug in repair_bugs],
+            )
             store.save()
             verification = invoke_with_replacements(
                 store, semaphore, worktree, assignment_id, "verification-reviewer",
-                role_prompt("verification-reviewer", assignment, replacement, {"previousCandidate": reviewed_sha, "repairDiff": f"{reviewed_sha}..{replacement}", "providerFailure": status, "expectedReviewEpoch": fix_number, "openFindingIds": []}),
+                role_prompt("verification-reviewer", assignment, replacement, {"blockers": repair_bugs, "previousCandidate": reviewed_sha, "repairDiff": f"{reviewed_sha}..{replacement}", "providerFailure": status, "expectedReviewEpoch": fix_number, "openFindingIds": session["openFindingIds"]}),
                 review=True, validator=lambda value: (validate_incremental_findings(store, worktree, reviewed_sha, replacement, value["findings"]), value)[1],
             )
         except ProtocolExhaustedError:
@@ -2573,7 +2588,15 @@ def _merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignm
             requirements=list(assignment.get("requirementContext", [])) + list(assignment.get("acceptanceCriteria", [])),
         )
         new_blockers = record_findings(store, assignment_id, dispositions)
+        resolved_ids = set(verification["resolvedFindingIds"])
+        if resolved_ids:
+            bugs = load_bugs(store)
+            for bug in bugs:
+                if bug.get("sourceFindingId") in resolved_ids:
+                    bug["status"] = "resolved"
+            write_bugs(store, bugs)
         session.pop("pendingRepairNumber", None)
+        session.update(acceptedBlockerIds=[], openFindingIds=[])
         if new_blockers or any(item["coordinatorDisposition"] == "needs-user" for item in dispositions):
             status = "failed"
             continue
@@ -3254,12 +3277,20 @@ def _recovery_snapshot(store: StateStore, assignment: dict) -> dict:
     }
     if head not in candidates:
         raise RuntimeError(f"recovery refused candidate SHA drift: {assignment_id}")
-    ancestry = git(worktree, "merge-base", "--is-ancestor", record["baseSha"], head, timeout=store.state["validationTimeoutSeconds"], check=False)
+    pending_integration = (
+        head == task_state.get("pendingWorkerSha")
+        and task_state.get("phase") == "blocked"
+        and task_state.get("error") == "repeated progress fingerprint detected"
+        and session.get("phase") == "approved"
+        and session.get("reviewedSha")
+    )
+    recovery_base = session["reviewedSha"] if pending_integration else record["baseSha"]
+    ancestry = git(worktree, "merge-base", "--is-ancestor", recovery_base, head, timeout=store.state["validationTimeoutSeconds"], check=False)
     if ancestry.returncode:
         raise RuntimeError(f"recovery refused candidate ancestry drift: {assignment_id}")
-    changed = target_changes(store, worktree, record["baseSha"], head)
+    changed = target_changes(store, worktree, recovery_base, head)
     allowed = assignment["allowedPaths"]
-    if "approvedRepairPaths" in session:
+    if not pending_integration and "approvedRepairPaths" in session:
         approved = session["approvedRepairPaths"]
         if not isinstance(approved, list) or any(not isinstance(path, str) or not valid_relative_path(path) for path in approved):
             raise RuntimeError(f"recovery refused invalid approved repair scope: {assignment_id}")
@@ -3343,7 +3374,11 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
             else:
                 continue
         elif phase == "blocked":
-            candidate = task_state.get("candidateSha")
+            if task_state.get("pendingWorkerSha") and session.get("phase") == "approved" and task_state.get("error") == "repeated progress fingerprint detected":
+                target = "approved"
+                candidate = None
+            else:
+                candidate = task_state.get("candidateSha")
             failed = [
                 (sequence_id, sequence) for sequence_id, sequence in store.state.get("protocolSequences", {}).items()
                 if sequence.get("assignmentId") == assignment_id
@@ -3359,7 +3394,7 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
                 and sequence.get("context", {}).get("candidateSha") == candidate
             ]
             history = task_state.get("validationHistory", [])
-            if (
+            if candidate is not None and (
                 not failed or len(current) > 1 or "slice-reviewer" not in str(task_state.get("error", ""))
                 or not candidate or task_state.get("validationCandidateSha") != candidate
                 or session.get("phase") not in {"slice-review", "blocked"} or session.get("initialCandidateSha") != candidate
@@ -3371,8 +3406,9 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
                 )
             ):
                 raise RuntimeError(f"recovery refused removed or unknown phase {phase!r} for {assignment_id}; replan from the incomplete requirements and backlog")
-            protocol = current[0] if current else None
-            target = "slice-review"
+            if candidate is not None:
+                protocol = current[0] if current else None
+                target = "slice-review"
         elif safe:
             target = phase
             if phase == "implementing":
