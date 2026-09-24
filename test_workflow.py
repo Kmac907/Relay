@@ -2046,6 +2046,7 @@ class DeterministicCoreTests(unittest.TestCase):
         self.assertNotIn("repairer", run.ROLE_JSON_SCHEMAS)
         for role, mode in (("slice-reviewer", "initial"), ("verification-reviewer", "incremental")):
             self.assertEqual(run.ROLE_JSON_SCHEMAS[role]["properties"]["mode"], {"type": "string", "enum": [mode]})
+        self.assertEqual(run.ROLE_JSON_SCHEMAS["slice-reviewer"]["properties"]["resolvedFindingIds"]["items"], {"type": "string"})
         self.assertEqual({path.name for path in run.PROMPTS.glob("*.md")}, {"scout.md", "planner.md", "plan-reviewer.md", "worker.md", "reviewer.md", "audit-planner.md", "auditor.md"})
         self.assertIn("AUDIT-NNNN", run.prompt_template("audit-planner"))
 
