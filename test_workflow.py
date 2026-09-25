@@ -842,6 +842,21 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertFalse(path.exists())
             self.assertNotIn("TASK-0001", store.state["worktrees"])
 
+    def test_cleanup_records_an_inaccessible_unregistered_directory(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            store = self.state_store(root)
+            path = root / "relay-worktrees" / "test" / "TASK-0001"
+            path.mkdir(parents=True)
+            store.state["worktrees"]["TASK-0001"] = {"path": str(path), "root": str(path), "branch": "relay/TASK-0001"}
+            failed = subprocess.CompletedProcess([], 1, "", "not a working tree")
+            absent = subprocess.CompletedProcess([], 0, f"worktree {root}\n", "")
+            with patch("run.tempfile.gettempdir", return_value=str(root)), patch("run.git", side_effect=[failed, absent, subprocess.CompletedProcess([], 0, "", "")]), patch("run.shutil.rmtree", side_effect=PermissionError("denied")):
+                run.cleanup_worktree(store, "TASK-0001")
+            self.assertEqual(store.state["orphanedWorktrees"][0]["error"], "denied")
+            self.assertTrue(Path(store.state["orphanedWorktrees"][0]["path"]).samefile(path))
+            self.assertNotIn("TASK-0001", store.state["worktrees"])
+
     def test_integrated_assignment_retries_worktree_cleanup(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
