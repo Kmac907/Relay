@@ -3210,7 +3210,6 @@ def _recovery_snapshot(store: StateStore, assignment: dict, *, adopt_clean_candi
         parent = git(worktree, "merge-base", "--is-ancestor", diff_base, head, timeout=store.state["validationTimeoutSeconds"], check=False) if diff_base else ancestry
         if head != pending or head == diff_base or parent.returncode:
             raise RuntimeError(f"recovery refused candidate ancestry drift: {assignment_id}")
-    changed = target_changes(store, worktree, diff_base, head)
     allowed = assignment["allowedPaths"]
     if "approvedRepairPaths" in session and not task_state.get("integrationRepairStatus"):
         approved = session["approvedRepairPaths"]
@@ -3222,6 +3221,13 @@ def _recovery_snapshot(store: StateStore, assignment: dict, *, adopt_clean_candi
         if unapproved:
             raise RuntimeError(f"recovery refused approved repair paths outside maximum scope for {assignment_id}: {', '.join(unapproved)}")
         allowed = approved
+        repair_base = session.get("currentCandidateSha")
+        if repair_base and head != repair_base:
+            ancestry = git(worktree, "merge-base", "--is-ancestor", repair_base, head, timeout=store.state["validationTimeoutSeconds"], check=False)
+            if ancestry.returncode:
+                raise RuntimeError(f"recovery refused repair ancestry drift: {assignment_id}")
+            diff_base = repair_base
+    changed = target_changes(store, worktree, diff_base, head)
     directories = scope_directories(store, allowed) | {
         normalized_path(path) for path in allowed if not path_has_magic(path) and (worktree / path).is_dir()
     }
@@ -3293,8 +3299,13 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
                 target = "candidate-validation"
             elif re.match(r"\[(?:Errno|WinError) \d+\]", error) and assignment_id in store.state.get("worktrees", {}):
                 snapshot = _recovery_snapshot(store, assignments[assignment_id], adopt_clean_candidate=True)
-                target = "candidate-validation" if snapshot["headSha"] != store.state["worktrees"][assignment_id]["baseSha"] else "ready"
-                adopt_clean_candidate = target == "candidate-validation"
+                repair = re.fullmatch(rf"{re.escape(assignment_id)}:repair:(\d+)", str(task_state.get("activeRepairWorkItem", "")))
+                if repair and session.get("acceptedBlockerIds") and "approvedRepairPaths" in session:
+                    target = f"repair-{repair.group(1)}"
+                    adopt_clean_candidate = True
+                else:
+                    target = "candidate-validation" if snapshot["headSha"] != store.state["worktrees"][assignment_id]["baseSha"] else "ready"
+                    adopt_clean_candidate = target == "candidate-validation"
             elif _worktree_setup_failure(error) and assignment_id not in store.state.get("worktrees", {}):
                 actions.append({"action": "resume", "assignmentId": assignment_id, "fromPhase": phase, "toPhase": "ready"})
                 handled.add(assignment_id)
@@ -3315,6 +3326,10 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
         action = {"action": "resume", "assignmentId": assignment_id, "fromPhase": phase, "toPhase": target, **snapshot}
         if adopt_clean_candidate:
             action["adoptCleanCandidate"] = True
+        if target.startswith("repair-") and phase == "needs-user":
+            action["resumeReviewRepair"] = True
+            if snapshot["headSha"] != session.get("currentCandidateSha"):
+                action["candidateSha"] = snapshot["headSha"]
         if target == "candidate-validation":
             action["candidateSha"] = task_state.get("pendingWorkerSha") or task_state.get("validationCandidateSha") or snapshot["headSha"]
         if target == "approved":
@@ -3391,6 +3406,11 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
                 task_state["phase"] = action["toPhase"]
                 if action.get("candidateSha") and action["toPhase"] == "candidate-validation":
                     task_state["pendingWorkerSha"] = action["candidateSha"]
+                if action.get("resumeReviewRepair"):
+                    session = store.state["reviewSessions"][assignment_id]
+                    session["phase"] = action["toPhase"]
+                    if action.get("candidateSha"):
+                        session["pendingWorkerSha"] = action["candidateSha"]
                 if action.get("candidateSha") == task_state.get("integrationValidatedSha") and action["toPhase"] == "approved":
                     session = store.state.get("reviewSessions", {}).get(assignment_id, {})
                     if session.get("phase") == "needs-user":

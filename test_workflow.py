@@ -1351,6 +1351,34 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(store.state["taskStates"][assignment["id"]]["pendingWorkerSha"], candidate)
             self.assertEqual(store.state["taskStates"][assignment["id"]]["phase"], "candidate-validation")
 
+    def test_recovery_resumes_a_committed_review_repair_from_its_narrow_diff(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            target = make_git_repository(root / "relay-worktrees" / "test" / "TASK-0001")
+            base = git_output(target, "rev-parse", "HEAD").strip()
+            path = target / "src" / "app.py"
+            path.parent.mkdir()
+            path.write_text("initial\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", "src/app.py"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "candidate"], check=True, capture_output=True)
+            candidate = git_output(target, "rev-parse", "HEAD").strip()
+            path.write_text("repaired\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "commit", "-am", "repair"], check=True, capture_output=True)
+            repair = git_output(target, "rev-parse", "HEAD").strip()
+            run.exclude_relay_files(target)
+            store = self.state_store(target)
+            assignment = ContractTests().task()
+            store.state.update(phase="needs-user", campaignId="test")
+            store.state["taskStates"][assignment["id"]] = {"phase": "needs-user", "error": "[Errno 22] Invalid argument", "candidateSha": candidate, "activeRepairWorkItem": f"{assignment['id']}:repair:1"}
+            store.state["reviewSessions"][assignment["id"]] = {"phase": "needs-user", "currentCandidateSha": candidate, "approvedRepairPaths": ["src/app.py"], "acceptedBlockerIds": ["BUG-0001"]}
+            store.state["worktrees"][assignment["id"]] = {"path": str(target), "root": str(target), "branch": "branch", "baseSha": base}
+            with patch("run.tempfile.gettempdir", return_value=str(root)):
+                actions = run.plan_recovery(store, [assignment], [])
+                run.apply_recovery(store, [assignment], actions)
+            self.assertEqual(actions[0]["candidateSha"], repair)
+            self.assertEqual(store.state["taskStates"][assignment["id"]]["phase"], "repair-1")
+            self.assertEqual(store.state["reviewSessions"][assignment["id"]]["pendingWorkerSha"], repair)
+
     def test_reconcile_ignores_obsolete_extra_state_keys(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
