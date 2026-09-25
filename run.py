@@ -1543,14 +1543,13 @@ def candidate_integrity(store: StateStore, assignment: dict, worktree: Path, res
     sha = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
     if result["candidateSha"] != sha:
         raise ValueError("reported candidate does not equal worktree HEAD")
-    dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout.splitlines()
-    if dirty and not target_git_paths(store, worktree, "ls-files", "--others", "--exclude-standard"):
+    untracked = target_git_paths(store, worktree, "ls-files", "--others", "--exclude-standard")
+    tracked = target_git_paths(store, worktree, "diff", "--name-only", "HEAD")
+    if tracked and not untracked:
+        git(worktree, "restore", "--source", "HEAD", "--staged", "--worktree", "--", *tracked, timeout=store.state["validationTimeoutSeconds"])
+        relay_console.emit("DONE", f"operation=candidate-cleanup assignment={assignment['id']} paths={len(tracked)}")
         tracked = target_git_paths(store, worktree, "diff", "--name-only", "HEAD")
-        if tracked:
-            git(worktree, "restore", "--source", "HEAD", "--staged", "--worktree", "--", *tracked, timeout=store.state["validationTimeoutSeconds"])
-            relay_console.emit("DONE", f"operation=candidate-cleanup assignment={assignment['id']} paths={len(tracked)}")
-            dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout.splitlines()
-    if dirty:
+    if tracked or untracked:
         raise RuntimeError("candidate worktree has uncommitted changes")
     assignment_base = store.state["worktrees"][assignment["id"]]["baseSha"]
     ancestry = git(worktree, "merge-base", "--is-ancestor", assignment_base, sha, timeout=store.state["validationTimeoutSeconds"], check=False)

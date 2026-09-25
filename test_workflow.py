@@ -1065,6 +1065,18 @@ class DeterministicCoreTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "repeated progress fingerprint"):
                     run.record_progress(store, assignment["id"], Path(root), "a", assignment["allowedPaths"], "validation")
 
+    def test_candidate_integrity_uses_head_diff_instead_of_false_status(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            store.state["taskStates"][assignment["id"]] = {"phase": "candidate-validation"}
+            store.state["worktrees"][assignment["id"]] = {"baseSha": "base"}
+            def git_result(_repo, *args, **_kwargs):
+                output = "candidate\n" if args[:2] == ("rev-parse", "HEAD") else " M tests/evidence.json\n" if args[0] == "status" else ""
+                return subprocess.CompletedProcess(args, 0, output, "")
+            with patch("run.git", side_effect=git_result), patch("run.target_git_paths", return_value=[]):
+                self.assertEqual(run.candidate_integrity(store, assignment, Path(root), {"candidateSha": "candidate"}), "candidate")
+
     def test_incremental_review_may_only_add_repair_diff_findings(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
