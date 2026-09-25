@@ -3383,6 +3383,14 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
             raise RuntimeError(f"recovery refused removed or unknown phase {phase!r} for {assignment_id}; replan from the incomplete requirements and backlog")
         snapshot = snapshot or _recovery_snapshot(store, assignments[assignment_id])
         action = {"action": "resume", "assignmentId": assignment_id, "fromPhase": phase, "toPhase": target, **snapshot}
+        verify = re.fullmatch(r"verify-(\d+)", target)
+        if verify and not session.get("previousCandidateSha"):
+            previous = session.get("initialCandidateSha") if verify.group(1) == "1" else None
+            repaired = session.get("pendingRepairSha")
+            worktree, _ = recovery_worktree(store, assignment_id)
+            if not previous or not repaired or previous == repaired or git(worktree, "merge-base", "--is-ancestor", previous, repaired, timeout=store.state["validationTimeoutSeconds"], check=False).returncode:
+                raise RuntimeError(f"recovery cannot establish the previous repair candidate: {assignment_id}")
+            action["previousCandidateSha"] = previous
         if discard_validation_dirt:
             action["discardDirtyPaths"] = sorted(set(snapshot["dirtyPaths"]) - set(snapshot.get("untrackedPaths", [])))
             if re.fullmatch(r"verify-\d+", target):
@@ -3490,6 +3498,8 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
                     session["phase"] = action["toPhase"]
                     if action.get("candidateSha"):
                         session["pendingWorkerSha"] = action["candidateSha"]
+                if action.get("previousCandidateSha"):
+                    store.state["reviewSessions"][assignment_id]["previousCandidateSha"] = action["previousCandidateSha"]
                 if action.get("candidateSha") == task_state.get("integrationValidatedSha") and action["toPhase"] == "approved":
                     session = store.state.get("reviewSessions", {}).get(assignment_id, {})
                     if session.get("phase") == "needs-user":

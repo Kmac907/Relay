@@ -1515,13 +1515,15 @@ class DeterministicCoreTests(unittest.TestCase):
             assignment = ContractTests().task() | {"allowedPaths": ["src/app.py", "tests/evidence.json"]}
             store.state.update(phase="needs-user", campaignId="test")
             store.state["taskStates"][assignment["id"]] = {"phase": "slice-review", "candidateSha": repair, "validationCandidateSha": repair, "activeRepairWorkItem": f"{assignment['id']}:repair:1"}
-            store.state["reviewSessions"][assignment["id"]] = {"phase": "verify-1", "currentCandidateSha": repair, "pendingRepairSha": repair, "previousCandidateSha": candidate, "approvedRepairPaths": ["src/app.py"], "acceptedBlockerIds": ["BUG-0001"]}
+            store.state["reviewSessions"][assignment["id"]] = {"phase": "verify-1", "initialCandidateSha": candidate, "currentCandidateSha": repair, "pendingRepairSha": repair, "approvedRepairPaths": ["src/app.py"], "acceptedBlockerIds": ["BUG-0001"]}
             store.state["worktrees"][assignment["id"]] = {"path": str(target), "root": str(target), "branch": "branch", "baseSha": base}
             with patch("run.tempfile.gettempdir", return_value=str(root)):
                 actions = run.plan_recovery(store, [assignment], [])
                 run.apply_recovery(store, [assignment], actions)
             self.assertEqual(actions[0]["discardDirtyPaths"], ["tests/evidence.json"])
+            self.assertEqual(actions[0]["previousCandidateSha"], candidate)
             self.assertEqual(store.state["taskStates"][assignment["id"]]["phase"], "verify-1")
+            self.assertEqual(store.state["reviewSessions"][assignment["id"]]["previousCandidateSha"], candidate)
             self.assertEqual(git_output(target, "status", "--porcelain=v1", "--untracked-files=all"), "")
             self.assertEqual((target / "tests/evidence.json").read_text(encoding="utf-8"), "candidate\n")
             (target / "tests/evidence.json").write_text("later validation output\n", encoding="utf-8")
