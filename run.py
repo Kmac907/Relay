@@ -1553,7 +1553,10 @@ def candidate_integrity(store: StateStore, assignment: dict, worktree: Path, res
     if "changedPaths" in result and sorted(result["changedPaths"]) != sorted(changed):
         raise ValueError(f"reported changed paths do not match candidate diff; expected {json.dumps(changed)}")
     allowed = assignment["allowedPaths"]
-    outside = sorted(item for item in changed if not allowed_change(item, allowed, scope_directories(store, allowed)))
+    directories = scope_directories(store, allowed) | {
+        normalized_path(path) for path in allowed if not path_has_magic(path) and (worktree / path).is_dir()
+    }
+    outside = sorted(item for item in changed if not allowed_change(item, allowed, directories))
     if outside:
         raise ValueError(f"candidate changed paths outside assignment scope: {', '.join(outside)}")
     return sha
