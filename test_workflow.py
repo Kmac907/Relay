@@ -1089,6 +1089,17 @@ class DeterministicCoreTests(unittest.TestCase):
             with patch("run.git", side_effect=git_result), patch("run.target_git_paths", return_value=[]):
                 self.assertEqual(run.candidate_integrity(store, assignment, Path(root), {"candidateSha": "candidate"}), "candidate")
 
+    def test_clean_validation_candidate_uses_head_diff_instead_of_false_status(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            store.state["taskStates"][assignment["id"]] = {"validationCandidateSha": "candidate"}
+            def git_result(_repo, *args, **_kwargs):
+                output = "candidate\n" if args[:2] == ("rev-parse", "HEAD") else " M tests/evidence.json\n"
+                return subprocess.CompletedProcess(args, 0, output, "")
+            with patch("run.git", side_effect=git_result), patch("run.target_git_paths", return_value=[]):
+                self.assertEqual(run.clean_validation_candidate(store, assignment["id"], Path(root)), "candidate")
+
     def test_incremental_review_may_only_add_repair_diff_findings(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
@@ -1118,7 +1129,7 @@ class DeterministicCoreTests(unittest.TestCase):
             assignment = ContractTests().task()
             result = {"mode": "task", "assignmentId": assignment["id"], "status": "satisfied", "candidateSha": "", "changedPaths": [], "validation": [], "summary": "already present", "proposedLearnings": []}
             def git_result(_repo, *args, **_kwargs):
-                output = "head\n" if args[:2] == ("rev-parse", "HEAD") else ""
+                output = "head\n" if args[:2] == ("rev-parse", "HEAD") else " M tests/evidence.json\n" if args[0] == "status" else ""
                 return subprocess.CompletedProcess(args, 0, output, "")
             with patch("run.create_worktree", return_value=(Path(root), "branch")), patch("run.invoke_with_replacements", return_value=result), patch("run.run_validations"), patch("run.git", side_effect=git_result), patch("run.run_review", return_value=True) as review, patch("run.publish_candidate") as publish, patch("run.cleanup_worktree"):
                 self.assertTrue(run.process_assignment(store, threading.Semaphore(1), assignment, "task"))

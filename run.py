@@ -1631,7 +1631,7 @@ def clean_validation_candidate(store: StateStore, assignment_id: str, worktree: 
     if not candidate:
         return None
     head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"], check=False).stdout.strip()
-    dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"], check=False).stdout
+    dirty = target_git_paths(store, worktree, "diff", "--name-only", "HEAD") + target_git_paths(store, worktree, "ls-files", "--others", "--exclude-standard")
     return candidate if head == candidate and not dirty else None
 
 
@@ -2804,7 +2804,8 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
                     if result["status"] == "needs-user":
                         raise RuntimeError(f"worker requires human decision: {result['summary']}")
                     if result["status"] == "satisfied":
-                        if result["changedPaths"] or git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout:
+                        dirty = target_git_paths(store, worktree, "diff", "--name-only", "HEAD") + target_git_paths(store, worktree, "ls-files", "--others", "--exclude-standard")
+                        if result["changedPaths"] or dirty:
                             raise ValueError("satisfied result requires a clean unchanged worktree")
                         run_validations(store, assignment, worktree, "task")
                         run_validations(store, assignment, worktree, "campaign", store.state["campaignValidationCommands"])
