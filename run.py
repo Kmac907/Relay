@@ -2613,7 +2613,11 @@ def cleanup_worktree(store: StateStore, assignment_id: str) -> None:
             listed = git(repository, "worktree", "list", "--porcelain", timeout=store.state["providerTimeoutSeconds"]).stdout.splitlines()
             if path.resolve() in {Path(line[9:]).resolve() for line in listed if line.startswith("worktree ")}:
                 return
-            shutil.rmtree(path)
+            try:
+                shutil.rmtree(path)
+            except OSError as error:
+                store.state.setdefault("orphanedWorktrees", []).append({"path": str(path), "error": str(error)})
+                relay_console.emit("WARN", f"operation=worktree-cleanup assignment={assignment_id} reason=unregistered-directory-retained path={path}")
         git(repository, "branch", "-D", record["branch"], timeout=store.state["providerTimeoutSeconds"], check=False)
         cleanup_assignment_environment(store, assignment_id)
         store.state["worktrees"].pop(assignment_id, None)
