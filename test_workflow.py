@@ -1542,7 +1542,7 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(store.state["taskStates"][assignment["id"]]["phase"], "slice-review")
             self.assertEqual(git_output(target, "status", "--porcelain=v1", "--untracked-files=all"), "")
             (target / "tests/evidence.json").write_text("other task validation output\n", encoding="utf-8")
-            store.state["taskStates"][assignment["id"]].update(validationCandidateSha=candidate, pendingWorkerSha=repair)
+            store.state["taskStates"][assignment["id"]].update(validationCandidateSha=candidate, workerHistory=[{"status": "candidate", "candidateSha": repair}])
             store.state["reviewSessions"][assignment["id"]].update(phase="repair-2", currentCandidateSha=candidate, approvedRepairPaths=["src/app.py"])
             narrow_assignment = assignment | {"allowedPaths": ["src/app.py"]}
             with patch("run.tempfile.gettempdir", return_value=str(root)):

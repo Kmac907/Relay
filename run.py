@@ -1098,6 +1098,10 @@ def record_worker_output(store: StateStore, assignment_id: str, result: dict) ->
     store.update(record)
 
 
+def latest_worker_candidate(task_state: dict) -> str:
+    return next((item["candidateSha"] for item in reversed(task_state.get("workerHistory", [])) if item.get("status") == "candidate" and isinstance(item.get("candidateSha"), str) and item["candidateSha"]), "")
+
+
 def worker_prompt(mode: str, assignment: dict, candidate_sha: str = "", blockers: list[dict] | None = None, previous_failure: str = "", cleanup_paths: list[str] | None = None) -> str:
     return json.dumps({"mode": mode, "candidateSha": candidate_sha, "blockers": blockers or [], "previousFailure": previous_failure, "cleanupPaths": cleanup_paths or []}, sort_keys=True)
 
@@ -3227,12 +3231,14 @@ def _recovery_snapshot(store: StateStore, assignment: dict, *, adopt_clean_candi
             session.get("currentCandidateSha"), session.get("pendingRepairSha"), session.get("reviewedSha"),
         ) if isinstance(value, str) and value
     }
+    candidates.add(latest_worker_candidate(task_state))
+    candidates.discard("")
     if head not in candidates and not adopt_clean_candidate:
         raise RuntimeError(f"recovery refused candidate SHA drift: {assignment_id}")
     diff_base = record["baseSha"]
     ancestry = git(worktree, "merge-base", "--is-ancestor", diff_base, head, timeout=store.state["validationTimeoutSeconds"], check=False)
     if ancestry.returncode:
-        pending = task_state.get("pendingWorkerSha") or task_state.get("integrationValidatedSha")
+        pending = task_state.get("pendingWorkerSha") or latest_worker_candidate(task_state) or task_state.get("integrationValidatedSha")
         diff_base = task_state.get("integrationWorkingSha") or session.get("reviewedSha")
         if task_state.get("integrationRepairStatus") and head == session.get("reviewedSha"):
             diff_base = head
@@ -3344,7 +3350,7 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
                 resuming_repair = bool(repair and session.get("acceptedBlockerIds") and "approvedRepairPaths" in session)
                 resuming_integration = bool(task_state.get("integrationRepairStatus") and session.get("reviewedSha") and (task_state.get("pr") or store.state.get("pullRequests", {}).get(assignment_id)))
                 validated_candidate = task_state.get("validationCandidateSha")
-                trusted_candidate = task_state.get("pendingWorkerSha") or validated_candidate
+                trusted_candidate = task_state.get("pendingWorkerSha") or latest_worker_candidate(task_state) or validated_candidate
                 snapshot = _recovery_snapshot(store, assignments[assignment_id], adopt_clean_candidate=True, allow_dirty_repair=resuming_repair or bool(trusted_candidate), allow_repair_scope_cleanup=resuming_repair or resuming_integration, allow_integration_cleanup=resuming_integration, tracked_cleanup_candidate=trusted_candidate or "")
                 discard_untracked_roots = snapshot.get("disposableUntrackedRoots", [])
                 tracked_dirty = set(snapshot.get("dirtyPaths", [])) - set(snapshot.get("untrackedPaths", []))
@@ -3373,7 +3379,7 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
         elif safe:
             target = phase
             validated_candidate = task_state.get("validationCandidateSha")
-            trusted_candidate = task_state.get("pendingWorkerSha") or validated_candidate
+            trusted_candidate = task_state.get("pendingWorkerSha") or latest_worker_candidate(task_state) or validated_candidate
             if phase == "approved" and task_state.get("integrationRepairStatus") and task_state.get("integrationWorkingSha"):
                 resuming_integration = True
                 snapshot = _recovery_snapshot(store, assignments[assignment_id], allow_dirty_repair=True, allow_repair_scope_cleanup=True, allow_integration_cleanup=True)
