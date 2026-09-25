@@ -2504,6 +2504,15 @@ def _merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignm
             task_state["error"] = str(error)
             candidate = clean_validation_candidate(store, assignment_id, worktree)
             scope_prefix = "candidate changed paths outside assignment scope: "
+            if repair_mode == "integration-repair" and candidate and str(error) == "candidate does not descend from expected base":
+                parent = git(worktree, "merge-base", "--is-ancestor", working_sha, candidate, timeout=store.state["validationTimeoutSeconds"], check=False)
+                if candidate == working_sha or parent.returncode:
+                    raise
+                record_progress(store, assignment_id, worktree, candidate, assignment["allowedPaths"], "integration-ancestry")
+                task_state.update(integrationWorkingSha=candidate)
+                task_state.pop("pendingWorkerSha", None)
+                store.save()
+                continue
             if repair_mode == "integration-repair" and candidate and str(error).startswith(scope_prefix):
                 cleanup_paths = [path.strip() for path in str(error)[len(scope_prefix):].split(",")]
                 if not cleanup_paths or any(not valid_relative_path(path) for path in cleanup_paths):
