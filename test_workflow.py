@@ -2225,6 +2225,30 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(store.state["agentsBootstrap"]["contentHash"], repo.TARGET_AGENTS_SHA256)
             self.assertEqual(store.state["schemaVersion"], run.STATE_SCHEMA_VERSION)
 
+    def test_campaign_initialization_adopts_only_planner_rejection_logs(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); target = make_git_repository(root)
+            rejected = target / ".relay" / "logs" / "rejected" / "protocol.txt"
+            rejected.parent.mkdir(parents=True)
+            rejected.write_text("planning evidence", encoding="utf-8")
+            args = run.parser().parse_args(["--repo", str(target)])
+            text = plan.render_tasks([ContractTests().task()], git_output(target, "rev-parse", "HEAD").strip(), "abc123", campaign_validation_commands=["python -c \"print('baseline')\""])
+            store, _ = run.initialize_campaign(target, text, args)
+            self.assertTrue(rejected.is_file())
+            self.assertTrue(store.path.is_file())
+
+    def test_campaign_initialization_refuses_other_relay_artifacts(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); target = make_git_repository(root)
+            artifact = target / ".relay" / "unknown.txt"
+            artifact.parent.mkdir()
+            artifact.write_text("keep", encoding="utf-8")
+            args = run.parser().parse_args(["--repo", str(target)])
+            text = plan.render_tasks([ContractTests().task()], git_output(target, "rev-parse", "HEAD").strip(), "abc123", campaign_validation_commands=["python -c \"print('baseline')\""])
+            with self.assertRaisesRegex(RuntimeError, "refusing existing Relay campaign artifact"):
+                run.initialize_campaign(target, text, args)
+            self.assertEqual(artifact.read_text(encoding="utf-8"), "keep")
+
     def test_old_campaign_state_is_rejected_instead_of_recovered(self):
         with tempfile.TemporaryDirectory() as root:
             target = make_git_repository(Path(root))

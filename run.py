@@ -3926,8 +3926,15 @@ def initialize_campaign(repo: Path, text: str, args: argparse.Namespace) -> tupl
             raise RuntimeError(f"refusing existing {path}")
     instructions, agents_content = target_instructions(repo, create=True)
     relay = repo / ".relay"
-    relay.mkdir(parents=True, exist_ok=False)
-    (relay / "logs").mkdir()
+    if relay.exists():
+        unexpected = [
+            path for path in relay.rglob("*")
+            if (relative := path.relative_to(relay)) not in {Path("logs"), Path("logs/rejected")}
+            and not (relative.parent == Path("logs/rejected") and relative.suffix == ".txt" and path.is_file() and not path.is_symlink())
+        ]
+        if unexpected:
+            raise RuntimeError(f"refusing existing Relay campaign artifact: {unexpected[0]}")
+    (relay / "logs").mkdir(parents=True, exist_ok=True)
     state = initial_state(repo, metadata, args)
     state["pathDirectories"] = sorted({
         normalized_path(path) for task in tasks for path in task["allowedPaths"]
