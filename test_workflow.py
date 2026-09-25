@@ -1139,11 +1139,11 @@ class DeterministicCoreTests(unittest.TestCase):
                 resolved = next(verifications)
                 return {"assignmentId": assignment_id, "mode": "incremental", "reviewEpoch": 1 if candidate == "repair-one" else 2, "candidateSha": candidate, "resolvedFindingIds": [bug["sourceFindingId"]] if resolved else [], "findings": []}
 
-            def integrity(_store, _assignment, _worktree, result, parent):
+            def integrity(_store, _assignment, _worktree, result, parent, _scope_base=None):
                 parents.append((result["candidateSha"], parent))
                 return result["candidateSha"]
 
-            def validate(_store, _assignment, _worktree, result):
+            def validate(_store, _assignment, _worktree, result, _parent=None, _scope_base=None):
                 store.state["taskStates"][assignment["id"]].pop("error", None)
                 return result["candidateSha"]
 
@@ -1224,6 +1224,40 @@ class DeterministicCoreTests(unittest.TestCase):
             store.state["worktrees"][assignment["id"]] = {"baseSha": base}
             self.assertEqual(run.validate_candidate(store, assignment, target, {"candidateSha": repaired}), repaired)
             self.assertEqual(store.state["candidateShas"][assignment["id"]], repaired)
+
+    def test_narrow_repair_scope_uses_the_parent_candidate_diff(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = make_git_repository(Path(root))
+            base = git_output(target, "rev-parse", "HEAD").strip()
+            for name in ("one.txt", "two.txt"):
+                (target / name).write_text("original\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", "one.txt", "two.txt"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "candidate"], check=True, capture_output=True)
+            candidate = git_output(target, "rev-parse", "HEAD").strip()
+            (target / "one.txt").write_text("repair\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "commit", "-am", "repair"], check=True, capture_output=True)
+            repaired = git_output(target, "rev-parse", "HEAD").strip()
+            store = self.state_store(target)
+            run.exclude_relay_files(target)
+            assignment = ContractTests().task()
+            assignment.update(allowedPaths=["one.txt"], validationCommands=[])
+            store.state["campaignValidationCommands"] = []
+            store.state["taskStates"][assignment["id"]] = {"phase": "candidate-validation"}
+            store.state["worktrees"][assignment["id"]] = {"baseSha": base}
+            result = {"candidateSha": repaired, "changedPaths": ["one.txt"]}
+            self.assertEqual(run.validate_candidate(store, assignment, target, result, candidate, candidate), repaired)
+
+    def test_repair_scope_recognizes_an_authorized_candidate_created_directory(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root)
+            fixture = target / "tests" / "fixtures" / "new-portal" / "outcome.json"
+            fixture.parent.mkdir(parents=True)
+            fixture.write_text("{}\n", encoding="utf-8")
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            assignment["allowedPaths"] = ["tests/fixtures/new-portal"]
+            blocker = {"allowedPaths": ["tests/fixtures/new-portal/outcome.json"]}
+            self.assertEqual(run.approved_repair_paths(store, assignment, [blocker], target), (["tests/fixtures/new-portal/outcome.json"], []))
 
     def test_candidate_rejects_dirty_and_exact_out_of_scope_paths(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1369,7 +1403,7 @@ class DeterministicCoreTests(unittest.TestCase):
             store = self.state_store(target)
             assignment = ContractTests().task()
             store.state.update(phase="needs-user", campaignId="test")
-            store.state["taskStates"][assignment["id"]] = {"phase": "needs-user", "error": "[Errno 22] Invalid argument", "candidateSha": candidate, "activeRepairWorkItem": f"{assignment['id']}:repair:1"}
+            store.state["taskStates"][assignment["id"]] = {"phase": "needs-user", "error": "candidate changed paths outside assignment scope: src/app.py", "candidateSha": candidate, "activeRepairWorkItem": f"{assignment['id']}:repair:1"}
             store.state["reviewSessions"][assignment["id"]] = {"phase": "needs-user", "currentCandidateSha": candidate, "approvedRepairPaths": ["src/app.py"], "acceptedBlockerIds": ["BUG-0001"]}
             store.state["worktrees"][assignment["id"]] = {"path": str(target), "root": str(target), "branch": "branch", "baseSha": base}
             with patch("run.tempfile.gettempdir", return_value=str(root)):
@@ -1378,6 +1412,61 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(actions[0]["candidateSha"], repair)
             self.assertEqual(store.state["taskStates"][assignment["id"]]["phase"], "repair-1")
             self.assertEqual(store.state["reviewSessions"][assignment["id"]]["pendingWorkerSha"], repair)
+
+    def test_recovery_resumes_dirty_files_only_inside_the_approved_repair_scope(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            target = make_git_repository(root / "relay-worktrees" / "test" / "TASK-0001")
+            base = git_output(target, "rev-parse", "HEAD").strip()
+            path = target / "src" / "app.py"
+            path.parent.mkdir()
+            path.write_text("candidate\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", "src/app.py"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "candidate"], check=True, capture_output=True)
+            candidate = git_output(target, "rev-parse", "HEAD").strip()
+            path.write_text("dirty repair\n", encoding="utf-8")
+            run.exclude_relay_files(target)
+            store = self.state_store(target)
+            assignment = ContractTests().task()
+            store.state.update(phase="needs-user", campaignId="test")
+            store.state["taskStates"][assignment["id"]] = {"phase": "needs-user", "error": "accepted blocker requires paths outside assignment scope: src/app.py", "candidateSha": candidate}
+            store.state["reviewSessions"][assignment["id"]] = {"phase": "needs-user", "currentCandidateSha": candidate, "approvedRepairPaths": ["src/app.py"], "acceptedBlockerIds": ["BUG-0001"], "reviewEpoch": 0}
+            store.state["worktrees"][assignment["id"]] = {"path": str(target), "root": str(target), "branch": "branch", "baseSha": base}
+            with patch("run.tempfile.gettempdir", return_value=str(root)):
+                actions = run.plan_recovery(store, [assignment], [])
+                run.apply_recovery(store, [assignment], actions)
+            self.assertEqual(actions[0]["dirtyPaths"], ["src/app.py"])
+            self.assertEqual(store.state["taskStates"][assignment["id"]]["phase"], "repair-1")
+
+    def test_recovery_sends_assignment_scoped_repair_drift_back_for_cleanup(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            target = make_git_repository(root / "relay-worktrees" / "test" / "TASK-0001")
+            base = git_output(target, "rev-parse", "HEAD").strip()
+            for name in ("src/app.py", "tests/evidence.json"):
+                path = target / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("candidate\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", "src/app.py", "tests/evidence.json"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "candidate"], check=True, capture_output=True)
+            candidate = git_output(target, "rev-parse", "HEAD").strip()
+            for name in ("src/app.py", "tests/evidence.json"):
+                (target / name).write_text("repair\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "commit", "-am", "repair with drift"], check=True, capture_output=True)
+            run.exclude_relay_files(target)
+            store = self.state_store(target)
+            assignment = ContractTests().task()
+            assignment["allowedPaths"] = ["src/app.py", "tests/evidence.json"]
+            store.state.update(phase="needs-user", campaignId="test")
+            store.state["taskStates"][assignment["id"]] = {"phase": "needs-user", "error": "candidate changed paths outside assignment scope: tests/evidence.json", "candidateSha": candidate, "activeRepairWorkItem": f"{assignment['id']}:repair:1"}
+            store.state["reviewSessions"][assignment["id"]] = {"phase": "needs-user", "currentCandidateSha": candidate, "approvedRepairPaths": ["src/app.py"], "acceptedBlockerIds": ["BUG-0001"]}
+            store.state["worktrees"][assignment["id"]] = {"path": str(target), "root": str(target), "branch": "branch", "baseSha": base}
+            with patch("run.tempfile.gettempdir", return_value=str(root)):
+                actions = run.plan_recovery(store, [assignment], [])
+                run.apply_recovery(store, [assignment], actions)
+            self.assertEqual(actions[0]["scopeDriftPaths"], ["tests/evidence.json"])
+            self.assertNotIn("pendingWorkerSha", store.state["reviewSessions"][assignment["id"]])
+            self.assertEqual(store.state["taskStates"][assignment["id"]]["phase"], "repair-1")
 
     def test_reconcile_ignores_obsolete_extra_state_keys(self):
         with tempfile.TemporaryDirectory() as root:

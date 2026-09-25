@@ -1171,7 +1171,7 @@ def record_progress(store: StateStore, assignment_id: str, worktree: Path, candi
     previous_candidate = task_state.get("lastProgressCandidate")
     if signatures and signatures[-1] == signature and previous_candidate:
         changed = target_changes(store, worktree, previous_candidate, candidate)
-        directories = scope_directories(store, repair_scope)
+        directories = scope_directories(store, repair_scope, worktree)
         if not changed or not any(allowed_change(path, repair_scope, directories) for path in changed):
             raise RuntimeError("repair changed no relevant code and did not advance failures or findings")
     fingerprints.append(fingerprint)
@@ -1401,10 +1401,10 @@ def create_worktree(store: StateStore, assignment: dict) -> tuple[Path, str]:
         return path, branch
 
 
-def scope_directories(store: StateStore, scopes: list[str]) -> set[str]:
+def scope_directories(store: StateStore, scopes: list[str], worktree: Path | None = None) -> set[str]:
     known = {normalized_path(item) for item in store.state.get("pathDirectories", [])}
     has_metadata = "pathDirectories" in store.state
-    repository = Path(store.state["repository"])
+    repository = worktree or Path(store.state["repository"])
     for scope in scopes:
         if not path_has_magic(scope) and (scope.endswith(("/", "\\")) or (repository / scope).is_dir() or (not has_metadata and not Path(scope).suffix)):
             known.add(normalized_path(scope))
@@ -1439,12 +1439,12 @@ def maximum_repair_paths(store: StateStore, assignment: dict) -> list[str]:
     return list(dict.fromkeys([*assignment["allowedPaths"], *completed_dependency_paths(store, assignment)]))
 
 
-def approved_repair_paths(store: StateStore, assignment: dict, blockers: list[dict]) -> tuple[list[str], list[str]]:
+def approved_repair_paths(store: StateStore, assignment: dict, blockers: list[dict], worktree: Path | None = None) -> tuple[list[str], list[str]]:
     maximum = maximum_repair_paths(store, assignment)
     required = list(dict.fromkeys(path for bug in blockers for path in bug.get("allowedPaths", [])))
     if not required:
         return maximum, []
-    directories = scope_directories(store, maximum)
+    directories = scope_directories(store, maximum, worktree)
     outside = [path for path in required if not allowed_change(path, maximum, directories)]
     return required, outside
 
@@ -1534,7 +1534,7 @@ def run_validations(store: StateStore, assignment: dict, worktree: Path, categor
         clear_operation(store, assignment_id, "validate")
 
 
-def candidate_integrity(store: StateStore, assignment: dict, worktree: Path, result: dict, parent_sha: str | None = None) -> str:
+def candidate_integrity(store: StateStore, assignment: dict, worktree: Path, result: dict, parent_sha: str | None = None, scope_base: str | None = None) -> str:
     sha = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
     if result["candidateSha"] != sha:
         raise ValueError("reported candidate does not equal worktree HEAD")
@@ -1549,27 +1549,25 @@ def candidate_integrity(store: StateStore, assignment: dict, worktree: Path, res
         ancestry = git(worktree, "merge-base", "--is-ancestor", parent_sha, sha, timeout=store.state["validationTimeoutSeconds"], check=False)
         if sha == parent_sha or ancestry.returncode:
             raise RuntimeError("validation repair must commit a descendant candidate")
-    changed = target_changes(store, worktree, assignment_base, sha)
+    changed = target_changes(store, worktree, scope_base or assignment_base, sha)
     if "changedPaths" in result and sorted(result["changedPaths"]) != sorted(changed):
         raise ValueError(f"reported changed paths do not match candidate diff; expected {json.dumps(changed)}")
     allowed = assignment["allowedPaths"]
-    directories = scope_directories(store, allowed) | {
-        normalized_path(path) for path in allowed if not path_has_magic(path) and (worktree / path).is_dir()
-    }
+    directories = scope_directories(store, allowed, worktree)
     outside = sorted(item for item in changed if not allowed_change(item, allowed, directories))
     if outside:
         raise RuntimeError(f"candidate changed paths outside assignment scope: {', '.join(outside)}")
     return sha
 
 
-def validate_worker_result(store: StateStore, assignment: dict, worktree: Path, result: dict, parent_sha: str | None = None) -> dict:
+def validate_worker_result(store: StateStore, assignment: dict, worktree: Path, result: dict, parent_sha: str | None = None, scope_base: str | None = None) -> dict:
     if result["status"] == "candidate":
-        candidate_integrity(store, assignment, worktree, result, parent_sha)
+        candidate_integrity(store, assignment, worktree, result, parent_sha, scope_base)
     return result
 
 
-def validate_candidate(store: StateStore, assignment: dict, worktree: Path, result: dict) -> str:
-    sha = candidate_integrity(store, assignment, worktree, result)
+def validate_candidate(store: StateStore, assignment: dict, worktree: Path, result: dict, parent_sha: str | None = None, scope_base: str | None = None) -> str:
+    sha = candidate_integrity(store, assignment, worktree, result, parent_sha, scope_base)
     store.update(lambda state: state["taskStates"][assignment["id"]].update(validationShellVersion=3, validationCandidateSha=sha))
     run_validations(store, assignment, worktree, "task")
     campaign_commands = store.state.get("campaignValidationCommands", [])
@@ -2165,10 +2163,10 @@ def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: di
             if session["phase"].startswith("repair-"):
                 repair_paths = session.get("approvedRepairPaths")
                 if repair_paths is None:
-                    repair_paths, outside = approved_repair_paths(store, assignment, blockers)
+                    repair_paths, outside = approved_repair_paths(store, assignment, blockers, worktree)
                 else:
                     maximum = maximum_repair_paths(store, assignment)
-                    directories = scope_directories(store, maximum)
+                    directories = scope_directories(store, maximum, worktree)
                     outside = [path for path in repair_paths if not allowed_change(path, maximum, directories)]
                 if outside:
                     store.state["taskStates"][assignment_id]["error"] = f"accepted blocker requires paths outside assignment scope: {', '.join(outside)}"
@@ -2186,12 +2184,12 @@ def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: di
                         repair = {"candidateSha": session["pendingWorkerSha"]}
                     else:
                         reserve_repair(store, assignment_id, number)
-                        repair = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt("repair", repair_assignment, current_sha, blockers, store.state["taskStates"][assignment_id].get("error", "")), mode="repair", review=True, validator=lambda value: validate_worker_result(store, repair_assignment, worktree, value, current_sha))
+                        repair = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt("repair", repair_assignment, current_sha, blockers, store.state["taskStates"][assignment_id].get("error", "")), mode="repair", review=True, validator=lambda value: validate_worker_result(store, repair_assignment, worktree, value, current_sha, current_sha))
                         record_worker_output(store, assignment_id, repair)
                         session.update(previousCandidateSha=current_sha, pendingWorkerSha=repair["candidateSha"])
                         store.save()
-                    candidate_integrity(store, repair_assignment, worktree, repair, current_sha)
-                    repaired_sha = validate_candidate(store, repair_assignment, worktree, repair)
+                    candidate_integrity(store, repair_assignment, worktree, repair, current_sha, current_sha)
+                    repaired_sha = validate_candidate(store, repair_assignment, worktree, repair, current_sha, current_sha)
                 except (RuntimeError, ValueError, OSError, json.JSONDecodeError) as error:
                     task_state = store.state["taskStates"][assignment_id]
                     task_state["error"] = str(error)
@@ -3184,13 +3182,14 @@ def recovery_worktree(store: StateStore, assignment_id: str) -> tuple[Path, dict
     return worktree, record
 
 
-def _recovery_snapshot(store: StateStore, assignment: dict, *, adopt_clean_candidate: bool = False) -> dict:
+def _recovery_snapshot(store: StateStore, assignment: dict, *, adopt_clean_candidate: bool = False, allow_dirty_repair: bool = False, allow_repair_scope_cleanup: bool = False) -> dict:
     assignment_id = assignment["id"]
     worktree, record = recovery_worktree(store, assignment_id)
     head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
     dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout
-    if dirty:
+    if dirty and not allow_dirty_repair:
         raise RuntimeError(f"recovery refused unexpected worktree changes: {assignment_id}")
+    dirty_paths = sorted(set(target_git_paths(store, worktree, "diff", "--name-only") + target_git_paths(store, worktree, "ls-files", "--others", "--exclude-standard"))) if dirty else []
     task_state = store.state["taskStates"][assignment_id]
     session = store.state.get("reviewSessions", {}).get(assignment_id, {})
     candidates = {
@@ -3216,25 +3215,28 @@ def _recovery_snapshot(store: StateStore, assignment: dict, *, adopt_clean_candi
         if not isinstance(approved, list) or any(not isinstance(path, str) or not valid_relative_path(path) for path in approved):
             raise RuntimeError(f"recovery refused invalid approved repair scope: {assignment_id}")
         maximum = maximum_repair_paths(store, assignment)
-        directories = scope_directories(store, maximum)
+        directories = scope_directories(store, maximum, worktree)
         unapproved = sorted(path for path in approved if not allowed_change(path, maximum, directories))
         if unapproved:
             raise RuntimeError(f"recovery refused approved repair paths outside maximum scope for {assignment_id}: {', '.join(unapproved)}")
         allowed = approved
         repair_base = session.get("currentCandidateSha")
-        if repair_base and head != repair_base:
-            ancestry = git(worktree, "merge-base", "--is-ancestor", repair_base, head, timeout=store.state["validationTimeoutSeconds"], check=False)
-            if ancestry.returncode:
-                raise RuntimeError(f"recovery refused repair ancestry drift: {assignment_id}")
+        if repair_base:
+            if head != repair_base:
+                ancestry = git(worktree, "merge-base", "--is-ancestor", repair_base, head, timeout=store.state["validationTimeoutSeconds"], check=False)
+                if ancestry.returncode:
+                    raise RuntimeError(f"recovery refused repair ancestry drift: {assignment_id}")
             diff_base = repair_base
     changed = target_changes(store, worktree, diff_base, head)
-    directories = scope_directories(store, allowed) | {
-        normalized_path(path) for path in allowed if not path_has_magic(path) and (worktree / path).is_dir()
-    }
-    outside = sorted(path for path in changed if not allowed_change(path, allowed, directories))
+    directories = scope_directories(store, allowed, worktree)
+    outside = sorted(path for path in [*changed, *dirty_paths] if not allowed_change(path, allowed, directories))
     if outside:
-        raise RuntimeError(f"recovery refused scope drift for {assignment_id}: {', '.join(outside)}")
-    return {"headSha": head, "branch": record["branch"]}
+        maximum = maximum_repair_paths(store, assignment)
+        maximum_directories = scope_directories(store, maximum, worktree)
+        unsafe = sorted(path for path in outside if not allowed_change(path, maximum, maximum_directories))
+        if unsafe or not allow_repair_scope_cleanup:
+            raise RuntimeError(f"recovery refused scope drift for {assignment_id}: {', '.join(unsafe or outside)}")
+    return {"headSha": head, "branch": record["branch"], **({"dirtyPaths": dirty_paths} if dirty_paths else {}), **({"scopeDriftPaths": outside} if outside else {})}
 
 
 def _inspect_pr_readonly(store: StateStore, identifier: str | int) -> dict:
@@ -3297,6 +3299,11 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
             error = task_state.get("error") or task_state.get("providerStatus") or ""
             if task_state.get("validationFailure") and task_state.get("validationCandidateSha"):
                 target = "candidate-validation"
+            elif error.startswith(("accepted blocker requires paths outside assignment scope:", "candidate changed paths outside assignment scope:")) and session.get("acceptedBlockerIds") and "approvedRepairPaths" in session:
+                snapshot = _recovery_snapshot(store, assignments[assignment_id], adopt_clean_candidate=True, allow_dirty_repair=True, allow_repair_scope_cleanup=True)
+                repair = re.fullmatch(rf"{re.escape(assignment_id)}:repair:(\d+)", str(task_state.get("activeRepairWorkItem", "")))
+                target = f"repair-{repair.group(1) if repair else int(session.get('reviewEpoch', 0)) + 1}"
+                adopt_clean_candidate = snapshot["headSha"] != session.get("currentCandidateSha")
             elif re.match(r"\[(?:Errno|WinError) \d+\]", error) and assignment_id in store.state.get("worktrees", {}):
                 snapshot = _recovery_snapshot(store, assignments[assignment_id], adopt_clean_candidate=True)
                 repair = re.fullmatch(rf"{re.escape(assignment_id)}:repair:(\d+)", str(task_state.get("activeRepairWorkItem", "")))
@@ -3328,7 +3335,9 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
             action["adoptCleanCandidate"] = True
         if target.startswith("repair-") and phase == "needs-user":
             action["resumeReviewRepair"] = True
-            if snapshot["headSha"] != session.get("currentCandidateSha"):
+            if snapshot.get("dirtyPaths"):
+                action["resumeDirtyRepair"] = True
+            if snapshot["headSha"] != session.get("currentCandidateSha") and not snapshot.get("scopeDriftPaths"):
                 action["candidateSha"] = snapshot["headSha"]
         if target == "candidate-validation":
             action["candidateSha"] = task_state.get("pendingWorkerSha") or task_state.get("validationCandidateSha") or snapshot["headSha"]
@@ -3398,7 +3407,7 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
                 task_state.pop("error", None)
             else:
                 if assignment_id in store.state.get("worktrees", {}):
-                    snapshot = _recovery_snapshot(store, assignments[assignment_id], adopt_clean_candidate=bool(action.get("adoptCleanCandidate")))
+                    snapshot = _recovery_snapshot(store, assignments[assignment_id], adopt_clean_candidate=bool(action.get("adoptCleanCandidate")), allow_dirty_repair=bool(action.get("resumeDirtyRepair")), allow_repair_scope_cleanup=bool(action.get("scopeDriftPaths")))
                     if any(snapshot.get(key) != action.get(key) for key in snapshot):
                         raise RuntimeError(f"assignment changed after recovery preview: {assignment_id}")
                 if task_state.get("phase") != action["fromPhase"]:
