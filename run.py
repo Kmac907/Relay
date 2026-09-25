@@ -1059,6 +1059,7 @@ def context_packet(store: StateStore, repo: Path, assignment_id: str, role: str,
     return {
         "role": role, "mode": mode, "permissions": "write assigned worktree only" if role == "worker" else "read-only",
         "candidateSha": candidate,
+        "worktreeBaseSha": store.state.get("worktrees", {}).get(assignment_id, {}).get("baseSha", ""),
         "campaign": {
             "id": store.state.get("campaignId"), "objective": store.state.get("campaignObjective"),
             "baseSha": store.state.get("baseSha"), "integrationSha": store.state.get("integrationSha") or store.state.get("baseSha"),
@@ -1097,8 +1098,8 @@ def record_worker_output(store: StateStore, assignment_id: str, result: dict) ->
     store.update(record)
 
 
-def worker_prompt(mode: str, assignment: dict, candidate_sha: str = "", blockers: list[dict] | None = None, previous_failure: str = "") -> str:
-    return json.dumps({"mode": mode, "candidateSha": candidate_sha, "blockers": blockers or [], "previousFailure": previous_failure}, sort_keys=True)
+def worker_prompt(mode: str, assignment: dict, candidate_sha: str = "", blockers: list[dict] | None = None, previous_failure: str = "", cleanup_paths: list[str] | None = None) -> str:
+    return json.dumps({"mode": mode, "candidateSha": candidate_sha, "blockers": blockers or [], "previousFailure": previous_failure, "cleanupPaths": cleanup_paths or []}, sort_keys=True)
 
 
 def role_prompt(role: str, assignment: dict, candidate_sha: str, context: object) -> str:
@@ -1550,19 +1551,24 @@ def candidate_integrity(store: StateStore, assignment: dict, worktree: Path, res
         if sha == parent_sha or ancestry.returncode:
             raise RuntimeError("validation repair must commit a descendant candidate")
     changed = target_changes(store, worktree, scope_base or assignment_base, sha)
-    if "changedPaths" in result and sorted(result["changedPaths"]) != sorted(changed):
-        raise ValueError(f"reported changed paths do not match candidate diff; expected {json.dumps(changed)}")
     allowed = assignment["allowedPaths"]
     directories = scope_directories(store, allowed, worktree)
     outside = sorted(item for item in changed if not allowed_change(item, allowed, directories))
     if outside:
         raise RuntimeError(f"candidate changed paths outside assignment scope: {', '.join(outside)}")
+    if "changedPaths" in result and sorted(result["changedPaths"]) != sorted(changed):
+        raise ValueError(f"reported changed paths do not match candidate diff; expected {json.dumps(changed)}")
     return sha
 
 
 def validate_worker_result(store: StateStore, assignment: dict, worktree: Path, result: dict, parent_sha: str | None = None, scope_base: str | None = None) -> dict:
     if result["status"] == "candidate":
-        candidate_integrity(store, assignment, worktree, result, parent_sha, scope_base)
+        sha = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
+        if result["candidateSha"] != sha:
+            raise ValueError("reported candidate does not equal worktree HEAD")
+        changed = target_changes(store, worktree, scope_base or store.state["worktrees"][assignment["id"]]["baseSha"], sha)
+        if "changedPaths" in result and sorted(result["changedPaths"]) != sorted(changed):
+            raise ValueError(f"reported changed paths do not match candidate diff; expected {json.dumps(changed)}")
     return result
 
 
@@ -2466,11 +2472,12 @@ def _merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignm
             if pending:
                 result = {"candidateSha": pending}
             else:
-                result = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt(repair_mode, assignment, working_sha, blocker, task_state.get("error", "")), mode=repair_mode, review=True, validator=lambda value: validate_worker_result(store, assignment, worktree, value, working_sha))
+                result = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt(repair_mode, assignment, working_sha, blocker, task_state.get("error", ""), task_state.get("integrationCleanupPaths")), mode=repair_mode, review=True, validator=lambda value: validate_worker_result(store, assignment, worktree, value, working_sha))
                 record_worker_output(store, assignment_id, result)
             candidate_integrity(store, assignment, worktree, result, working_sha)
             replacement = validate_candidate(store, assignment, worktree, result)
             task_state["integrationValidatedSha"] = replacement
+            task_state.pop("integrationCleanupPaths", None)
             task_state.pop("pendingWorkerSha", None)
             task_state.pop("integrationWorkingSha", None)
             store.save()
@@ -2486,6 +2493,16 @@ def _merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignm
         except (RuntimeError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as error:
             task_state["error"] = str(error)
             candidate = clean_validation_candidate(store, assignment_id, worktree)
+            scope_prefix = "candidate changed paths outside assignment scope: "
+            if repair_mode == "integration-repair" and candidate and str(error).startswith(scope_prefix):
+                cleanup_paths = [path.strip() for path in str(error)[len(scope_prefix):].split(",")]
+                if not cleanup_paths or any(not valid_relative_path(path) for path in cleanup_paths):
+                    raise
+                record_progress(store, assignment_id, worktree, candidate, assignment["allowedPaths"], "integration-scope")
+                task_state.update(integrationWorkingSha=candidate, integrationCleanupPaths=cleanup_paths)
+                task_state.pop("pendingWorkerSha", None)
+                store.save()
+                continue
             if task_state.get("validationFailure") and candidate:
                 record_progress(store, assignment_id, worktree, candidate, assignment["allowedPaths"], "integration-validation")
                 task_state["integrationWorkingSha"] = candidate
@@ -2493,6 +2510,7 @@ def _merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignm
                 store.save()
                 continue
             if not candidate and not requires_human(error):
+                task_state.pop("pendingWorkerSha", None)
                 store.save()
                 continue
             raise
@@ -2783,6 +2801,7 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
                     raise
                 else:
                     task_state.pop("validationCandidateSha", None)
+                    task_state.pop("pendingWorkerSha", None)
                 store.save()
                 sha = None
         if not run_review(store, semaphore, assignment, worktree, sha):
@@ -3182,7 +3201,7 @@ def recovery_worktree(store: StateStore, assignment_id: str) -> tuple[Path, dict
     return worktree, record
 
 
-def _recovery_snapshot(store: StateStore, assignment: dict, *, adopt_clean_candidate: bool = False, allow_dirty_repair: bool = False, allow_repair_scope_cleanup: bool = False) -> dict:
+def _recovery_snapshot(store: StateStore, assignment: dict, *, adopt_clean_candidate: bool = False, allow_dirty_repair: bool = False, allow_repair_scope_cleanup: bool = False, allow_integration_cleanup: bool = False) -> dict:
     assignment_id = assignment["id"]
     worktree, record = recovery_worktree(store, assignment_id)
     head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
@@ -3191,6 +3210,8 @@ def _recovery_snapshot(store: StateStore, assignment: dict, *, adopt_clean_candi
         raise RuntimeError(f"recovery refused unexpected worktree changes: {assignment_id}")
     untracked_paths = target_git_paths(store, worktree, "ls-files", "--others", "--exclude-standard") if dirty else []
     dirty_paths = sorted(set(target_git_paths(store, worktree, "diff", "--name-only") + untracked_paths)) if dirty else []
+    untracked_roots = {path.split("/", 1)[0] for path in untracked_paths}
+    disposable_untracked_roots = sorted(untracked_roots) if untracked_roots and untracked_roots <= {".pytest-temp", ".pytest-tmp"} else []
     task_state = store.state["taskStates"][assignment_id]
     session = store.state.get("reviewSessions", {}).get(assignment_id, {})
     candidates = {
@@ -3207,9 +3228,12 @@ def _recovery_snapshot(store: StateStore, assignment: dict, *, adopt_clean_candi
     if ancestry.returncode:
         pending = task_state.get("pendingWorkerSha") or task_state.get("integrationValidatedSha")
         diff_base = task_state.get("integrationWorkingSha") or session.get("reviewedSha")
-        parent = git(worktree, "merge-base", "--is-ancestor", diff_base, head, timeout=store.state["validationTimeoutSeconds"], check=False) if diff_base else ancestry
-        if head != pending or head == diff_base or parent.returncode:
-            raise RuntimeError(f"recovery refused candidate ancestry drift: {assignment_id}")
+        if task_state.get("integrationRepairStatus") and head == session.get("reviewedSha"):
+            diff_base = head
+        else:
+            parent = git(worktree, "merge-base", "--is-ancestor", diff_base, head, timeout=store.state["validationTimeoutSeconds"], check=False) if diff_base else ancestry
+            if head != pending or head == diff_base or parent.returncode:
+                raise RuntimeError(f"recovery refused candidate ancestry drift: {assignment_id}")
     allowed = assignment["allowedPaths"]
     if "approvedRepairPaths" in session and not task_state.get("integrationRepairStatus"):
         approved = session["approvedRepairPaths"]
@@ -3230,14 +3254,15 @@ def _recovery_snapshot(store: StateStore, assignment: dict, *, adopt_clean_candi
             diff_base = repair_base
     changed = target_changes(store, worktree, diff_base, head)
     directories = scope_directories(store, allowed, worktree)
-    outside = sorted(path for path in [*changed, *dirty_paths] if not allowed_change(path, allowed, directories))
+    scoped_dirty_paths = [path for path in dirty_paths if path.split("/", 1)[0] not in disposable_untracked_roots]
+    outside = sorted(path for path in [*changed, *scoped_dirty_paths] if not allowed_change(path, allowed, directories))
     if outside:
         maximum = maximum_repair_paths(store, assignment)
         maximum_directories = scope_directories(store, maximum, worktree)
         unsafe = sorted(path for path in outside if not allowed_change(path, maximum, maximum_directories))
-        if unsafe or not allow_repair_scope_cleanup:
+        if (unsafe and not allow_integration_cleanup) or not allow_repair_scope_cleanup:
             raise RuntimeError(f"recovery refused scope drift for {assignment_id}: {', '.join(unsafe or outside)}")
-    return {"headSha": head, "branch": record["branch"], **({"dirtyPaths": dirty_paths} if dirty_paths else {}), **({"untrackedPaths": untracked_paths} if untracked_paths else {}), **({"scopeDriftPaths": outside} if outside else {})}
+    return {"headSha": head, "branch": record["branch"], **({"dirtyPaths": dirty_paths} if dirty_paths else {}), **({"untrackedPaths": untracked_paths} if untracked_paths else {}), **({"disposableUntrackedRoots": disposable_untracked_roots} if disposable_untracked_roots else {}), **({"scopeDriftPaths": outside} if outside else {})}
 
 
 def _inspect_pr_readonly(store: StateStore, identifier: str | int) -> dict:
@@ -3292,7 +3317,9 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
         session = store.state.get("reviewSessions", {}).get(assignment_id, {})
         snapshot = None
         adopt_clean_candidate = False
-        validated_repair = False
+        discard_validation_dirt = False
+        discard_untracked_roots = []
+        resuming_integration = False
         if re.fullmatch(r"(?:repair|verify)-\d+", str(phase)):
             safe = True
         else:
@@ -3309,8 +3336,20 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
             elif re.match(r"\[(?:Errno|WinError) \d+\]", error) and assignment_id in store.state.get("worktrees", {}):
                 repair = re.fullmatch(rf"{re.escape(assignment_id)}:repair:(\d+)", str(task_state.get("activeRepairWorkItem", "")))
                 resuming_repair = bool(repair and session.get("acceptedBlockerIds") and "approvedRepairPaths" in session)
-                snapshot = _recovery_snapshot(store, assignments[assignment_id], adopt_clean_candidate=True, allow_dirty_repair=resuming_repair, allow_repair_scope_cleanup=resuming_repair)
-                if resuming_repair:
+                resuming_integration = bool(task_state.get("integrationRepairStatus") and session.get("reviewedSha") and (task_state.get("pr") or store.state.get("pullRequests", {}).get(assignment_id)))
+                validated_candidate = task_state.get("validationCandidateSha")
+                snapshot = _recovery_snapshot(store, assignments[assignment_id], adopt_clean_candidate=True, allow_dirty_repair=resuming_repair or bool(validated_candidate), allow_repair_scope_cleanup=resuming_repair or resuming_integration, allow_integration_cleanup=resuming_integration)
+                discard_untracked_roots = snapshot.get("disposableUntrackedRoots", [])
+                tracked_dirty = set(snapshot.get("dirtyPaths", [])) - set(snapshot.get("untrackedPaths", []))
+                discard_validation_dirt = bool(tracked_dirty and snapshot["headSha"] == validated_candidate)
+                if tracked_dirty and not discard_validation_dirt and not resuming_repair:
+                    raise RuntimeError(f"recovery refused unsafe interrupted integration dirt for {assignment_id}: {', '.join(snapshot['dirtyPaths'])}")
+                if snapshot.get("untrackedPaths") and not discard_untracked_roots and not resuming_repair:
+                    raise RuntimeError(f"recovery refused unsafe interrupted integration artifacts: {assignment_id}")
+                if resuming_integration:
+                    target = "approved"
+                    adopt_clean_candidate = snapshot["headSha"] != session.get("reviewedSha")
+                elif resuming_repair:
                     target = f"repair-{repair.group(1)}"
                     adopt_clean_candidate = True
                 else:
@@ -3326,13 +3365,17 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
                 continue
         elif safe:
             target = phase
-            validated_repair = re.fullmatch(r"verify-\d+", str(session.get("phase", ""))) and session.get("pendingRepairSha") == task_state.get("validationCandidateSha")
-            if validated_repair:
+            validated_candidate = task_state.get("validationCandidateSha")
+            if validated_candidate:
                 snapshot = _recovery_snapshot(store, assignments[assignment_id], allow_dirty_repair=True, allow_repair_scope_cleanup=True)
-                if snapshot.get("untrackedPaths") or snapshot["headSha"] != session["pendingRepairSha"] or set(snapshot.get("scopeDriftPaths", [])) - set(snapshot.get("dirtyPaths", [])):
-                    raise RuntimeError(f"recovery refused unsafe validated repair drift: {assignment_id}")
-                target = session["phase"]
-            elif phase == "implementing":
+                discard_untracked_roots = snapshot.get("disposableUntrackedRoots", [])
+                tracked_dirty = set(snapshot.get("dirtyPaths", [])) - set(snapshot.get("untrackedPaths", []))
+                discard_validation_dirt = bool(tracked_dirty)
+                if (discard_validation_dirt and (snapshot["headSha"] != validated_candidate or set(snapshot.get("scopeDriftPaths", [])) - tracked_dirty)) or (snapshot.get("untrackedPaths") and not discard_untracked_roots):
+                    raise RuntimeError(f"recovery refused unsafe validated candidate drift: {assignment_id}")
+                if re.fullmatch(r"verify-\d+", str(session.get("phase", ""))) and session.get("pendingRepairSha") == validated_candidate:
+                    target = session["phase"]
+            if phase == "implementing" and not discard_validation_dirt:
                 target = "candidate-validation" if task_state.get("pendingWorkerSha") else "ready"
             elif phase in {"provider-checks", "resume-provider", "waiting-provider", "push-and-open-pr"}:
                 target = "approved"
@@ -3340,8 +3383,14 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
             raise RuntimeError(f"recovery refused removed or unknown phase {phase!r} for {assignment_id}; replan from the incomplete requirements and backlog")
         snapshot = snapshot or _recovery_snapshot(store, assignments[assignment_id])
         action = {"action": "resume", "assignmentId": assignment_id, "fromPhase": phase, "toPhase": target, **snapshot}
-        if validated_repair and snapshot.get("dirtyPaths"):
-            action.update(resumeReviewRepair=True, discardDirtyPaths=snapshot["dirtyPaths"])
+        if discard_validation_dirt:
+            action["discardDirtyPaths"] = sorted(set(snapshot["dirtyPaths"]) - set(snapshot.get("untrackedPaths", [])))
+            if re.fullmatch(r"verify-\d+", target):
+                action["resumeReviewRepair"] = True
+        if discard_untracked_roots:
+            action["discardUntrackedRoots"] = discard_untracked_roots
+        if resuming_integration:
+            action.update(resumeIntegrationRepair=True, integrationWorkingSha=snapshot["headSha"], integrationCleanupPaths=snapshot.get("scopeDriftPaths", []))
         if adopt_clean_candidate:
             action["adoptCleanCandidate"] = True
         if target.startswith("repair-") and phase == "needs-user":
@@ -3418,14 +3467,22 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
                 task_state.pop("error", None)
             else:
                 if assignment_id in store.state.get("worktrees", {}):
-                    snapshot = _recovery_snapshot(store, assignments[assignment_id], adopt_clean_candidate=bool(action.get("adoptCleanCandidate")), allow_dirty_repair=bool(action.get("resumeDirtyRepair") or action.get("discardDirtyPaths")), allow_repair_scope_cleanup=bool(action.get("scopeDriftPaths")))
+                    snapshot = _recovery_snapshot(store, assignments[assignment_id], adopt_clean_candidate=bool(action.get("adoptCleanCandidate")), allow_dirty_repair=bool(action.get("resumeDirtyRepair") or action.get("discardDirtyPaths") or action.get("discardUntrackedRoots")), allow_repair_scope_cleanup=bool(action.get("scopeDriftPaths") or action.get("resumeIntegrationRepair")), allow_integration_cleanup=bool(action.get("resumeIntegrationRepair")))
                     if any(snapshot.get(key) != action.get(key) for key in snapshot):
                         raise RuntimeError(f"assignment changed after recovery preview: {assignment_id}")
                     if action.get("discardDirtyPaths"):
                         git(recovery_worktree(store, assignment_id)[0], "restore", "--source", "HEAD", "--worktree", "--", *action["discardDirtyPaths"], timeout=store.state["validationTimeoutSeconds"])
+                    for root in action.get("discardUntrackedRoots", []):
+                        if root not in {".pytest-temp", ".pytest-tmp"}:
+                            raise RuntimeError(f"recovery refused unknown disposable directory: {root}")
+                        artifact = safe_within(recovery_worktree(store, assignment_id)[0] / root, recovery_worktree(store, assignment_id)[0])
+                        if artifact.is_dir():
+                            shutil.rmtree(artifact)
                 if task_state.get("phase") != action["fromPhase"]:
                     raise RuntimeError(f"assignment phase changed after recovery preview: {assignment_id}")
                 task_state["phase"] = action["toPhase"]
+                if action.get("resumeIntegrationRepair"):
+                    task_state.update(integrationWorkingSha=action["integrationWorkingSha"], integrationCleanupPaths=action["integrationCleanupPaths"])
                 if action.get("candidateSha") and action["toPhase"] == "candidate-validation":
                     task_state["pendingWorkerSha"] = action["candidateSha"]
                 if action.get("resumeReviewRepair"):

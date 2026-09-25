@@ -1273,8 +1273,10 @@ class DeterministicCoreTests(unittest.TestCase):
             assignment["validationCommands"] = []
             store.state["taskStates"][assignment["id"]] = {"phase": "candidate-validation"}
             store.state["worktrees"][assignment["id"]] = {"baseSha": base}
+            report = {"status": "candidate", "candidateSha": sha, "changedPaths": ["outside.txt"]}
+            self.assertIs(run.validate_worker_result(store, assignment, target, report), report)
             with self.assertRaisesRegex(RuntimeError, "outside.txt"):
-                run.validate_candidate(store, assignment, target, {"candidateSha": sha})
+                run.validate_candidate(store, assignment, target, {"candidateSha": sha, "changedPaths": []})
             (target / "untracked.txt").write_text("dirty\n", encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "uncommitted"):
                 run.validate_candidate(store, assignment, target, {"candidateSha": sha})
@@ -1357,6 +1359,24 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(actions[0]["candidateSha"], "integrated")
             self.assertEqual(actions[0]["toPhase"], "approved")
             self.assertEqual(store.state["reviewSessions"][assignment_id]["phase"], "approved")
+
+    def test_recovery_resumes_interrupted_integration_scope_cleanup(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task(); assignment_id = assignment["id"]
+            pr = {"number": 7, "state": "OPEN", "url": "x", "headRefOid": "reviewed"}
+            snapshot = {"headSha": "invalid-integration", "branch": "branch", "scopeDriftPaths": ["dependency.py"]}
+            store.state.update(phase="needs-user")
+            store.state["taskStates"][assignment_id] = {"phase": "needs-user", "candidateSha": "reviewed", "validationCandidateSha": "reviewed", "integrationRepairStatus": "repair-required", "pr": pr, "error": "[Errno 22] Invalid argument"}
+            store.state["reviewSessions"][assignment_id] = {"phase": "approved", "reviewedSha": "reviewed", "acceptedBlockerIds": []}
+            store.state["worktrees"][assignment_id] = {"path": root, "root": root, "branch": "branch", "baseSha": "base"}
+            with patch("run._recovery_snapshot", return_value=snapshot), patch("run._inspect_pr_readonly", return_value=pr):
+                actions = run.plan_recovery(store, [assignment], [])
+                run.apply_recovery(store, [assignment], actions)
+            self.assertTrue(actions[0]["resumeIntegrationRepair"])
+            self.assertEqual(actions[0]["integrationCleanupPaths"], ["dependency.py"])
+            self.assertEqual(store.state["taskStates"][assignment_id]["integrationWorkingSha"], "invalid-integration")
+            self.assertEqual(store.state["taskStates"][assignment_id]["integrationCleanupPaths"], ["dependency.py"])
 
     def test_recovery_adopts_clean_scoped_candidate_after_operational_failure(self):
         self.assertFalse(run.requires_human(OSError(22, "Invalid argument")))
@@ -1504,6 +1524,23 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(store.state["taskStates"][assignment["id"]]["phase"], "verify-1")
             self.assertEqual(git_output(target, "status", "--porcelain=v1", "--untracked-files=all"), "")
             self.assertEqual((target / "tests/evidence.json").read_text(encoding="utf-8"), "candidate\n")
+            (target / "tests/evidence.json").write_text("later validation output\n", encoding="utf-8")
+            store.state["taskStates"][assignment["id"]]["phase"] = "slice-review"
+            store.state["reviewSessions"][assignment["id"]]["phase"] = "approved"
+            with patch("run.tempfile.gettempdir", return_value=str(root)):
+                actions = run.plan_recovery(store, [assignment], [])
+                run.apply_recovery(store, [assignment], actions)
+            self.assertEqual(actions[0]["discardDirtyPaths"], ["tests/evidence.json"])
+            self.assertEqual(store.state["taskStates"][assignment["id"]]["phase"], "slice-review")
+            self.assertEqual(git_output(target, "status", "--porcelain=v1", "--untracked-files=all"), "")
+            artifact = target / ".pytest-temp" / "result.txt"
+            artifact.parent.mkdir()
+            artifact.write_text("generated\n", encoding="utf-8")
+            with patch("run.tempfile.gettempdir", return_value=str(root)):
+                actions = run.plan_recovery(store, [assignment], [])
+                run.apply_recovery(store, [assignment], actions)
+            self.assertEqual(actions[0]["discardUntrackedRoots"], [".pytest-temp"])
+            self.assertFalse(artifact.parent.exists())
 
     def test_reconcile_ignores_obsolete_extra_state_keys(self):
         with tempfile.TemporaryDirectory() as root:
@@ -2038,6 +2075,37 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertNotIn("fixAttemptsStarted", store.state["taskStates"][assignment["id"]])
             self.assertEqual(session["phase"], "approved")
 
+    def test_invalid_integration_scope_returns_to_a_write_worker(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            store.state["taskStates"][assignment["id"]] = {"phase": "approved", "integrationRepairStatus": "repair-required"}
+            store.state["worktrees"][assignment["id"]] = {"path": root, "branch": "relay/TASK-0001", "baseSha": "base"}
+            store.state["reviewSessions"][assignment["id"]] = {"phase": "approved", "reviewedSha": "reviewed", "reviewEpoch": 0}
+            pr = {"number": 1, "state": "OPEN", "url": "x", "headRefOid": "reviewed"}
+            workers = iter((
+                {"mode": "integration-repair", "assignmentId": assignment["id"], "status": "candidate", "candidateSha": "invalid", "changedPaths": ["one.txt"], "validation": [], "summary": "dropped base path"},
+                {"mode": "integration-repair", "assignmentId": assignment["id"], "status": "candidate", "candidateSha": "fixed", "changedPaths": ["one.txt"], "validation": [], "summary": "restored base path"},
+            ))
+            def agent(*args, **_kwargs):
+                if args[4] == "worker":
+                    return next(workers)
+                return {"assignmentId": assignment["id"], "mode": "incremental", "reviewEpoch": 1, "candidateSha": "fixed", "resolvedFindingIds": [], "findings": []}
+            integrity = [RuntimeError("candidate changed paths outside assignment scope: dependency.py"), None]
+            def candidate_integrity(*_args, **_kwargs):
+                error = integrity.pop(0)
+                if error:
+                    raise error
+                return "fixed"
+            with patch("run.invoke_with_replacements", side_effect=agent) as invoked, patch("run.candidate_integrity", side_effect=candidate_integrity), patch("run.clean_validation_candidate", return_value="invalid"), patch("run.validate_candidate", return_value="fixed"), patch("run.record_progress") as progress, patch("run.publish_candidate", return_value=pr), patch("run.refresh_integration_base", return_value=True), patch("run.provider_approve"), patch("run.wait_for_checks", return_value="passed"), patch("run.validate_publication_proof"), patch("run.pr_merge"), patch("run.inspect_merged_pr", return_value=pr | {"state": "MERGED", "headRefOid": "fixed"}), patch("run.mark_integrated"):
+                self.assertTrue(run._merge_assignment(store, threading.Semaphore(1), assignment, Path(root), "relay/TASK-0001", pr, "reviewed"))
+            worker_prompts = [json.loads(call.args[5]) for call in invoked.call_args_list if call.args[4] == "worker"]
+            self.assertEqual(worker_prompts[1]["candidateSha"], "invalid")
+            self.assertEqual(worker_prompts[1]["cleanupPaths"], ["dependency.py"])
+            self.assertIn("outside assignment scope", worker_prompts[1]["previousFailure"])
+            self.assertNotIn("integrationCleanupPaths", store.state["taskStates"][assignment["id"]])
+            progress.assert_called_once()
+
     def test_recovered_repair_behind_integration_base_is_reconciled_before_validation(self):
         with tempfile.TemporaryDirectory() as root:
             target = make_git_repository(Path(root))
@@ -2293,6 +2361,7 @@ class DeterministicCoreTests(unittest.TestCase):
                 "TASK-0002": {"phase": "repair-1", "candidateSha": "reviewed", "pendingWorkerSha": "pending", "integrationWorkingSha": "working", "validationHistory": [{"outcome": "failed"}], "workerHistory": [{"summary": "first result"}], "visitedFingerprints": ["one"]},
             }
             store.state["reviewSessions"]["TASK-0002"] = {"phase": "repair-1"}
+            store.state["worktrees"]["TASK-0002"] = {"baseSha": "integration-base"}
             store.state["learnings"] = [{"scope": ["shared/base.py"], "fact": "use base helper", "sourceAssignment": "TASK-0001", "evidenceSha": "abc", "status": "active"}]
             bug = ContractTests().backlog_bug(); bug.update(status="active", source="TASK-0009", allowedPaths=["app/feature.py"]); bug.pop("deferralReason")
             run.write_bugs(store, [bug])
@@ -2304,6 +2373,7 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(packet["validationEvidence"][0]["outcome"], "failed")
             self.assertEqual(packet["learnings"][0]["fact"], "use base helper")
             self.assertEqual(packet["candidateSha"], "pending")
+            self.assertEqual(packet["worktreeBaseSha"], "integration-base")
             store.state["taskStates"]["TASK-0002"].pop("pendingWorkerSha")
             self.assertEqual(run.context_packet(store, Path(root), "TASK-0002", "worker", "repair", "repair this")["candidateSha"], "working")
 
