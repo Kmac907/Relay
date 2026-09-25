@@ -1770,8 +1770,11 @@ class DeterministicCoreTests(unittest.TestCase):
             assignment = ContractTests().task()
             store.state["taskStates"][assignment["id"]] = {"phase": "approved", "pendingWorkerSha": pending, "integrationRepairStatus": "repair-required"}
             store.state["worktrees"][assignment["id"]] = {"path": str(target), "branch": "relay/TASK-0001", "baseSha": integration}
-            store.state["reviewSessions"][assignment["id"]] = {"phase": "approved", "reviewedSha": reviewed, "reviewEpoch": 0}
+            store.state["reviewSessions"][assignment["id"]] = {"phase": "approved", "reviewedSha": reviewed, "reviewEpoch": 0, "approvedRepairPaths": []}
             pr = {"number": 1, "state": "OPEN", "url": "x", "headRefOid": reviewed}
+
+            with patch("run.recovery_worktree", return_value=(target, store.state["worktrees"][assignment["id"]])):
+                self.assertEqual(run._recovery_snapshot(store, assignment)["headSha"], pending)
 
             def agent(*args, **_kwargs):
                 if args[4] == "worker":

@@ -3157,12 +3157,17 @@ def _recovery_snapshot(store: StateStore, assignment: dict) -> dict:
     }
     if head not in candidates:
         raise RuntimeError(f"recovery refused candidate SHA drift: {assignment_id}")
-    ancestry = git(worktree, "merge-base", "--is-ancestor", record["baseSha"], head, timeout=store.state["validationTimeoutSeconds"], check=False)
+    diff_base = record["baseSha"]
+    ancestry = git(worktree, "merge-base", "--is-ancestor", diff_base, head, timeout=store.state["validationTimeoutSeconds"], check=False)
     if ancestry.returncode:
-        raise RuntimeError(f"recovery refused candidate ancestry drift: {assignment_id}")
-    changed = target_changes(store, worktree, record["baseSha"], head)
+        pending = task_state.get("pendingWorkerSha") or task_state.get("integrationValidatedSha")
+        diff_base = task_state.get("integrationWorkingSha") or session.get("reviewedSha")
+        parent = git(worktree, "merge-base", "--is-ancestor", diff_base, head, timeout=store.state["validationTimeoutSeconds"], check=False) if diff_base else ancestry
+        if head != pending or head == diff_base or parent.returncode:
+            raise RuntimeError(f"recovery refused candidate ancestry drift: {assignment_id}")
+    changed = target_changes(store, worktree, diff_base, head)
     allowed = assignment["allowedPaths"]
-    if "approvedRepairPaths" in session:
+    if "approvedRepairPaths" in session and not task_state.get("integrationRepairStatus"):
         approved = session["approvedRepairPaths"]
         if not isinstance(approved, list) or any(not isinstance(path, str) or not valid_relative_path(path) for path in approved):
             raise RuntimeError(f"recovery refused invalid approved repair scope: {assignment_id}")
