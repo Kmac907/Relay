@@ -1467,6 +1467,7 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(actions[0]["scopeDriftPaths"], ["tests/evidence.json"])
             self.assertNotIn("pendingWorkerSha", store.state["reviewSessions"][assignment["id"]])
             self.assertEqual(store.state["taskStates"][assignment["id"]]["phase"], "repair-1")
+            self.assertEqual(store.state["taskStates"][assignment["id"]]["error"], "repair must remove changes outside approved scope before completion: tests/evidence.json")
 
     def test_reconcile_ignores_obsolete_extra_state_keys(self):
         with tempfile.TemporaryDirectory() as root:

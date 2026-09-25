@@ -3424,7 +3424,10 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
                     session = store.state.get("reviewSessions", {}).get(assignment_id, {})
                     if session.get("phase") == "needs-user":
                         session["phase"] = "approved"
-                task_state.pop("error", None)
+                if action.get("scopeDriftPaths"):
+                    task_state["error"] = "repair must remove changes outside approved scope before completion: " + ", ".join(action["scopeDriftPaths"])
+                else:
+                    task_state.pop("error", None)
         store.state["pendingRecovery"]["completed"].append(f"{action['action']}:{assignment_id}")
         store.save()
     if any(action["action"] == "defer" for action in actions):
