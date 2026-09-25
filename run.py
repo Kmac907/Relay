@@ -2406,6 +2406,19 @@ def _merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignm
     while True:
         pending = task_state.get("pendingWorkerSha") or task_state.get("integrationValidatedSha")
         working_sha = task_state.get("integrationWorkingSha") or reviewed_sha
+        if pending:
+            assignment_base = store.state["worktrees"][assignment_id]["baseSha"]
+            if git(worktree, "merge-base", "--is-ancestor", assignment_base, pending, timeout=store.state["validationTimeoutSeconds"], check=False).returncode:
+                head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
+                dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout
+                parent = git(worktree, "merge-base", "--is-ancestor", working_sha, pending, timeout=store.state["validationTimeoutSeconds"], check=False)
+                if head != pending or dirty or pending == working_sha or parent.returncode:
+                    raise ValueError("recovered integration candidate has unsafe ancestry or worktree drift")
+                task_state.update(integrationWorkingSha=pending, integrationRepairStatus="repair-required")
+                task_state.pop("pendingWorkerSha", None)
+                task_state.pop("integrationValidatedSha", None)
+                store.save()
+                working_sha, pending = pending, None
         if pending or task_state.get("integrationRepairStatus"):
             status = task_state.get("integrationRepairStatus", "repair-required")
         elif not refresh_integration_base(store, assignment_id, worktree, reviewed_sha, "integration-fetch"):

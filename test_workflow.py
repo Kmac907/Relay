@@ -1748,6 +1748,45 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertNotIn("fixAttemptsStarted", store.state["taskStates"][assignment["id"]])
             self.assertEqual(session["phase"], "approved")
 
+    def test_recovered_repair_behind_integration_base_is_reconciled_before_validation(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = make_git_repository(Path(root))
+            base = git_output(target, "rev-parse", "HEAD").strip()
+            path = target / "src" / "file.py"; path.parent.mkdir(); path.write_text("reviewed\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", "src/file.py"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "reviewed"], check=True, capture_output=True)
+            reviewed = git_output(target, "rev-parse", "HEAD").strip()
+            path.write_text("repaired\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "commit", "-am", "repair"], check=True, capture_output=True)
+            pending = git_output(target, "rev-parse", "HEAD").strip()
+            subprocess.run(["git", "-C", str(target), "checkout", "-b", "integration", base], check=True, capture_output=True)
+            (target / "README.md").write_text("# Integrated\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "commit", "-am", "integration"], check=True, capture_output=True)
+            integration = git_output(target, "rev-parse", "HEAD").strip()
+            subprocess.run(["git", "-C", str(target), "checkout", "--detach", pending], check=True, capture_output=True)
+
+            store = self.state_store(target)
+            run.exclude_relay_files(target)
+            assignment = ContractTests().task()
+            store.state["taskStates"][assignment["id"]] = {"phase": "approved", "pendingWorkerSha": pending, "integrationRepairStatus": "repair-required"}
+            store.state["worktrees"][assignment["id"]] = {"path": str(target), "branch": "relay/TASK-0001", "baseSha": integration}
+            store.state["reviewSessions"][assignment["id"]] = {"phase": "approved", "reviewedSha": reviewed, "reviewEpoch": 0}
+            pr = {"number": 1, "state": "OPEN", "url": "x", "headRefOid": reviewed}
+
+            def agent(*args, **_kwargs):
+                if args[4] == "worker":
+                    subprocess.run(["git", "-C", str(target), "merge", "--no-edit", "integration"], check=True, capture_output=True)
+                    candidate = git_output(target, "rev-parse", "HEAD").strip()
+                    return {"mode": "integration-repair", "assignmentId": assignment["id"], "status": "candidate", "candidateSha": candidate, "validation": [], "summary": "integrated"}
+                candidate = git_output(target, "rev-parse", "HEAD").strip()
+                return {"assignmentId": assignment["id"], "mode": "incremental", "reviewEpoch": 1, "candidateSha": candidate, "resolvedFindingIds": [], "findings": []}
+
+            with patch("run.invoke_with_replacements", side_effect=agent) as invoked, patch("run.validate_candidate", side_effect=lambda *_args: git_output(target, "rev-parse", "HEAD").strip()), patch("run.publish_candidate", return_value=pr), patch("run.refresh_integration_base", side_effect=[True, True]), patch("run.provider_approve"), patch("run.wait_for_checks", return_value="passed"), patch("run.validate_publication_proof"), patch("run.pr_merge"), patch("run.inspect_merged_pr", return_value=pr | {"state": "MERGED"}), patch("run.mark_integrated"):
+                self.assertTrue(run._merge_assignment(store, threading.Semaphore(1), assignment, target, "relay/TASK-0001", pr, reviewed))
+            self.assertEqual(invoked.call_args_list[0].args[4], "worker")
+            self.assertEqual(json.loads(invoked.call_args_list[0].args[5])["candidateSha"], pending)
+            self.assertNotIn("integrationRepairStatus", store.state["taskStates"][assignment["id"]])
+
     def test_existing_pr_and_merged_pr_are_not_duplicated(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
