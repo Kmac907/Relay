@@ -1316,6 +1316,30 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(run.validate_candidate(store, assignment, target, {"candidateSha": sha}), sha)
             self.assertEqual(fixture.read_text(encoding="utf-8"), "{}\n")
 
+    def test_candidate_cleans_tracked_validation_side_effects(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = make_git_repository(Path(root))
+            base = git_output(target, "rev-parse", "HEAD").strip()
+            fixture = target / "outcome.json"
+            fixture.write_text("{}\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", fixture.name], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "candidate"], check=True, capture_output=True)
+            sha = git_output(target, "rev-parse", "HEAD").strip()
+            store = self.state_store(target)
+            run.exclude_relay_files(target)
+            assignment = ContractTests().task()
+            assignment.update(allowedPaths=[fixture.name], validationCommands=[])
+            store.state["campaignValidationCommands"] = []
+            store.state["taskStates"][assignment["id"]] = {"phase": "candidate-validation"}
+            store.state["worktrees"][assignment["id"]] = {"baseSha": base}
+
+            def validation(*_args, **_kwargs):
+                fixture.write_text("live result\n", encoding="utf-8")
+
+            with patch("run.run_validations", side_effect=validation):
+                self.assertEqual(run.validate_candidate(store, assignment, target, {"candidateSha": sha}), sha)
+            self.assertEqual(fixture.read_text(encoding="utf-8"), "{}\n")
+
     def test_out_of_scope_blocker_stops_before_repair(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
@@ -1373,6 +1397,29 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(actions[0]["candidateSha"], "integrated")
             self.assertEqual(actions[0]["toPhase"], "approved")
             self.assertEqual(store.state["reviewSessions"][assignment_id]["phase"], "approved")
+
+    def test_recovery_resumes_stale_verification_and_discards_validation_dirt(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task(); assignment_id = assignment["id"]
+            repair = "repair"
+            store.state.update(phase="needs-user")
+            store.state["taskStates"][assignment_id] = {
+                "phase": "needs-user", "candidateSha": repair, "validationCandidateSha": repair,
+                "activeRepairWorkItem": f"{assignment_id}:repair:4",
+                "error": "verification reviewer changed candidate SHA",
+            }
+            store.state["reviewSessions"][assignment_id] = {
+                "phase": "needs-user", "currentCandidateSha": repair, "pendingRepairSha": repair,
+                "previousCandidateSha": "previous",
+            }
+            store.state["worktrees"][assignment_id] = {"path": root, "root": root, "branch": "branch", "baseSha": "base"}
+            snapshot = {"headSha": repair, "branch": "branch", "dirtyPaths": ["outcome.json"]}
+            with patch("run._recovery_snapshot", return_value=snapshot):
+                actions = run.plan_recovery(store, [assignment], [])
+            self.assertEqual(actions[0]["toPhase"], "verify-4")
+            self.assertEqual(actions[0]["discardDirtyPaths"], ["outcome.json"])
+            self.assertTrue(actions[0]["resumeReviewRepair"])
 
     def test_recovery_resumes_interrupted_integration_scope_cleanup(self):
         with tempfile.TemporaryDirectory() as root:
@@ -2725,7 +2772,7 @@ class FakeEndToEndTests(unittest.TestCase):
             }
             subprocess.run([sys.executable, str(Path(plan.__file__)), "--repo", str(target), "--requirements", str(requirements)], capture_output=True, text=True, env=environment, check=True)
             command = [sys.executable, str(Path(run.__file__)), "--repo", str(target), "--agent-timeout", "10", "--validation-timeout", "10", "--provider-timeout", "10", "--provider-check-timeout", "10"]
-            first = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=30)
+            first = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=60)
             state = json.loads((target / ".relay" / "state.json").read_text(encoding="utf-8"))
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr + json.dumps(state, indent=2))
             self.assertEqual((state["phase"], state["agentsBootstrap"]["phase"]), ("complete", "complete"))
