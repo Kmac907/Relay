@@ -1300,7 +1300,9 @@ class DeterministicCoreTests(unittest.TestCase):
             store.state["campaignValidationCommands"] = []
             store.state["taskStates"][assignment["id"]] = {"phase": "candidate-validation"}
             store.state["worktrees"][assignment["id"]] = {"baseSha": base}
+            fixture.write_text("post-candidate validation output\n", encoding="utf-8")
             self.assertEqual(run.validate_candidate(store, assignment, target, {"candidateSha": sha}), sha)
+            self.assertEqual(fixture.read_text(encoding="utf-8"), "{}\n")
 
     def test_out_of_scope_blocker_stops_before_repair(self):
         with tempfile.TemporaryDirectory() as root:
