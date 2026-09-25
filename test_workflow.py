@@ -2096,7 +2096,7 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertNotIn("fixAttemptsStarted", store.state["taskStates"][assignment["id"]])
             self.assertEqual(session["phase"], "approved")
 
-    def test_invalid_integration_scope_returns_to_a_write_worker(self):
+    def test_invalid_integration_candidate_returns_to_a_write_worker(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
             assignment = ContractTests().task()
@@ -2105,6 +2105,7 @@ class DeterministicCoreTests(unittest.TestCase):
             store.state["reviewSessions"][assignment["id"]] = {"phase": "approved", "reviewedSha": "reviewed", "reviewEpoch": 0}
             pr = {"number": 1, "state": "OPEN", "url": "x", "headRefOid": "reviewed"}
             workers = iter((
+                {"mode": "integration-repair", "assignmentId": assignment["id"], "status": "candidate", "candidateSha": "behind", "changedPaths": ["one.txt"], "validation": [], "summary": "missed integration base"},
                 {"mode": "integration-repair", "assignmentId": assignment["id"], "status": "candidate", "candidateSha": "invalid", "changedPaths": ["one.txt"], "validation": [], "summary": "dropped base path"},
                 {"mode": "integration-repair", "assignmentId": assignment["id"], "status": "candidate", "candidateSha": "fixed", "changedPaths": ["one.txt"], "validation": [], "summary": "restored base path"},
             ))
@@ -2112,20 +2113,23 @@ class DeterministicCoreTests(unittest.TestCase):
                 if args[4] == "worker":
                     return next(workers)
                 return {"assignmentId": assignment["id"], "mode": "incremental", "reviewEpoch": 1, "candidateSha": "fixed", "resolvedFindingIds": [], "findings": []}
-            integrity = [RuntimeError("candidate changed paths outside assignment scope: dependency.py"), None]
+            integrity = [RuntimeError("candidate does not descend from expected base"), RuntimeError("candidate changed paths outside assignment scope: dependency.py"), None]
             def candidate_integrity(*_args, **_kwargs):
                 error = integrity.pop(0)
                 if error:
                     raise error
                 return "fixed"
-            with patch("run.invoke_with_replacements", side_effect=agent) as invoked, patch("run.candidate_integrity", side_effect=candidate_integrity), patch("run.clean_validation_candidate", return_value="invalid"), patch("run.validate_candidate", return_value="fixed"), patch("run.record_progress") as progress, patch("run.publish_candidate", return_value=pr), patch("run.refresh_integration_base", return_value=True), patch("run.provider_approve"), patch("run.wait_for_checks", return_value="passed"), patch("run.validate_publication_proof"), patch("run.pr_merge"), patch("run.inspect_merged_pr", return_value=pr | {"state": "MERGED", "headRefOid": "fixed"}), patch("run.mark_integrated"):
+            completed = subprocess.CompletedProcess([], 0, "", "")
+            with patch("run.invoke_with_replacements", side_effect=agent) as invoked, patch("run.candidate_integrity", side_effect=candidate_integrity), patch("run.clean_validation_candidate", side_effect=["behind", "invalid"]), patch("run.git", return_value=completed), patch("run.validate_candidate", return_value="fixed"), patch("run.record_progress") as progress, patch("run.publish_candidate", return_value=pr), patch("run.refresh_integration_base", return_value=True), patch("run.provider_approve"), patch("run.wait_for_checks", return_value="passed"), patch("run.validate_publication_proof"), patch("run.pr_merge"), patch("run.inspect_merged_pr", return_value=pr | {"state": "MERGED", "headRefOid": "fixed"}), patch("run.mark_integrated"):
                 self.assertTrue(run._merge_assignment(store, threading.Semaphore(1), assignment, Path(root), "relay/TASK-0001", pr, "reviewed"))
             worker_prompts = [json.loads(call.args[5]) for call in invoked.call_args_list if call.args[4] == "worker"]
-            self.assertEqual(worker_prompts[1]["candidateSha"], "invalid")
-            self.assertEqual(worker_prompts[1]["cleanupPaths"], ["dependency.py"])
-            self.assertIn("outside assignment scope", worker_prompts[1]["previousFailure"])
+            self.assertEqual(worker_prompts[1]["candidateSha"], "behind")
+            self.assertIn("does not descend", worker_prompts[1]["previousFailure"])
+            self.assertEqual(worker_prompts[2]["candidateSha"], "invalid")
+            self.assertEqual(worker_prompts[2]["cleanupPaths"], ["dependency.py"])
+            self.assertIn("outside assignment scope", worker_prompts[2]["previousFailure"])
             self.assertNotIn("integrationCleanupPaths", store.state["taskStates"][assignment["id"]])
-            progress.assert_called_once()
+            self.assertEqual(progress.call_count, 2)
 
     def test_recovered_repair_behind_integration_base_is_reconciled_before_validation(self):
         with tempfile.TemporaryDirectory() as root:
