@@ -1588,6 +1588,7 @@ def validate_candidate(store: StateStore, assignment: dict, worktree: Path, resu
     campaign_commands = store.state.get("campaignValidationCommands", [])
     if campaign_commands:
         run_validations(store, assignment, worktree, "campaign", campaign_commands)
+    candidate_integrity(store, assignment, worktree, result, parent_sha, scope_base)
     def accepted(state: dict) -> None:
         state["candidateShas"][assignment["id"]] = sha
         state["taskStates"][assignment["id"]].update(candidateSha=sha, phase="slice-review")
@@ -3351,6 +3352,18 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
             error = task_state.get("error") or task_state.get("providerStatus") or ""
             if task_state.get("validationFailure") and task_state.get("validationCandidateSha"):
                 target = "candidate-validation"
+            elif error == "verification reviewer changed candidate SHA" and task_state.get("validationCandidateSha") == session.get("pendingRepairSha"):
+                repair = re.fullmatch(rf"{re.escape(assignment_id)}:repair:(\d+)", str(task_state.get("activeRepairWorkItem", "")))
+                if not repair:
+                    continue
+                trusted_candidate = task_state["validationCandidateSha"]
+                snapshot = _recovery_snapshot(store, assignments[assignment_id], allow_dirty_repair=True, allow_repair_scope_cleanup=True, tracked_cleanup_candidate=trusted_candidate)
+                discard_untracked_roots = snapshot.get("disposableUntrackedRoots", [])
+                tracked_dirty = set(snapshot.get("dirtyPaths", [])) - set(snapshot.get("untrackedPaths", []))
+                discard_validation_dirt = bool(tracked_dirty and snapshot["headSha"] == trusted_candidate)
+                if (tracked_dirty and not discard_validation_dirt) or (snapshot.get("untrackedPaths") and not discard_untracked_roots):
+                    raise RuntimeError(f"recovery refused unsafe validated candidate drift: {assignment_id}")
+                target = f"verify-{repair.group(1)}"
             elif error.startswith(("accepted blocker requires paths outside assignment scope:", "candidate changed paths outside assignment scope:")) and session.get("acceptedBlockerIds") and "approvedRepairPaths" in session:
                 snapshot = _recovery_snapshot(store, assignments[assignment_id], adopt_clean_candidate=True, allow_dirty_repair=True, allow_repair_scope_cleanup=True)
                 repair = re.fullmatch(rf"{re.escape(assignment_id)}:repair:(\d+)", str(task_state.get("activeRepairWorkItem", "")))
