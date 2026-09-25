@@ -2528,7 +2528,7 @@ def _merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignm
             scope_prefix = "candidate changed paths outside assignment scope: "
             if repair_mode == "integration-repair" and candidate and str(error) == "candidate does not descend from expected base":
                 parent = git(worktree, "merge-base", "--is-ancestor", working_sha, candidate, timeout=store.state["validationTimeoutSeconds"], check=False)
-                if candidate == working_sha or parent.returncode:
+                if parent.returncode:
                     raise
                 record_progress(store, assignment_id, worktree, candidate, assignment["allowedPaths"], "integration-ancestry")
                 task_state.update(integrationWorkingSha=candidate)
