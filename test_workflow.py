@@ -1377,6 +1377,10 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(actions[0]["integrationCleanupPaths"], ["dependency.py"])
             self.assertEqual(store.state["taskStates"][assignment_id]["integrationWorkingSha"], "invalid-integration")
             self.assertEqual(store.state["taskStates"][assignment_id]["integrationCleanupPaths"], ["dependency.py"])
+            with patch("run._recovery_snapshot", return_value=snapshot), patch("run._inspect_pr_readonly", return_value=pr):
+                actions = run.plan_recovery(store, [assignment], [])
+            self.assertTrue(actions[0]["resumeIntegrationRepair"])
+            self.assertEqual(actions[0]["integrationWorkingSha"], "invalid-integration")
 
     def test_recovery_adopts_clean_scoped_candidate_after_operational_failure(self):
         self.assertFalse(run.requires_human(OSError(22, "Invalid argument")))
@@ -1535,6 +1539,15 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(actions[0]["discardDirtyPaths"], ["tests/evidence.json"])
             self.assertEqual(store.state["taskStates"][assignment["id"]]["phase"], "slice-review")
             self.assertEqual(git_output(target, "status", "--porcelain=v1", "--untracked-files=all"), "")
+            (target / "tests/evidence.json").write_text("other task validation output\n", encoding="utf-8")
+            store.state["taskStates"][assignment["id"]].update(validationCandidateSha=candidate, pendingWorkerSha=repair)
+            store.state["reviewSessions"][assignment["id"]].update(phase="repair-2", currentCandidateSha=candidate, approvedRepairPaths=["src/app.py"])
+            narrow_assignment = assignment | {"allowedPaths": ["src/app.py"]}
+            with patch("run.tempfile.gettempdir", return_value=str(root)):
+                actions = run.plan_recovery(store, [narrow_assignment], [])
+                run.apply_recovery(store, [narrow_assignment], actions)
+            self.assertEqual(actions[0]["discardDirtyPaths"], ["tests/evidence.json"])
+            self.assertEqual((target / "tests/evidence.json").read_text(encoding="utf-8"), "candidate\n")
             artifact = target / ".pytest-temp" / "result.txt"
             artifact.parent.mkdir()
             artifact.write_text("generated\n", encoding="utf-8")
