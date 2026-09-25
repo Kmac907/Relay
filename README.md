@@ -54,17 +54,15 @@ For an existing repository, skip this step.
 python plan.py `
   --repo C:\Code\Projects\Example `
   --requirements C:\path\to\requirements.md `
-  --workers 3 `
-  --campaign-active-timeout 86400 `
-  --campaign-agent-calls 100
+  --workers 3
 
 python run.py --repo C:\Code\Projects\Example --dry-run
 python run.py --repo C:\Code\Projects\Example
 ```
 
-The planner creates the smallest independently verifiable assignments that fit one fresh context. It prefers vertical behavior; an enabling assignment is valid only with focused validation and a named consumer in the same finite plan. The plan receives one bounded review before execution.
+The planner creates the smallest independently verifiable assignments that fit one fresh context. It prefers vertical behavior; an enabling assignment is valid only with focused validation and a named consumer in the same finite plan. The plan receives one initial review and, when needed, one scoped repair and verification before execution.
 
-`PLAN.md` is a reviewed immutable contract containing the requirement source or snapshot, objective, task graph, paths, non-goals, acceptance criteria, validation, campaign resource ceilings, and prompt-template digest. `tasks.md` is its coordinator-owned mutable execution projection.
+`PLAN.md` is a reviewed immutable contract containing the requirement source or snapshot, objective, task graph, paths, non-goals, acceptance criteria, validation, and prompt-template digest. `tasks.md` is its coordinator-owned mutable execution projection.
 
 Read status without changing state:
 
@@ -79,7 +77,7 @@ Relay has seven agent roles:
 
 | Role | Access | Responsibility |
 | --- | --- | --- |
-| Scout | Read-only | Optional bounded repository discovery during planning. |
+| Scout | Read-only | Optional fixed-scope repository discovery during planning. |
 | Planner | Read-only | Produce the finite task graph and repair a rejected plan. |
 | Plan Reviewer | Read-only | Review the plan and verify its one repair. |
 | Worker | Worktree write | Implement task, repair, bug, or integration-repair mode. |
@@ -89,7 +87,7 @@ Relay has seven agent roles:
 
 Scheduling, tests, Git/worktree operations, provider polling, integration, output validation, state changes, and cycle detection are coordinator functions, not agents.
 
-Stable role policy lives in `prompts/*.md`. Python appends a canonical JSON handoff packet built from applicable `AGENTS.md` files, the assignment contract, Git SHAs, dependency results, bugs, validation evidence, prior attempts, review epochs, and relevant merged learnings. The fully rendered execution prompt and its template/context/prompt hashes are recorded under `.relay/logs/prompts/` and `.relay/state.json`. Safety boundaries are also enforced by Python; prompt text is not a security boundary.
+Stable role policy lives in `prompts/*.md`. Python appends a canonical JSON handoff packet built from applicable `AGENTS.md` files, the assignment contract, Git SHAs, dependency results, bugs, validation evidence, prior results, review epochs, and relevant merged learnings. The fully rendered execution prompt and its template/context/prompt hashes are recorded under `.relay/logs/prompts/` and `.relay/state.json`. Safety boundaries are also enforced by Python; prompt text is not a security boundary.
 
 Only relevant context is selected. Workers receive path- or dependency-related learnings and history; reviewers and auditors remain independent. Raw logs are referenced when needed rather than appended wholesale.
 
@@ -122,7 +120,11 @@ ready -> leased -> running -> candidate -> accepted -> integrated
 
 Every candidate runs focused validation followed by campaign validation. A task receives one initial review. Later epochs verify only unresolved findings, claimed resolutions, and the repair delta; they may add only blockers introduced by that delta. Review never returns to the initial phase or widens the assignment.
 
-Relay does not stop a productive repair because an arbitrary per-task count was reached. It persists fingerprints containing the candidate tree, validation failure evidence, open finding IDs, integration base, repair scope, and provider state. An unchanged candidate, repeated fingerprint, A-B-A cycle, or irrelevant code change with unchanged failures/findings stops the affected work item. Relevant changes may continue until evidence advances, a state cycles, or the campaign resource ceiling is reached. Process deadlines, provider deadlines, the campaign active-time ceiling, and the campaign agent-call ceiling still bound resource use.
+Relay maximizes autonomous throughput. There are no campaign budgets, call allowances, retry limits, fix-loop limits, or attempt counters. Work continues while deterministic project status advances. Relay stops only for unsafe repository or provider drift, missing credentials or access, or a genuine human decision.
+
+Relay persists fingerprints containing the candidate tree, validation failure evidence, open finding IDs, integration base, repair scope, and provider state. An unchanged candidate, repeated fingerprint, A-B-A cycle, or irrelevant code change with unchanged failures/findings is a genuine decision point and becomes `needs-user`. Each external agent, validation, provider command, and provider-check window has a hard deadline. Expiration starts a fresh status-driven operation; it never consumes or grants an allowance. Concurrency remains limited by `--workers`.
+
+The interactive console continuously redraws one spinner/status heartbeat. Redirected output emits a plain `WAIT` line only when status changes or after the periodic interval. These lines are presentation only; Relay never creates persisted WAIT work items.
 
 Workers may propose concise path-scoped learnings. Relay activates them only after the evidence candidate merges, marks them stale when supporting paths change, and injects only relevant active learnings into later Worker contexts.
 
@@ -130,7 +132,7 @@ Workers may propose concise path-scoped learnings. Relay activates them only aft
 
 Reviewers and auditors report evidence only: severity, location, observable failure, reproduction text, an exact requirement citation, evidence, candidate provenance, and affected evidence paths. They never select actions, IDs, status, or repair scope, and Relay never executes their reproduction text. `affectedPaths` must be repository-relative, must contain the location file, and never grants write access.
 
-`run.py` derives stable IDs and dispositions. Unsupported provenance and P3 findings are discarded; P2 findings enter `BACKLOG.md`; candidate-introduced P0/P1 findings become bounded review repairs or `needs-user` when they exceed the existing maximum scope. Pre-existing and audit P0/P1 findings become bug work only when their normalized requirement exactly matches supplied requirement or acceptance text; otherwise they enter the backlog. Coordinator disposition and reason are persisted with every finding and bug. Backlog and discarded findings do not block a candidate; `needs-user` takes priority over repair, and incremental approval requires every prior blocker to be explicitly resolved with no new blocker.
+`run.py` derives stable IDs and dispositions. Unsupported provenance and P3 findings are discarded; P2 findings enter `BACKLOG.md`; candidate-introduced P0/P1 findings become review repairs or `needs-user` when they exceed the existing maximum scope. Pre-existing and audit P0/P1 findings become bug work only when their normalized requirement exactly matches supplied requirement or acceptance text; otherwise they enter the backlog. Coordinator disposition and reason are persisted with every finding and bug. Backlog and discarded findings do not block a candidate; `needs-user` takes priority over repair, and incremental approval requires every prior blocker to be explicitly resolved with no new blocker.
 
 Bugs carry stable IDs, provenance, requirement, reproduction, evidence, paths, validation, and prior fingerprints. Their fixes use the same validation and incremental-review pipeline as tasks.
 
@@ -142,25 +144,21 @@ Completion requires all planned tasks satisfied or integrated, all blocking find
 
 ## Recovery
 
-Normal restarts reload schema-4 state, reconcile persisted reservations and live provider state, and continue a safe recorded phase. Resource exhaustion or a genuine decision requires an explicit recovery action, which previews before mutation:
+Normal restarts reload schema-4 state, reconcile persisted operations and live provider state, and continue the safe recorded phase. Recovery is for a genuine decision or explicit blocker deferral and previews every mutation.
 
-Malformed JSON and schema or validator failures use `--format-retries` as a fresh-agent correction allowance. Relay freezes the original context and schema, records the failed call and next reservation, and supplies the correction agent with exact JSON paths, stable error codes, and the rejected response as delimited untrusted data. Rejected responses are secret-redacted, included up to 64 KiB with a full hash and truncation flag, and saved under `.relay/logs/rejected/`. Corrections consume the campaign agent-call ceiling but do not rerun implementation or validation, increment Worker implementation attempts, create repair work, or advance review epochs. Process failures and timeouts are operational failures and are not corrected this way. Exhaustion records a `protocol-failed` coordinator operation while preserving the candidate and workflow phase.
+Malformed JSON and schema or validator failures start a fresh read-only correction context with the original context and schema frozen. Relay supplies exact JSON paths, stable error codes, and the rejected response as delimited untrusted data. Rejected responses are secret-redacted, included up to 64 KiB with a full hash and truncation flag, and saved under `.relay/logs/rejected/`. Corrections do not rerun implementation or validation, create repair work, or advance review epochs.
+
+Agent-process and provider timeouts are recorded, reconciled against current status, and relaunched when safe. Transient provider failures continue locally; credential/access failures and unsafe drift become `needs-user`. Human reviewer policy becomes `waiting-provider` without occupying a worker.
 
 ```powershell
 python run.py --repo C:\Code\Projects\Example --recover
 python run.py --repo C:\Code\Projects\Example --recover --confirm
 
-python run.py --repo C:\Code\Projects\Example --recover --grant-agent-calls 20
-python run.py --repo C:\Code\Projects\Example --recover --grant-agent-calls 20 --confirm
-
-python run.py --repo C:\Code\Projects\Example --recover --grant-active-seconds 3600
-python run.py --repo C:\Code\Projects\Example --recover --grant-active-seconds 3600 --confirm
-
 python run.py --repo C:\Code\Projects\Example --recover --defer-blocker BUG-0001
 python run.py --repo C:\Code\Projects\Example --recover --defer-blocker BUG-0001 --confirm
 ```
 
-Reservations are persisted before external processes so crashes never grant a free call. Unexpected dirt, SHA drift, path drift, provider-head drift, active processes, missing authority, and unknown phases stop without guessing.
+Operation identity and status are persisted before external processes. Unexpected dirt, SHA drift, path drift, provider-head drift, missing authority, and unknown phases stop without guessing; interrupted safe operations resume from recorded evidence.
 
 ## Cleanup
 
@@ -182,4 +180,4 @@ python run.py --help
 python status.py --help
 ```
 
-Exit codes are `0` for completion, `1` for operational or validation failure, `2` when user or provider action is required, and `130` when interrupted.
+Exit codes are `0` for completion, `1` for invalid startup state or an unsafe coordinator failure, `2` when user or provider action is required, and `130` when interrupted.

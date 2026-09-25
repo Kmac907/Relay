@@ -145,17 +145,10 @@ def positive(value: str) -> int:
     return number
 
 
-def nonnegative(value: str) -> int:
-    number = int(value)
-    if number < 0:
-        raise argparse.ArgumentTypeError("must not be negative")
-    return number
-
-
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         description="Run or resume an autonomous Relay campaign.",
-        epilog="needs-user requires a human decision; waiting-provider requires external completion; blocked records an unsafe or repeated operational failure.",
+        epilog="needs-user requires a human decision; waiting-provider requires external completion.",
     )
     result.add_argument("--repo", required=True, type=Path)
     result.add_argument("--workers", type=positive, default=3)
@@ -522,7 +515,7 @@ def initial_state(repo: Path, metadata: dict, args: argparse.Namespace) -> dict:
         "providerTimeoutSeconds": args.provider_timeout, "providerCheckTimeoutSeconds": args.provider_check_timeout,
         "mergeMethod": args.merge_method,
         "createdAt": datetime.now(timezone.utc).isoformat(), "heartbeat": datetime.now(timezone.utc).isoformat(),
-        "activeProcesses": {}, "worktrees": {}, "candidateShas": {}, "validationCommandsStarted": {}, "taskStates": {},
+        "activeProcesses": {}, "worktrees": {}, "candidateShas": {}, "taskStates": {},
         "workItems": {}, "pathLeases": {}, "promptRecords": [], "protocolSequences": {}, "coordinatorOperations": [], "findingRecords": [], "learnings": [], "integrationLock": None,
         "auditBugValidationCommands": {},
         "reviewSessions": {}, "pullRequests": {}, "providerDeadlines": {},
@@ -533,7 +526,7 @@ def initial_state(repo: Path, metadata: dict, args: argparse.Namespace) -> dict:
         "baselineValidation": {
             "baseSha": metadata["baseSha"], "commandsHash": commands_hash(campaign_commands),
             "phase": "pending",
-            "commandsStarted": 0, "currentCommand": None, "startedAt": None, "deadline": None,
+            "currentCommand": None, "startedAt": None, "deadline": None,
             "completedAt": None, "error": None, "log": None,
         },
     }
@@ -547,14 +540,15 @@ def atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     temporary.write_text(content, encoding="utf-8", newline="")
-    for attempt in range(5):
+    deadline = time.monotonic() + 1
+    while True:
         try:
             os.replace(temporary, path)
             return
         except PermissionError:
-            if attempt == 4:
+            if time.monotonic() >= deadline:
                 raise
-            time.sleep(.02)
+            time.sleep(.01)
 
 
 class StateStore:
@@ -1130,19 +1124,19 @@ def _reserve_agent_process(store: StateStore, assignment_id: str, role: str, mod
 
 
 def stop_phase(error: object) -> str:
+    return "needs-user"
+
+
+def requires_human(error: BaseException) -> bool:
     text = str(error).lower()
-    human = (
+    markers = (
         "credential", "authentication", "authorization", "not authorized", "permission denied",
         "conflicting requirement", "destructive ambiguity", "outside assignment scope",
-        "requires paths outside", "validation command ", "repeated progress fingerprint",
-        "did not advance failures or findings",
+        "requires paths outside", "repeated progress fingerprint", "did not advance failures or findings",
+        "unsafe ", "drift", "uncommitted changes", "does not descend", "reported candidate",
+        "no such file", "not recognized", "cannot find the file",
     )
-    return "needs-user" if any(marker in text for marker in human) else "blocked"
-
-
-def coordinator_failure_identity(error: BaseException, candidate: str) -> str:
-    value = f"{type(error).__name__}:{' '.join(str(error).split())}:{candidate}"
-    return hashlib.sha256(value.encode()).hexdigest()
+    return isinstance(error, (OSError, ValueError)) or any(marker in text for marker in markers)
 
 
 def progress_fingerprint(store: StateStore, assignment_id: str, worktree: Path, candidate: str, repair_scope: list[str], stage: str) -> tuple[str, str]:
@@ -1188,7 +1182,7 @@ def reserve_repair(store: StateStore, assignment_id: str, epoch: int, work_type:
         task_state = state["taskStates"][assignment_id]
         item_id = f"{assignment_id}:repair:{epoch}"
         previous = task_state.get("activeRepairWorkItem")
-        if previous != item_id and state["workItems"].get(previous, {}).get("status") not in {"accepted", "integrated"}:
+        if previous and previous != item_id and state["workItems"].get(previous, {}).get("status") not in {"accepted", "integrated"}:
             state["workItems"][previous]["status"] = "replaced"
         task_state["activeRepairWorkItem"] = item_id
         state["workItems"].setdefault(item_id, {
@@ -1465,7 +1459,6 @@ def _output(value: str | bytes | None) -> str:
 
 
 def run_validations(store: StateStore, assignment: dict, worktree: Path, category: str = "task", commands: list[str] | None = None, record: dict | None = None) -> None:
-    require_campaign_resources(store)
     assignment_id = assignment["id"]
     commands = assignment["validationCommands"] if commands is None else commands
     expected_record = store.state["baselineValidation"] if assignment_id == "BASELINE" else store.state["taskStates"][assignment_id]
@@ -1473,12 +1466,8 @@ def run_validations(store: StateStore, assignment: dict, worktree: Path, categor
     if record is not expected_record:
         raise ValueError("validation state record mismatch")
     for command_number, command in enumerate(commands, 1):
-        started = {}
-        def consume(state: dict) -> None:
-            key = assignment_id if category == "task" else f"{assignment_id}:{category}"
-            count = state["validationCommandsStarted"].get(key, 0) + 1
-            state["validationCommandsStarted"][key] = count
-            started["number"] = count
+        token = uuid.uuid4().hex
+        def reserve(state: dict) -> None:
             target = state["baselineValidation"] if assignment_id == "BASELINE" else state["taskStates"][assignment_id]
             target.update(
                 operation="validate", operationStartedAt=datetime.now(timezone.utc).isoformat(),
@@ -1486,13 +1475,13 @@ def run_validations(store: StateStore, assignment: dict, worktree: Path, categor
                 validationPosition=command_number, validationTotal=len(commands), validationCategory=category,
             )
             if assignment_id == "BASELINE":
-                target.update(phase="running", commandsStarted=count, currentCommand=command, startedAt=target.get("startedAt") or datetime.now(timezone.utc).isoformat(), deadline=target["operationDeadline"])
-        store.update(consume)
+                target.update(phase="running", currentCommand=command, startedAt=target.get("startedAt") or datetime.now(timezone.utc).isoformat(), deadline=target["operationDeadline"])
+        store.update(reserve)
         relay_console.update(runtime_progress(store.state, load_bugs(store)))
-        relay_console.emit("START", f"operation=validate category={category} assignment={assignment_id} command={command_number}/{len(commands)} attempt={started['number']} deadline={store.state['validationTimeoutSeconds']}s")
+        relay_console.emit("START", f"operation=validate category={category} assignment={assignment_id} command={command_number}/{len(commands)} deadline={store.state['validationTimeoutSeconds']}s")
         shell = validation_command(command)
         middle = "" if category == "task" else f"-{category}"
-        log = store.path.parent / "logs" / f"{assignment_id}{middle}-validation-{started['number']}.log"
+        log = store.path.parent / "logs" / f"{assignment_id}{middle}-validation-{token}.log"
         try:
             completed = run_validation_command(shell, cwd=worktree, timeout=store.state["validationTimeoutSeconds"], env=assignment_environment(store, assignment_id, worktree))
             exit_code, stdout, stderr = str(completed.returncode), completed.stdout, completed.stderr
@@ -2081,6 +2070,7 @@ def ensure_review_session(store: StateStore, assignment_id: str, sha: str, assig
             state["reviewSessions"][assignment_id] = {
                 "reviewSessionId": f"{assignment_id}-REVIEW-1", "initialCandidateSha": sha, "reviewedSha": "",
                 "phase": "verify-1" if audit else "slice-review", "reviewResult": None,
+                "reviewEpoch": 0,
                 "acceptedBlockerIds": [audit["id"]] if audit else [],
                 "openFindingIds": [audit.get("sourceFindingId", audit["id"])] if audit else [],
             }
@@ -2189,6 +2179,10 @@ def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: di
                         session.pop("pendingWorkerSha", None)
                         store.save()
                         continue
+                    if not candidate and not requires_human(error):
+                        session.pop("pendingWorkerSha", None)
+                        store.save()
+                        continue
                     raise
                 session.update(currentCandidateSha=repaired_sha, pendingRepairSha=repaired_sha, pendingRepairNumber=number)
                 session.pop("pendingWorkerSha", None)
@@ -2232,6 +2226,7 @@ def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: di
                 write_bugs(store, bugs)
             remaining_finding_ids = sorted((blocker_ids - resolved_ids) | {bug["sourceFindingId"] for bug in new_blockers})
             remaining = [bug for bug in load_bugs(store) if bug["sourceFindingId"] in remaining_finding_ids and bug["status"] == "active"]
+            session["reviewEpoch"] = number
             session["acceptedBlockerIds"] = [bug["id"] for bug in remaining]
             session["openFindingIds"] = remaining_finding_ids
             session["approvedRepairPaths"] = sorted({path for bug in remaining for path in bug.get("allowedPaths", [])})
@@ -2358,8 +2353,7 @@ def wait_for_checks(store: StateStore, assignment_id: str, pr: dict, reviewed_sh
                 return "failed"
             if reviewer_waiting:
                 progress("reviewer-policy-waiting", dict(Counter(blocking)), "external-approval")
-                time.sleep(min(10, max(0, deadline - time.time())))
-                continue
+                return "policy-waiting"
             if set(blocking) & {"queued", "running"} or merge_status == "queued":
                 progress("pending", dict(Counter(blocking)), "poll")
                 time.sleep(min(10, max(0, deadline - time.time())))
@@ -2406,10 +2400,15 @@ def refresh_integration_base(store: StateStore, assignment_id: str, worktree: Pa
 def _merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignment: dict, worktree: Path, branch: str, pr: dict, reviewed_sha: str) -> bool:
     assignment_id = assignment["id"]
     session = store.state["reviewSessions"][assignment_id]
+    task_state = store.state["taskStates"][assignment_id]
     merge_subject, merge_body, _merge_hash = canonical_merge_metadata(store.state, assignment, reviewed_sha)
     status = "ready"
     while True:
-        if not refresh_integration_base(store, assignment_id, worktree, reviewed_sha, "integration-fetch"):
+        pending = task_state.get("pendingWorkerSha") or task_state.get("integrationValidatedSha")
+        working_sha = task_state.get("integrationWorkingSha") or reviewed_sha
+        if pending or task_state.get("integrationRepairStatus"):
+            status = task_state.get("integrationRepairStatus", "repair-required")
+        elif not refresh_integration_base(store, assignment_id, worktree, reviewed_sha, "integration-fetch"):
             status = "repair-required"
         else:
             provider_approve(store, assignment_id, pr, reviewed_sha)
@@ -2421,29 +2420,47 @@ def _merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignm
                     break
             elif status not in {"failed", "repair-required"}:
                 break
-        record_progress(store, assignment_id, worktree, reviewed_sha, assignment["allowedPaths"], f"provider:{status}")
+        if not pending and not task_state.get("integrationRepairStatus"):
+            record_progress(store, assignment_id, worktree, reviewed_sha, assignment["allowedPaths"], f"provider:{status}")
+            task_state["integrationRepairStatus"] = status
+            store.save()
         repair_mode = "integration-repair" if status == "repair-required" else "repair"
-        fix_number = reserve_fix(store, assignment_id, "integration-repair" if repair_mode == "integration-repair" else "validation-repair")
-        blocker = [{"id": f"PROVIDER-{fix_number}", "failure": status, "evidence": f"{provider_name(store.state)} checks or merge readiness failed"}]
+        epoch = int(session.get("reviewEpoch", 0)) + 1
+        reserve_repair(store, assignment_id, epoch, "integration-repair" if repair_mode == "integration-repair" else "validation-repair")
+        blocker = [{"id": f"PROVIDER-{epoch}", "failure": status, "evidence": f"{provider_name(store.state)} checks or merge readiness failed"}]
         try:
-            result = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt(repair_mode, assignment, reviewed_sha, blocker, store.state["taskStates"][assignment_id].get("error", "")), mode=repair_mode, review=True)
-            record_worker_output(store, assignment_id, result)
-            candidate_integrity(store, assignment, worktree, result, reviewed_sha)
+            if pending:
+                result = {"candidateSha": pending}
+            else:
+                result = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt(repair_mode, assignment, working_sha, blocker, task_state.get("error", "")), mode=repair_mode, review=True)
+                record_worker_output(store, assignment_id, result)
+            candidate_integrity(store, assignment, worktree, result, working_sha)
             replacement = validate_candidate(store, assignment, worktree, result)
+            task_state["integrationValidatedSha"] = replacement
+            task_state.pop("pendingWorkerSha", None)
+            task_state.pop("integrationWorkingSha", None)
+            store.save()
             pr = publish_candidate(store, assignment, worktree, branch, replacement)
-            session.update(pendingRepairNumber=fix_number, acceptedBlockerIds=[], openFindingIds=[])
+            session.update(pendingRepairNumber=epoch, acceptedBlockerIds=[], openFindingIds=[])
             store.save()
             verification = invoke_with_replacements(
                 store, semaphore, worktree, assignment_id, "verification-reviewer",
-                role_prompt("verification-reviewer", assignment, replacement, {"previousCandidate": reviewed_sha, "repairDiff": f"{reviewed_sha}..{replacement}", "providerFailure": status, "expectedReviewEpoch": fix_number, "openFindingIds": []}),
+                role_prompt("verification-reviewer", assignment, replacement, {"previousCandidate": reviewed_sha, "repairDiff": f"{reviewed_sha}..{replacement}", "providerFailure": status, "expectedReviewEpoch": epoch, "openFindingIds": []}),
                 review=True, validator=lambda value: (validate_incremental_findings(store, worktree, reviewed_sha, replacement, value["findings"]), value)[1],
             )
-        except ProtocolExhaustedError:
-            return False
         except (RuntimeError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as error:
-            store.update(lambda state: state["taskStates"][assignment_id].update(error=str(error)))
-            status = "failed"
-            continue
+            task_state["error"] = str(error)
+            candidate = clean_validation_candidate(store, assignment_id, worktree)
+            if task_state.get("validationFailure") and candidate:
+                record_progress(store, assignment_id, worktree, candidate, assignment["allowedPaths"], "integration-validation")
+                task_state["integrationWorkingSha"] = candidate
+                task_state.pop("pendingWorkerSha", None)
+                store.save()
+                continue
+            if not candidate and not requires_human(error):
+                store.save()
+                continue
+            raise
         dispositions = coordinator_dispositions(
             assignment_id, verification["findings"], maximum_paths=maximum_repair_paths(store, assignment),
             reviewed_paths=target_changes(store, worktree, reviewed_sha, replacement) if verification["findings"] else [],
@@ -2451,11 +2468,32 @@ def _merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignm
         )
         new_blockers = record_findings(store, assignment_id, dispositions)
         session.pop("pendingRepairNumber", None)
-        if new_blockers or any(item["coordinatorDisposition"] == "needs-user" for item in dispositions):
-            status = "failed"
+        session["reviewEpoch"] = epoch
+        if any(item["coordinatorDisposition"] == "needs-user" for item in dispositions):
+            session["phase"] = task_state["phase"] = "needs-user"
+            task_state["error"] = "; ".join(item["coordinatorReason"] for item in dispositions if item["coordinatorDisposition"] == "needs-user")
+            store.save()
+            return False
+        if new_blockers:
+            session.update(
+                phase=f"repair-{epoch + 1}", currentCandidateSha=replacement,
+                acceptedBlockerIds=[item["id"] for item in new_blockers],
+                openFindingIds=[item["sourceFindingId"] for item in new_blockers],
+                approvedRepairPaths=sorted({path for item in new_blockers for path in item.get("allowedPaths", [])}),
+            )
+            task_state.pop("integrationRepairStatus", None)
+            task_state.pop("integrationValidatedSha", None)
+            store.save()
+            if not run_review(store, semaphore, assignment, worktree, replacement):
+                return False
+            reviewed_sha = session["reviewedSha"]
+            pr = publish_candidate(store, assignment, worktree, branch, reviewed_sha)
+            merge_subject, merge_body, _merge_hash = canonical_merge_metadata(store.state, assignment, reviewed_sha)
             continue
         reviewed_sha = replacement
         session["reviewedSha"] = replacement
+        task_state.pop("integrationRepairStatus", None)
+        task_state.pop("integrationValidatedSha", None)
         merge_subject, merge_body, _merge_hash = canonical_merge_metadata(store.state, assignment, reviewed_sha)
         store.state["providerDeadlines"].pop(assignment_id, None)
         status = "ready"
@@ -2613,8 +2651,7 @@ def run_baseline_validation(store: StateStore) -> bool:
 def process_assignment(store: StateStore, semaphore: threading.Semaphore, assignment: dict, mode: str) -> bool:
     assignment_id = assignment["id"]
     def initialize(state: dict) -> None:
-        task_state = state["taskStates"].setdefault(assignment_id, {"phase": "ready", "mode": mode, "pushed": False, "merged": False})
-        task_state.setdefault("fixAttemptsStarted", 0)
+        state["taskStates"].setdefault(assignment_id, {"phase": "ready", "mode": mode, "pushed": False, "merged": False})
         state["workItems"].setdefault(assignment_id, {
             "id": assignment_id, "parentAssignment": None, "type": mode, "status": "leased",
             "priority": assignment.get("priority"), "dependencies": list(assignment.get("dependencies", [])),
@@ -2629,10 +2666,8 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
         task_state.update(worktree=str(worktree), branch=branch)
         store.save()
         sha = task_state.get("candidateSha")
-        while not sha and not task_state.get("coordinatorFailureBlocked") and (task_state.get("pendingWorkerSha") or worker_attempt_available(store.state, assignment_id)):
+        while not sha:
             failure = task_state.get("validationFailure")
-            if failure and not worker_attempt_available(store.state, assignment_id):
-                break
             task_state["phase"] = "implementing"
             store.save()
             try:
@@ -2643,7 +2678,6 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
                     if failure:
                         if not candidate:
                             raise RuntimeError("validation candidate is missing or dirty")
-                        reserve_fix(store, assignment_id, "validation-repair")
                     result = invoke_with_replacements(
                         store, semaphore, worktree, assignment_id, "worker",
                         worker_prompt(mode, assignment, candidate or "", [failure] if failure else None, task_state.get("error", "")), mode=mode,
@@ -2658,8 +2692,6 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
                         head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
                         record_worker_output(store, assignment_id, result)
                         if not run_review(store, semaphore, assignment, worktree, head):
-                            if protocol_failed(store.state, assignment_id):
-                                return False
                             task_state["phase"] = store.state["reviewSessions"][assignment_id]["phase"]
                             store.save()
                             return False
@@ -2681,8 +2713,6 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
                 sha = validate_candidate(store, assignment, worktree, result)
                 task_state.pop("pendingWorkerSha", None)
                 store.save()
-            except ProtocolExhaustedError:
-                return False
             except (RuntimeError, ValueError, OSError, json.JSONDecodeError) as error:
                 task_state["error"] = str(error)
                 failure = task_state.get("validationFailure")
@@ -2693,26 +2723,14 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
                         record_progress(store, assignment_id, worktree, candidate, assignment["allowedPaths"], "validation")
                     task_state.pop("pendingWorkerSha", None)
                 elif candidate:
-                    identity = coordinator_failure_identity(error, candidate)
-                    previous = task_state.get("coordinatorFailure", {})
-                    count = previous.get("count", 0) + 1 if previous.get("identity") == identity else 1
-                    task_state["coordinatorFailure"] = {"identity": identity, "count": count, "candidateSha": candidate, "evidence": str(error)}
-                    task_state["pendingWorkerSha"] = candidate
-                    if count >= 2:
-                        task_state["coordinatorFailureBlocked"] = True
+                    raise
+                elif requires_human(error):
+                    raise
                 else:
                     task_state.pop("validationCandidateSha", None)
                 store.save()
                 sha = None
-        if not sha:
-            task_state["phase"] = "blocked" if task_state.get("coordinatorFailureBlocked") else stop_phase(task_state.get("error", "campaign resource ceiling exhausted"))
-            store.save()
-            relay_console.emit("BLOCKED", f"operation=worker assignment={assignment_id} reason={task_state.get('error', 'campaign resource ceiling exhausted')}")
-            clear_operation(store, assignment_id)
-            return False
         if not run_review(store, semaphore, assignment, worktree, sha):
-            if protocol_failed(store.state, assignment_id):
-                return False
             task_state["phase"] = store.state["reviewSessions"][assignment_id]["phase"]
             store.save()
             relay_console.emit("BLOCKED", f"operation=internal-review assignment={assignment_id} reason={task_state.get('error', 'review requires user')}")
@@ -2741,8 +2759,6 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
                 write_bugs(store, bugs)
         cleanup_worktree(store, assignment_id)
         return True
-    except ProtocolExhaustedError:
-        return False
     except (RuntimeError, ValueError, OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
         task_state.update(phase=stop_phase(error), error=str(error))
         store.save()
@@ -2796,18 +2812,15 @@ def run_audit(store: StateStore, semaphore: threading.Semaphore, tasks: list[dic
         scopes = list(store.state["auditScopes"].values())
     else:
         if not store.state["auditPlanStarted"]:
-            store.update(lambda state: state.update(auditPlanStarted=True, auditCallLimit=1 + state["formatRetryAllowance"]))
+            store.update(lambda state: state.update(auditPlanStarted=True))
         try:
             result = invoke_with_replacements(store, semaphore, Path(store.state["repository"]), "AUDIT", "audit-planner", role_prompt("audit-planner", {"id": "AUDIT", "requirements": [], "allowedPaths": [], "acceptanceCriteria": [], "validationCommands": []}, audit_sha, {"tasks": tasks, "bugs": load_bugs(store)}), audit=True, validator=validate_audit_plan)
             scopes = validate_audit_scopes(result)
-        except ProtocolExhaustedError:
-            return []
         except (RuntimeError, ValueError):
             store.update(lambda state: state.update(phase="needs-user"))
             return []
         def fixed(state: dict) -> None:
             state["auditScopes"] = {scope["scopeId"]: {**scope, "started": False, "completed": False, "findings": []} for scope in scopes}
-            state["auditCallLimit"] = (1 + len(scopes)) * (state["formatRetryAllowance"] + 1)
             state["auditPlanCompleted"] = True
         store.update(fixed)
     pending = [scope for scope in store.state["auditScopes"].values() if not scope["completed"]]
@@ -3214,7 +3227,7 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
                 actions.append({"action": "resume", "assignmentId": assignment_id, "fromPhase": phase, "toPhase": "ready"})
                 handled.add(assignment_id)
                 continue
-            elif task_state.get("pr") or store.state.get("pullRequests", {}).get(assignment_id) or _publication_retry_key(error, assignment_id):
+            elif task_state.get("pr") or store.state.get("pullRequests", {}).get(assignment_id):
                 target = "approved"
             else:
                 continue
@@ -3239,8 +3252,6 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
             if live["headRefOid"] != candidate:
                 raise RuntimeError(f"recovery refused provider SHA drift: {assignment_id}")
             action.update(prNumber=live["number"], providerState=live["state"], candidateSha=candidate)
-            if retry_key := _publication_retry_key(task_state.get("error"), assignment_id):
-                action["providerRetryKey"] = retry_key
         actions.append(action)
         handled.add(assignment_id)
 
@@ -3249,7 +3260,7 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
         if assignment_id in assignments and task_state.get("phase") not in {"integrated"} and assignment_id not in handled
     )
     if unresolved:
-        raise RuntimeError(f"recovery needs grant, defer, or replanning for: {', '.join(unresolved)}")
+        raise RuntimeError(f"recovery needs a genuine decision, deferral, or replanning for: {', '.join(unresolved)}")
     if not actions:
         raise RuntimeError("recovery found no safe action")
     return actions
@@ -3306,9 +3317,6 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
                 task_state["phase"] = action["toPhase"]
                 if action.get("candidateSha") and action["toPhase"] == "candidate-validation":
                     task_state["pendingWorkerSha"] = action["candidateSha"]
-                if retry_key := action.get("providerRetryKey"):
-                    attempts = store.state.get("providerAttemptCounters", {}).get(retry_key, 0)
-                    store.state["providerAttemptCounters"][retry_key] = max(0, attempts - 1)
                 task_state.pop("error", None)
         store.state["pendingRecovery"]["completed"].append(f"{action['action']}:{assignment_id}")
         store.save()
@@ -3318,12 +3326,30 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
 
 
 def reconcile(store: StateStore) -> None:
+    for field in (
+        "campaignAgentCallLimit", "campaignAgentCallsStarted", "campaignActiveTimeoutSeconds",
+        "activeRuntimeSeconds", "activeRuntimeStartedAt", "formatRetryAllowance",
+        "providerAttemptLimit", "attemptCounters", "validationCommandsStarted",
+        "providerAttemptCounters", "providerOperationsStarted", "auditCallsStarted",
+        "auditCallLimit", "resourceStatus", "resourceGrantHistory",
+    ):
+        store.state.pop(field, None)
     store.state.setdefault("protocolSequences", {})
     store.state.setdefault("coordinatorOperations", [])
     store.state.setdefault("findingRecords", [])
     for sequence in store.state["protocolSequences"].values():
-        if sequence.get("status") == "running":
-            sequence["status"] = "operational-failed"
+        correction = sequence.pop("protocolRetry", None)
+        if correction and not sequence.get("protocolCorrection"):
+            for field in ("attempt", "previousAttempt"):
+                correction.pop(field, None)
+            sequence["protocolCorrection"] = correction
+        for field in ("attemptLimit", "attemptsStarted"):
+            sequence.pop(field, None)
+        if sequence.get("status") in {"running", "operational-failed", "failed", "retry-reserved"}:
+            sequence["status"] = "correction" if sequence.get("protocolCorrection") else "open"
+    store.state["coordinatorOperations"] = [item for item in store.state["coordinatorOperations"] if item.get("operation") != "protocol-failed"]
+    for record in store.state.get("promptRecords", []):
+        record.pop("protocolAttempt", None)
     def legacy_finding(value: dict) -> dict:
         result = dict(value)
         if "affectedPaths" not in result:
@@ -3349,9 +3375,6 @@ def reconcile(store: StateStore) -> None:
             verification["findings"] = [legacy_finding(item) for item in verification.get("findings", [])]
     for scope in store.state.get("auditScopes", {}).values():
         scope["findings"] = [legacy_finding(item) for item in scope.get("findings", [])]
-    if store.state.get("activeRuntimeStartedAt") is not None:
-        store.state["activeRuntimeStartedAt"] = None
-        store.save()
     repository = Path(store.state["repository"])
     if git(repository, "rev-parse", "--show-toplevel", timeout=store.state["providerTimeoutSeconds"], check=False).returncode == 0:
         root, prefix = repository_layout(repository, store.state["providerTimeoutSeconds"])
@@ -3387,15 +3410,40 @@ def reconcile(store: StateStore) -> None:
         store.state["integrationLock"] = None
     store.state.pop("tasks", None)
     store.state.pop("bugs", None)
-    for task_state in store.state.get("taskStates", {}).values():
-        task_state.setdefault("fixAttemptsStarted", 0)
+    for assignment_id, task_state in store.state.get("taskStates", {}).items():
+        if "attemptHistory" in task_state and "workerHistory" not in task_state:
+            task_state["workerHistory"] = task_state.pop("attemptHistory")
+        for field in ("fixAttemptsStarted", "coordinatorFailure", "coordinatorFailureBlocked"):
+            task_state.pop(field, None)
+        session = store.state.get("reviewSessions", {}).get(assignment_id, {})
+        for field in ("reviewCallsStarted", "reviewCallLimit"):
+            session.pop(field, None)
+        epochs = [0, int(session.get("reviewEpoch", 0) or 0), int(session.get("pendingRepairNumber", 0) or 0)]
+        for result in (session.get("reviewResult"), session.get("verificationResult")):
+            if isinstance(result, dict) and isinstance(result.get("reviewEpoch"), int):
+                epochs.append(result["reviewEpoch"])
+        session["reviewEpoch"] = max(epochs)
+        old_failure = "exhausted" in str(task_state.get("error", "")).lower() or "allowance" in str(task_state.get("error", "")).lower()
+        if old_failure:
+            if task_state.get("pr") or store.state.get("pullRequests", {}).get(assignment_id):
+                task_state["phase"] = "approved"
+                if task_state.get("pendingWorkerSha"):
+                    task_state["integrationRepairStatus"] = "repair-required"
+            elif task_state.get("pendingWorkerSha") or task_state.get("validationCandidateSha"):
+                task_state["phase"] = "candidate-validation"
+            else:
+                task_state["phase"] = session.get("phase") if re.fullmatch(r"(?:repair|verify)-\d+", str(session.get("phase"))) else "ready"
+            task_state.pop("error", None)
         if re.fullmatch(r"validation-repair-\d+", str(task_state.get("phase"))):
-            task_state.update(phase="needs-user", error="removed validation-repair phase requires replanning")
+            task_state["phase"] = "candidate-validation" if task_state.get("validationCandidateSha") else "ready"
         for field in OPERATION_FIELDS:
             task_state.pop(field, None)
     if store.state.get("agentsBootstrap"):
         for field in OPERATION_FIELDS:
             store.state["agentsBootstrap"].pop(field, None)
+    if "exhausted" in str(store.state.get("error", "")).lower() or "allowance" in str(store.state.get("error", "")).lower():
+        store.state.pop("error", None)
+        store.state["phase"] = "build"
     store.save()
     for task in load_tasks(store):
         task_state = store.state.get("taskStates", {}).get(task["id"], {})
@@ -3492,13 +3540,11 @@ def execute_campaign(store: StateStore, tasks: list[dict]) -> int:
         return 2
     by_id = {task["id"]: task for task in tasks}
     run_assignments(store, semaphore, tasks, "task")
-    if protocol_failed(store.state):
-        return 1
     unfinished = [value for key, value in store.state["taskStates"].items() if key in by_id and value["phase"] != "integrated"]
     if unfinished:
-        terminal = "waiting-provider" if all(value["phase"] == "waiting-provider" for value in unfinished) else "blocked" if any(value["phase"] == "blocked" for value in unfinished) else "needs-user"
+        terminal = "waiting-provider" if all(value["phase"] == "waiting-provider" for value in unfinished) else "needs-user"
         store.update(lambda state: state.__setitem__("phase", terminal))
-        return 1 if terminal == "blocked" else 2
+        return 2
     campaign_bugs = [bug for bug in load_bugs(store) if bug["status"] == "active" and bug["source"] not in {"audit", "final-validation"}]
     if campaign_bugs:
         run_assignments(store, semaphore, [bug_assignment(store, bug) for bug in campaign_bugs], "bug")
@@ -3510,10 +3556,8 @@ def execute_campaign(store: StateStore, tasks: list[dict]) -> int:
     store.update(lambda state: state.__setitem__("phase", "audit"))
     try:
         bugs = run_audit(store, semaphore, tasks)
-        if protocol_failed(store.state):
-            return 1
         if store.state["phase"] in {"blocked", "needs-user"}:
-            return 1 if store.state["phase"] == "blocked" else 2
+            return 2
         if bugs:
             run_assignments(store, semaphore, [bug_assignment(store, bug) for bug in bugs], "bug")
         unresolved = [bug for bug in load_bugs(store) if bug["status"] == "active"]
@@ -3531,12 +3575,10 @@ def execute_campaign(store: StateStore, tasks: list[dict]) -> int:
         verify_campaign_completion(store, tasks)
         store.update(lambda state: state.__setitem__("phase", "complete"))
         return 0
-    except ProtocolExhaustedError:
-        return 1
     except (RuntimeError, ValueError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
         phase = stop_phase(error)
         store.update(lambda state: state.update(phase=phase, error=str(error)))
-        return 1 if phase == "blocked" else 2
+        return 2
 
 
 def blocked_assignments(state: dict) -> list[tuple[str, str]]:
@@ -3552,9 +3594,6 @@ def blocked_assignments(state: dict) -> list[tuple[str, str]]:
     for assignment_id, task in state.get("taskStates", {}).items():
         if task.get("phase") in {"blocked", "needs-user", "waiting-provider"}:
             blocked.append((assignment_id, str(task.get("error") or task.get("providerStatus") or task["phase"])))
-    for operation in state.get("coordinatorOperations", []):
-        if operation.get("operation") == "protocol-failed":
-            blocked.append((str(operation.get("assignmentId") or "CAMPAIGN"), "structured-output correction allowance exhausted"))
     return sorted(blocked) or [("CAMPAIGN", "action required")]
 
 
@@ -3572,28 +3611,11 @@ def _worktree_setup_failure(value: object) -> bool:
     return text.startswith("worktree setup failed:") or ("'worktree', 'add'" in text and "non-zero exit status" in text)
 
 
-def _provider_exhaustion(value: object) -> tuple[str, str] | None:
-    match = re.match(r"^(Azure DevOps|GitHub) operation exhausted attempts: ([^;\s]+)", _normalized_error(value))
-    return (match.group(1), match.group(2)) if match else None
-
-
-def _publication_retry_key(value: object, assignment_id: str) -> str | None:
-    failure = _provider_exhaustion(value)
-    if not failure or not failure[1].startswith(f"{assignment_id}:"):
-        return None
-    operation = failure[1][len(assignment_id) + 1:]
-    return failure[1] if operation in {"pr-list", "pr-create"} or re.fullmatch(r"pr-(?:refresh|edit):[0-9a-f]+", operation) else None
-
-
 def _blocker_detail(value: object) -> tuple[str, str]:
     if _worktree_setup_failure(value):
         return "worktree-setup", "Git could not create assignment worktrees before Worker launch"
-    provider = _provider_exhaustion(value)
-    if provider:
-        operation = provider[1].split(":", 1)[-1].split(":", 1)[0]
-        labels = {"pr-list": "PR discovery", "pr-create": "PR creation", "pr-refresh": "PR refresh", "pr-edit": "PR metadata update"}
-        if operation in labels:
-            return "provider-publication", f"{provider[0]} {labels[operation]} exhausted attempts"
+    if "provider" in str(value).lower():
+        return "provider", _normalized_error(value)
     return "assignment", _normalized_error(value)
 
 
@@ -3601,7 +3623,7 @@ def _blocker_log(state: dict, value: object) -> str:
     match = re.search(r"log:\s*([^\r\n]+)", str(value or ""))
     if match:
         return match.group(1)
-    return str(state_path(state, "logs/provider.log")) if _provider_exhaustion(value) else "not-recorded"
+    return str(state_path(state, "logs/provider.log")) if "provider" in str(value).lower() else "not-recorded"
 
 
 def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[list[str], str]:
@@ -3657,10 +3679,6 @@ def campaign_summary(state: dict, tasks: list[dict], bugs: list[dict]) -> tuple[
     bullets = [re.sub(r"^- ((?:TASK|BUG)-\d{4}) ", lambda match: f"- {display_assignment(state, match.group(1))} ", line) for line in bullets]
     bug_counts = Counter(bug["status"] for bug in bugs)
     lines = [f"phase={state.get('phase', 'unknown')} tasks={counts['completed']}/{len(tasks)} completed blocked={counts['blocked']} waiting={counts['waiting']} satisfied={counts['satisfied']} not-run={counts['not-run']} bugs={len(bugs)} backlog={bug_counts['backlog']}"]
-    lines.append(
-        f"- RESOURCES agent-calls={state.get('campaignAgentCallsStarted', 0)}/{state.get('campaignAgentCallLimit', 0)} "
-        f"active-seconds={current_active_runtime(state):.1f}/{state.get('campaignActiveTimeoutSeconds', 0)}"
-    )
     baseline = state.get("baselineValidation")
     if baseline:
         phase = baseline.get("phase", "unknown")
@@ -3821,8 +3839,6 @@ def permanent_cleanup(repo: Path, confirm: bool) -> int:
 
 def initialize_campaign(repo: Path, text: str, args: argparse.Namespace) -> tuple[StateStore, list[dict]]:
     metadata, tasks = parse_tasks(text)
-    if metadata["campaignActiveTimeoutSeconds"] != args.campaign_active_timeout or metadata["campaignAgentCallLimit"] != args.campaign_agent_calls:
-        raise RuntimeError("plan resource limits do not match --campaign-active-timeout and --campaign-agent-calls")
     if metadata["promptTemplateHash"] != prompt_bundle_hash():
         raise RuntimeError("Relay prompt templates changed after planning; generate a fresh plan")
     source = metadata["requirementSource"]
@@ -3886,8 +3902,8 @@ def main(argv: list[str] | None = None) -> int:
     repo = args.repo.resolve()
     if not repo.is_dir():
         parser().error("repository does not exist")
-    if (args.defer_blocker or args.grant_agent_calls or args.grant_active_seconds) and not args.recover:
-        parser().error("recovery grants and blocker deferral require --recover")
+    if args.defer_blocker and not args.recover:
+        parser().error("blocker deferral requires --recover")
     if args.recover and (args.cleanup or args.dry_run or args.plan):
         parser().error("--recover cannot be combined with --cleanup, --dry-run, or --plan")
     if args.cleanup:
@@ -3936,13 +3952,6 @@ def main(argv: list[str] | None = None) -> int:
             resuming = False
         if args.recover and not resuming:
             raise RuntimeError("recovery requires an existing campaign")
-        resource_grant = bool(args.grant_agent_calls or args.grant_active_seconds)
-        if args.recover and resource_grant:
-            if args.defer_blocker:
-                raise RuntimeError("campaign resource grants cannot be combined with blocker deferral")
-            print(f"RECOVER campaign action=grant agentCalls={args.grant_agent_calls} activeSeconds={args.grant_active_seconds}")
-            if not args.confirm:
-                return 0
         if args.recover and not args.confirm:
             print_recovery(plan_recovery(store, load_tasks(store), args.defer_blocker))
             return 0
@@ -3951,22 +3960,12 @@ def main(argv: list[str] | None = None) -> int:
             if resuming:
                 reconcile(store)
                 tasks = load_tasks(store)
-            if args.recover and resource_grant:
-                def grant_resources(state: dict) -> None:
-                    state["campaignAgentCallLimit"] += args.grant_agent_calls
-                    state["campaignActiveTimeoutSeconds"] += args.grant_active_seconds
-                    state["phase"] = "build"
-                    state.pop("resourceStatus", None)
-                    state.setdefault("resourceGrantHistory", []).append({"grantedAt": datetime.now(timezone.utc).isoformat(), "agentCalls": args.grant_agent_calls, "activeSeconds": args.grant_active_seconds})
-                store.update(grant_resources)
-                return 0
             if args.recover:
                 actions = plan_recovery(store, tasks, args.defer_blocker)
                 print_recovery(actions)
                 apply_recovery(store, tasks, actions)
                 relay_console.emit("NEXT", f"Resume with: {_shell_join([sys.executable, str(Path(__file__).resolve()), '--repo', str(repo)])}")
                 return 0
-            start_active_runtime(store)
             stop = threading.Event()
             heartbeat = threading.Thread(target=heartbeat_loop, args=(store, stop), daemon=True)
             heartbeat.start()
@@ -3990,7 +3989,6 @@ def main(argv: list[str] | None = None) -> int:
             finally:
                 stop.set()
                 heartbeat.join()
-                pause_active_runtime(store)
                 relay_console.close()
     except Exception as error:
         if not (args.recover and not args.confirm) and "store" in locals() and isinstance(store, StateStore):
