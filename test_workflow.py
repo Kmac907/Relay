@@ -1260,8 +1260,10 @@ class DeterministicCoreTests(unittest.TestCase):
             store.state["worktrees"][assignment_id] = {"path": root, "root": root, "branch": "branch", "baseSha": "base"}
             with patch("run._recovery_snapshot", return_value={"headSha": "integrated", "branch": "branch"}), patch("run._inspect_pr_readonly", return_value=pr):
                 actions = run.plan_recovery(store, [assignment], [])
+                run.apply_recovery(store, [assignment], actions)
             self.assertEqual(actions[0]["candidateSha"], "integrated")
             self.assertEqual(actions[0]["toPhase"], "approved")
+            self.assertEqual(store.state["reviewSessions"][assignment_id]["phase"], "approved")
 
     def test_reconcile_ignores_obsolete_extra_state_keys(self):
         with tempfile.TemporaryDirectory() as root:
