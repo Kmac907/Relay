@@ -1136,10 +1136,10 @@ def requires_human(error: BaseException) -> bool:
         "credential", "authentication", "authorization", "not authorized", "permission denied",
         "conflicting requirement", "destructive ambiguity", "outside assignment scope",
         "requires paths outside", "repeated progress fingerprint", "did not advance failures or findings",
-        "unsafe ", "drift", "uncommitted changes", "does not descend", "reported candidate",
+        "unsafe ", "drift", "does not descend", "must commit a descendant candidate", "reported candidate",
         "no such file", "not recognized", "cannot find the file",
     )
-    return isinstance(error, (OSError, ValueError)) or any(marker in text for marker in markers)
+    return isinstance(error, ValueError) or any(marker in text for marker in markers)
 
 
 def progress_fingerprint(store: StateStore, assignment_id: str, worktree: Path, candidate: str, repair_scope: list[str], stage: str) -> tuple[str, str]:
@@ -1540,15 +1540,15 @@ def candidate_integrity(store: StateStore, assignment: dict, worktree: Path, res
         raise ValueError("reported candidate does not equal worktree HEAD")
     dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout.splitlines()
     if dirty:
-        raise ValueError("candidate worktree has uncommitted changes")
+        raise RuntimeError("candidate worktree has uncommitted changes")
     assignment_base = store.state["worktrees"][assignment["id"]]["baseSha"]
     ancestry = git(worktree, "merge-base", "--is-ancestor", assignment_base, sha, timeout=store.state["validationTimeoutSeconds"], check=False)
     if ancestry.returncode:
-        raise ValueError("candidate does not descend from expected base")
+        raise RuntimeError("candidate does not descend from expected base")
     if parent_sha:
         ancestry = git(worktree, "merge-base", "--is-ancestor", parent_sha, sha, timeout=store.state["validationTimeoutSeconds"], check=False)
         if sha == parent_sha or ancestry.returncode:
-            raise ValueError("validation repair must commit a descendant candidate")
+            raise RuntimeError("validation repair must commit a descendant candidate")
     changed = target_changes(store, worktree, assignment_base, sha)
     if "changedPaths" in result and sorted(result["changedPaths"]) != sorted(changed):
         raise ValueError(f"reported changed paths do not match candidate diff; expected {json.dumps(changed)}")
@@ -1558,7 +1558,7 @@ def candidate_integrity(store: StateStore, assignment: dict, worktree: Path, res
     }
     outside = sorted(item for item in changed if not allowed_change(item, allowed, directories))
     if outside:
-        raise ValueError(f"candidate changed paths outside assignment scope: {', '.join(outside)}")
+        raise RuntimeError(f"candidate changed paths outside assignment scope: {', '.join(outside)}")
     return sha
 
 
@@ -3184,7 +3184,7 @@ def recovery_worktree(store: StateStore, assignment_id: str) -> tuple[Path, dict
     return worktree, record
 
 
-def _recovery_snapshot(store: StateStore, assignment: dict) -> dict:
+def _recovery_snapshot(store: StateStore, assignment: dict, *, adopt_clean_candidate: bool = False) -> dict:
     assignment_id = assignment["id"]
     worktree, record = recovery_worktree(store, assignment_id)
     head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
@@ -3200,7 +3200,7 @@ def _recovery_snapshot(store: StateStore, assignment: dict) -> dict:
             session.get("currentCandidateSha"), session.get("pendingRepairSha"), session.get("reviewedSha"),
         ) if isinstance(value, str) and value
     }
-    if head not in candidates:
+    if head not in candidates and not adopt_clean_candidate:
         raise RuntimeError(f"recovery refused candidate SHA drift: {assignment_id}")
     diff_base = record["baseSha"]
     ancestry = git(worktree, "merge-base", "--is-ancestor", diff_base, head, timeout=store.state["validationTimeoutSeconds"], check=False)
@@ -3222,7 +3222,10 @@ def _recovery_snapshot(store: StateStore, assignment: dict) -> dict:
         if unapproved:
             raise RuntimeError(f"recovery refused approved repair paths outside maximum scope for {assignment_id}: {', '.join(unapproved)}")
         allowed = approved
-    outside = sorted(path for path in changed if not allowed_change(path, allowed, scope_directories(store, allowed)))
+    directories = scope_directories(store, allowed) | {
+        normalized_path(path) for path in allowed if not path_has_magic(path) and (worktree / path).is_dir()
+    }
+    outside = sorted(path for path in changed if not allowed_change(path, allowed, directories))
     if outside:
         raise RuntimeError(f"recovery refused scope drift for {assignment_id}: {', '.join(outside)}")
     return {"headSha": head, "branch": record["branch"]}
@@ -3278,6 +3281,8 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
             continue
         phase = task_state.get("phase")
         session = store.state.get("reviewSessions", {}).get(assignment_id, {})
+        snapshot = None
+        adopt_clean_candidate = False
         if re.fullmatch(r"(?:repair|verify)-\d+", str(phase)):
             safe = True
         else:
@@ -3286,6 +3291,10 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
             error = task_state.get("error") or task_state.get("providerStatus") or ""
             if task_state.get("validationFailure") and task_state.get("validationCandidateSha"):
                 target = "candidate-validation"
+            elif re.match(r"\[(?:Errno|WinError) \d+\]", error) and assignment_id in store.state.get("worktrees", {}):
+                snapshot = _recovery_snapshot(store, assignments[assignment_id], adopt_clean_candidate=True)
+                target = "candidate-validation" if snapshot["headSha"] != store.state["worktrees"][assignment_id]["baseSha"] else "ready"
+                adopt_clean_candidate = target == "candidate-validation"
             elif _worktree_setup_failure(error) and assignment_id not in store.state.get("worktrees", {}):
                 actions.append({"action": "resume", "assignmentId": assignment_id, "fromPhase": phase, "toPhase": "ready"})
                 handled.add(assignment_id)
@@ -3302,10 +3311,12 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
                 target = "approved"
         else:
             raise RuntimeError(f"recovery refused removed or unknown phase {phase!r} for {assignment_id}; replan from the incomplete requirements and backlog")
-        snapshot = _recovery_snapshot(store, assignments[assignment_id])
+        snapshot = snapshot or _recovery_snapshot(store, assignments[assignment_id])
         action = {"action": "resume", "assignmentId": assignment_id, "fromPhase": phase, "toPhase": target, **snapshot}
+        if adopt_clean_candidate:
+            action["adoptCleanCandidate"] = True
         if target == "candidate-validation":
-            action["candidateSha"] = task_state.get("pendingWorkerSha") or task_state.get("validationCandidateSha")
+            action["candidateSha"] = task_state.get("pendingWorkerSha") or task_state.get("validationCandidateSha") or snapshot["headSha"]
         if target == "approved":
             pr = task_state.get("pr") or store.state.get("pullRequests", {}).get(assignment_id)
             candidate = task_state.get("integrationValidatedSha") or session.get("reviewedSha") or task_state.get("candidateSha")
@@ -3372,7 +3383,7 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
                 task_state.pop("error", None)
             else:
                 if assignment_id in store.state.get("worktrees", {}):
-                    snapshot = _recovery_snapshot(store, assignments[assignment_id])
+                    snapshot = _recovery_snapshot(store, assignments[assignment_id], adopt_clean_candidate=bool(action.get("adoptCleanCandidate")))
                     if any(snapshot.get(key) != action.get(key) for key in snapshot):
                         raise RuntimeError(f"assignment changed after recovery preview: {assignment_id}")
                 if task_state.get("phase") != action["fromPhase"]:

@@ -1239,11 +1239,13 @@ class DeterministicCoreTests(unittest.TestCase):
             assignment["validationCommands"] = []
             store.state["taskStates"][assignment["id"]] = {"phase": "candidate-validation"}
             store.state["worktrees"][assignment["id"]] = {"baseSha": base}
-            with self.assertRaisesRegex(ValueError, "outside.txt"):
+            with self.assertRaisesRegex(RuntimeError, "outside.txt"):
                 run.validate_candidate(store, assignment, target, {"candidateSha": sha})
             (target / "untracked.txt").write_text("dirty\n", encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "uncommitted"):
+            with self.assertRaisesRegex(RuntimeError, "uncommitted"):
                 run.validate_candidate(store, assignment, target, {"candidateSha": sha})
+            self.assertFalse(run.requires_human(RuntimeError("candidate worktree has uncommitted changes")))
+            self.assertTrue(run.requires_human(RuntimeError("candidate changed paths outside assignment scope")))
 
     def test_candidate_accepts_files_in_an_authorized_new_directory(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1321,6 +1323,33 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(actions[0]["candidateSha"], "integrated")
             self.assertEqual(actions[0]["toPhase"], "approved")
             self.assertEqual(store.state["reviewSessions"][assignment_id]["phase"], "approved")
+
+    def test_recovery_adopts_clean_scoped_candidate_after_operational_failure(self):
+        self.assertFalse(run.requires_human(OSError(22, "Invalid argument")))
+        self.assertTrue(run.requires_human(PermissionError("permission denied")))
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            target = make_git_repository(root / "relay-worktrees" / "test" / "TASK-0001")
+            base = git_output(target, "rev-parse", "HEAD").strip()
+            fixture = target / "tests" / "fixtures" / "new-portal" / "outcome.json"
+            fixture.parent.mkdir(parents=True)
+            fixture.write_text("{}\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", fixture.relative_to(target).as_posix()], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "candidate"], check=True, capture_output=True)
+            candidate = git_output(target, "rev-parse", "HEAD").strip()
+            run.exclude_relay_files(target)
+            store = self.state_store(target)
+            assignment = ContractTests().task()
+            assignment["allowedPaths"] = ["tests/fixtures/new-portal"]
+            store.state.update(phase="needs-user", campaignId="test")
+            store.state["taskStates"][assignment["id"]] = {"phase": "needs-user", "error": "[Errno 22] Invalid argument"}
+            store.state["worktrees"][assignment["id"]] = {"path": str(target), "root": str(target), "branch": "branch", "baseSha": base}
+            with patch("run.tempfile.gettempdir", return_value=str(root)):
+                actions = run.plan_recovery(store, [assignment], [])
+                run.apply_recovery(store, [assignment], actions)
+            self.assertEqual(actions[0]["candidateSha"], candidate)
+            self.assertEqual(store.state["taskStates"][assignment["id"]]["pendingWorkerSha"], candidate)
+            self.assertEqual(store.state["taskStates"][assignment["id"]]["phase"], "candidate-validation")
 
     def test_reconcile_ignores_obsolete_extra_state_keys(self):
         with tempfile.TemporaryDirectory() as root:
