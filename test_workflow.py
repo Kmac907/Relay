@@ -1249,6 +1249,20 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(run.load_bugs(store)[0]["status"], "backlog")
             self.assertEqual(store.state["reviewSessions"][assignment["id"]]["reviewedSha"], "candidate")
 
+    def test_recovery_prefers_published_integration_candidate(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task(); assignment_id = assignment["id"]
+            pr = {"number": 7, "state": "OPEN", "url": "x", "headRefOid": "integrated"}
+            store.state.update(phase="needs-user")
+            store.state["taskStates"][assignment_id] = {"phase": "needs-user", "candidateSha": "reviewed", "integrationValidatedSha": "integrated", "pr": pr, "error": "candidate repair exceeds maximum scope: inherited.py"}
+            store.state["reviewSessions"][assignment_id] = {"phase": "needs-user", "reviewedSha": "reviewed"}
+            store.state["worktrees"][assignment_id] = {"path": root, "root": root, "branch": "branch", "baseSha": "base"}
+            with patch("run._recovery_snapshot", return_value={"headSha": "integrated", "branch": "branch"}), patch("run._inspect_pr_readonly", return_value=pr):
+                actions = run.plan_recovery(store, [assignment], [])
+            self.assertEqual(actions[0]["candidateSha"], "integrated")
+            self.assertEqual(actions[0]["toPhase"], "approved")
+
     def test_reconcile_ignores_obsolete_extra_state_keys(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
@@ -1791,6 +1805,7 @@ class DeterministicCoreTests(unittest.TestCase):
             store.state["taskStates"][assignment["id"]] = {"phase": "approved", "pendingWorkerSha": pending, "integrationRepairStatus": "repair-required"}
             store.state["worktrees"][assignment["id"]] = {"path": str(target), "branch": "relay/TASK-0001", "baseSha": integration}
             store.state["reviewSessions"][assignment["id"]] = {"phase": "approved", "reviewedSha": reviewed, "reviewEpoch": 0, "approvedRepairPaths": []}
+            run.write_bugs(store, [{"id": "BUG-0001", "title": "False integration scope", "severity": "P1", "status": "needs-user", "source": assignment["id"], "sourceFindingId": "false-scope", "location": "README.md:1", "failure": "inherited integration change", "reproduction": "git diff", "requirement": "It works.", "evidence": "old diff base", "allowedPaths": ["README.md"], "coordinatorDisposition": "needs-user", "coordinatorReason": "candidate repair exceeds maximum scope: README.md", "decisionReason": "candidate repair exceeds maximum scope: README.md"}])
             pr = {"number": 1, "state": "OPEN", "url": "x", "headRefOid": reviewed}
 
             with patch("run.recovery_worktree", return_value=(target, store.state["worktrees"][assignment["id"]])):
@@ -1808,7 +1823,10 @@ class DeterministicCoreTests(unittest.TestCase):
                 self.assertTrue(run._merge_assignment(store, threading.Semaphore(1), assignment, target, "relay/TASK-0001", pr, reviewed))
             self.assertEqual(invoked.call_args_list[0].args[4], "worker")
             self.assertEqual(json.loads(invoked.call_args_list[0].args[5])["candidateSha"], pending)
+            self.assertEqual(json.loads(invoked.call_args_list[1].args[5])["context"]["previousCandidate"], integration)
             self.assertNotIn("integrationRepairStatus", store.state["taskStates"][assignment["id"]])
+            self.assertEqual(store.state["reviewSessions"][assignment["id"]]["phase"], "approved")
+            self.assertEqual(run.load_bugs(store)[0]["status"], "resolved")
 
     def test_existing_pr_and_merged_pr_are_not_duplicated(self):
         with tempfile.TemporaryDirectory() as root:
