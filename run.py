@@ -3368,6 +3368,10 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
                 task_state["phase"] = action["toPhase"]
                 if action.get("candidateSha") and action["toPhase"] == "candidate-validation":
                     task_state["pendingWorkerSha"] = action["candidateSha"]
+                if action.get("candidateSha") == task_state.get("integrationValidatedSha") and action["toPhase"] == "approved":
+                    session = store.state.get("reviewSessions", {}).get(assignment_id, {})
+                    if session.get("phase") == "needs-user":
+                        session["phase"] = "approved"
                 task_state.pop("error", None)
         store.state["pendingRecovery"]["completed"].append(f"{action['action']}:{assignment_id}")
         store.save()
