@@ -2171,7 +2171,7 @@ class DeterministicCoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
             assignment = ContractTests().task()
-            store.state["taskStates"][assignment["id"]] = {"phase": "approved", "integrationRepairStatus": "repair-required"}
+            store.state["taskStates"][assignment["id"]] = {"phase": "approved", "integrationRepairStatus": "repair-required", "pendingWorkerSha": "reviewed", "integrationWorkingSha": "reviewed"}
             store.state["worktrees"][assignment["id"]] = {"path": root, "branch": "relay/TASK-0001", "baseSha": "base"}
             store.state["reviewSessions"][assignment["id"]] = {"phase": "approved", "reviewedSha": "reviewed", "reviewEpoch": 0}
             pr = {"number": 1, "state": "OPEN", "url": "x", "headRefOid": "reviewed"}
@@ -2202,6 +2202,7 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(worker_prompts[3]["cleanupPaths"], ["dependency.py"])
             self.assertIn("outside assignment scope", worker_prompts[3]["previousFailure"])
             self.assertNotIn("integrationCleanupPaths", store.state["taskStates"][assignment["id"]])
+            self.assertNotIn("pendingWorkerSha", store.state["taskStates"][assignment["id"]])
             self.assertEqual(progress.call_count, 3)
 
     def test_recovered_repair_behind_integration_base_is_reconciled_before_validation(self):
