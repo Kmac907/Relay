@@ -1398,6 +1398,20 @@ class DeterministicCoreTests(unittest.TestCase):
                 self.assertFalse(run.process_assignment(store, threading.Semaphore(1), assignment, "task"))
             self.assertEqual(order, ["review", "publish"])
 
+    def test_published_integration_candidate_skips_stale_review_publication(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            pr = {"number": 1, "headRefOid": "integrated"}
+            store.state["taskStates"][assignment["id"]] = {
+                "phase": "approved", "candidateSha": "integrated", "integrationValidatedSha": "integrated", "pr": pr,
+            }
+            store.state["reviewSessions"][assignment["id"]] = {"phase": "approved", "reviewedSha": "stale"}
+            with patch("run.create_worktree", return_value=(Path(root), "branch")), patch("run.run_review", return_value=True), patch("run.publish_candidate") as publish, patch("run.merge_assignment", return_value=True) as merge, patch("run.update_task_ledger"), patch("run.cleanup_worktree"):
+                self.assertTrue(run.process_assignment(store, threading.Semaphore(1), assignment, "task"))
+            publish.assert_not_called()
+            self.assertIs(merge.call_args.args[5], pr)
+
     def test_detects_supported_provider_remotes_and_decodes_names(self):
         cases = {
             "https://github.com/owner/repo.git": ("github", "owner/repo"),

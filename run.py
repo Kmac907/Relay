@@ -2783,7 +2783,8 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
             clear_operation(store, assignment_id)
             return False
         session = store.state["reviewSessions"][assignment_id]
-        pr = publish_candidate(store, assignment, worktree, branch, session["reviewedSha"])
+        pr = (task_state.get("pr") or store.state.get("pullRequests", {}).get(assignment_id)) if task_state.get("integrationValidatedSha") else None
+        pr = pr or publish_candidate(store, assignment, worktree, branch, session["reviewedSha"])
         task_state["phase"] = "approved"
         store.state["workItems"][assignment_id]["status"] = "accepted"
         repair = task_state.get("activeRepairWorkItem")
