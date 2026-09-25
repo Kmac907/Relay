@@ -1468,6 +1468,42 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertNotIn("pendingWorkerSha", store.state["reviewSessions"][assignment["id"]])
             self.assertEqual(store.state["taskStates"][assignment["id"]]["phase"], "repair-1")
             self.assertEqual(store.state["taskStates"][assignment["id"]]["error"], "repair must remove changes outside approved scope before completion: tests/evidence.json")
+            store.state["taskStates"][assignment["id"]].update(phase="needs-user", error="[Errno 22] Invalid argument")
+            store.state["reviewSessions"][assignment["id"]]["phase"] = "needs-user"
+            with patch("run.tempfile.gettempdir", return_value=str(root)):
+                actions = run.plan_recovery(store, [assignment], [])
+            self.assertEqual(actions[0]["scopeDriftPaths"], ["tests/evidence.json"])
+
+    def test_recovery_discards_tracked_validation_side_effects_before_verification(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            target = make_git_repository(root / "relay-worktrees" / "test" / "TASK-0001")
+            base = git_output(target, "rev-parse", "HEAD").strip()
+            for name in ("src/app.py", "tests/evidence.json"):
+                path = target / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("candidate\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", "src/app.py", "tests/evidence.json"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "candidate"], check=True, capture_output=True)
+            candidate = git_output(target, "rev-parse", "HEAD").strip()
+            (target / "src/app.py").write_text("repair\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "commit", "-am", "repair"], check=True, capture_output=True)
+            repair = git_output(target, "rev-parse", "HEAD").strip()
+            (target / "tests/evidence.json").write_text("validation output\n", encoding="utf-8")
+            run.exclude_relay_files(target)
+            store = self.state_store(target)
+            assignment = ContractTests().task() | {"allowedPaths": ["src/app.py", "tests/evidence.json"]}
+            store.state.update(phase="needs-user", campaignId="test")
+            store.state["taskStates"][assignment["id"]] = {"phase": "slice-review", "candidateSha": repair, "validationCandidateSha": repair, "activeRepairWorkItem": f"{assignment['id']}:repair:1"}
+            store.state["reviewSessions"][assignment["id"]] = {"phase": "verify-1", "currentCandidateSha": repair, "pendingRepairSha": repair, "previousCandidateSha": candidate, "approvedRepairPaths": ["src/app.py"], "acceptedBlockerIds": ["BUG-0001"]}
+            store.state["worktrees"][assignment["id"]] = {"path": str(target), "root": str(target), "branch": "branch", "baseSha": base}
+            with patch("run.tempfile.gettempdir", return_value=str(root)):
+                actions = run.plan_recovery(store, [assignment], [])
+                run.apply_recovery(store, [assignment], actions)
+            self.assertEqual(actions[0]["discardDirtyPaths"], ["tests/evidence.json"])
+            self.assertEqual(store.state["taskStates"][assignment["id"]]["phase"], "verify-1")
+            self.assertEqual(git_output(target, "status", "--porcelain=v1", "--untracked-files=all"), "")
+            self.assertEqual((target / "tests/evidence.json").read_text(encoding="utf-8"), "candidate\n")
 
     def test_reconcile_ignores_obsolete_extra_state_keys(self):
         with tempfile.TemporaryDirectory() as root:

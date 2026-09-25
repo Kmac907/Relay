@@ -3189,7 +3189,8 @@ def _recovery_snapshot(store: StateStore, assignment: dict, *, adopt_clean_candi
     dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout
     if dirty and not allow_dirty_repair:
         raise RuntimeError(f"recovery refused unexpected worktree changes: {assignment_id}")
-    dirty_paths = sorted(set(target_git_paths(store, worktree, "diff", "--name-only") + target_git_paths(store, worktree, "ls-files", "--others", "--exclude-standard"))) if dirty else []
+    untracked_paths = target_git_paths(store, worktree, "ls-files", "--others", "--exclude-standard") if dirty else []
+    dirty_paths = sorted(set(target_git_paths(store, worktree, "diff", "--name-only") + untracked_paths)) if dirty else []
     task_state = store.state["taskStates"][assignment_id]
     session = store.state.get("reviewSessions", {}).get(assignment_id, {})
     candidates = {
@@ -3236,7 +3237,7 @@ def _recovery_snapshot(store: StateStore, assignment: dict, *, adopt_clean_candi
         unsafe = sorted(path for path in outside if not allowed_change(path, maximum, maximum_directories))
         if unsafe or not allow_repair_scope_cleanup:
             raise RuntimeError(f"recovery refused scope drift for {assignment_id}: {', '.join(unsafe or outside)}")
-    return {"headSha": head, "branch": record["branch"], **({"dirtyPaths": dirty_paths} if dirty_paths else {}), **({"scopeDriftPaths": outside} if outside else {})}
+    return {"headSha": head, "branch": record["branch"], **({"dirtyPaths": dirty_paths} if dirty_paths else {}), **({"untrackedPaths": untracked_paths} if untracked_paths else {}), **({"scopeDriftPaths": outside} if outside else {})}
 
 
 def _inspect_pr_readonly(store: StateStore, identifier: str | int) -> dict:
@@ -3291,6 +3292,7 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
         session = store.state.get("reviewSessions", {}).get(assignment_id, {})
         snapshot = None
         adopt_clean_candidate = False
+        validated_repair = False
         if re.fullmatch(r"(?:repair|verify)-\d+", str(phase)):
             safe = True
         else:
@@ -3305,9 +3307,10 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
                 target = f"repair-{repair.group(1) if repair else int(session.get('reviewEpoch', 0)) + 1}"
                 adopt_clean_candidate = snapshot["headSha"] != session.get("currentCandidateSha")
             elif re.match(r"\[(?:Errno|WinError) \d+\]", error) and assignment_id in store.state.get("worktrees", {}):
-                snapshot = _recovery_snapshot(store, assignments[assignment_id], adopt_clean_candidate=True)
                 repair = re.fullmatch(rf"{re.escape(assignment_id)}:repair:(\d+)", str(task_state.get("activeRepairWorkItem", "")))
-                if repair and session.get("acceptedBlockerIds") and "approvedRepairPaths" in session:
+                resuming_repair = bool(repair and session.get("acceptedBlockerIds") and "approvedRepairPaths" in session)
+                snapshot = _recovery_snapshot(store, assignments[assignment_id], adopt_clean_candidate=True, allow_dirty_repair=resuming_repair, allow_repair_scope_cleanup=resuming_repair)
+                if resuming_repair:
                     target = f"repair-{repair.group(1)}"
                     adopt_clean_candidate = True
                 else:
@@ -3323,7 +3326,13 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
                 continue
         elif safe:
             target = phase
-            if phase == "implementing":
+            validated_repair = re.fullmatch(r"verify-\d+", str(session.get("phase", ""))) and session.get("pendingRepairSha") == task_state.get("validationCandidateSha")
+            if validated_repair:
+                snapshot = _recovery_snapshot(store, assignments[assignment_id], allow_dirty_repair=True, allow_repair_scope_cleanup=True)
+                if snapshot.get("untrackedPaths") or snapshot["headSha"] != session["pendingRepairSha"] or set(snapshot.get("scopeDriftPaths", [])) - set(snapshot.get("dirtyPaths", [])):
+                    raise RuntimeError(f"recovery refused unsafe validated repair drift: {assignment_id}")
+                target = session["phase"]
+            elif phase == "implementing":
                 target = "candidate-validation" if task_state.get("pendingWorkerSha") else "ready"
             elif phase in {"provider-checks", "resume-provider", "waiting-provider", "push-and-open-pr"}:
                 target = "approved"
@@ -3331,6 +3340,8 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
             raise RuntimeError(f"recovery refused removed or unknown phase {phase!r} for {assignment_id}; replan from the incomplete requirements and backlog")
         snapshot = snapshot or _recovery_snapshot(store, assignments[assignment_id])
         action = {"action": "resume", "assignmentId": assignment_id, "fromPhase": phase, "toPhase": target, **snapshot}
+        if validated_repair and snapshot.get("dirtyPaths"):
+            action.update(resumeReviewRepair=True, discardDirtyPaths=snapshot["dirtyPaths"])
         if adopt_clean_candidate:
             action["adoptCleanCandidate"] = True
         if target.startswith("repair-") and phase == "needs-user":
@@ -3407,9 +3418,11 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
                 task_state.pop("error", None)
             else:
                 if assignment_id in store.state.get("worktrees", {}):
-                    snapshot = _recovery_snapshot(store, assignments[assignment_id], adopt_clean_candidate=bool(action.get("adoptCleanCandidate")), allow_dirty_repair=bool(action.get("resumeDirtyRepair")), allow_repair_scope_cleanup=bool(action.get("scopeDriftPaths")))
+                    snapshot = _recovery_snapshot(store, assignments[assignment_id], adopt_clean_candidate=bool(action.get("adoptCleanCandidate")), allow_dirty_repair=bool(action.get("resumeDirtyRepair") or action.get("discardDirtyPaths")), allow_repair_scope_cleanup=bool(action.get("scopeDriftPaths")))
                     if any(snapshot.get(key) != action.get(key) for key in snapshot):
                         raise RuntimeError(f"assignment changed after recovery preview: {assignment_id}")
+                    if action.get("discardDirtyPaths"):
+                        git(recovery_worktree(store, assignment_id)[0], "restore", "--source", "HEAD", "--worktree", "--", *action["discardDirtyPaths"], timeout=store.state["validationTimeoutSeconds"])
                 if task_state.get("phase") != action["fromPhase"]:
                     raise RuntimeError(f"assignment phase changed after recovery preview: {assignment_id}")
                 task_state["phase"] = action["toPhase"]
@@ -3424,7 +3437,7 @@ def apply_recovery(store: StateStore, tasks: list[dict], actions: list[dict]) ->
                     session = store.state.get("reviewSessions", {}).get(assignment_id, {})
                     if session.get("phase") == "needs-user":
                         session["phase"] = "approved"
-                if action.get("scopeDriftPaths"):
+                if action.get("scopeDriftPaths") and not action.get("discardDirtyPaths"):
                     task_state["error"] = "repair must remove changes outside approved scope before completion: " + ", ".join(action["scopeDriftPaths"])
                 else:
                     task_state.pop("error", None)
