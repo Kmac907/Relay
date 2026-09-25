@@ -620,6 +620,18 @@ class DeterministicCoreTests(unittest.TestCase):
             invoked.assert_called_once()
             self.assertEqual(store.state["protocolSequences"][sequence_id]["rejections"][0]["errors"][0]["code"], "validator")
 
+    def test_changed_context_creates_a_fresh_protocol_sequence(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); store = self.state_store(root)
+            assignment = ContractTests().task(); assignment_id = assignment["id"]
+            store.state["taskStates"][assignment_id] = {"phase": "implementing", "workerHistory": [{"summary": "old"}]}
+            prompt = run.worker_prompt("task", assignment)
+            first_id, _ = run._prepare_protocol_sequence(store, root, assignment_id, "worker", prompt, "task")
+            store.state["taskStates"][assignment_id]["workerHistory"].append({"summary": "new"})
+            second_id, second = run._prepare_protocol_sequence(store, root, assignment_id, "worker", prompt, "task")
+            self.assertNotEqual(first_id, second_id)
+            self.assertEqual(second["context"]["previousResults"][-1]["summary"], "new")
+
     def test_malformed_json_correction_reports_parser_location(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root); store = self.state_store(root)
@@ -2460,6 +2472,22 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(packet["worktreeBaseSha"], "integration-base")
             store.state["taskStates"]["TASK-0002"].pop("pendingWorkerSha")
             self.assertEqual(run.context_packet(store, Path(root), "TASK-0002", "worker", "repair", "repair this")["candidateSha"], "working")
+
+    def test_worker_context_bounds_and_deduplicates_history(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task(); assignment_id = assignment["id"]
+            history = [{"status": "candidate", "candidateSha": str(index), "changedPaths": [], "summary": str(index)} for index in range(25)]
+            validation = [{"category": "task", "command": "test", "outcome": "passed", "log": str(index)} for index in range(100)]
+            store.state["taskStates"][assignment_id] = {"phase": "implementing", "workerHistory": history + [history[-1]] * 100, "validationHistory": validation}
+            packet = run.context_packet(store, Path(root), assignment_id, "worker", "task", "work")
+            self.assertEqual([item["candidateSha"] for item in packet["previousResults"]], [str(index) for index in range(5, 25)])
+            self.assertEqual(packet["validationEvidence"], [validation[-1]])
+
+            result = {"status": "candidate", "candidateSha": "24", "changedPaths": [], "summary": "24", "proposedLearnings": []}
+            before = len(store.state["taskStates"][assignment_id]["workerHistory"])
+            run.record_worker_output(store, assignment_id, result)
+            self.assertEqual(len(store.state["taskStates"][assignment_id]["workerHistory"]), before)
 
     def test_all_agent_roles_have_bounded_prompt_and_schema(self):
         self.assertEqual(set(run.ROLE_JSON_SCHEMAS), set(run.AGENT_SCHEMAS))

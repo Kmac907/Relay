@@ -37,6 +37,7 @@ BUG_MARKER = re.compile(r"<!-- relay: campaign=([A-Za-z0-9._-]+) repository=([0-
 BACKLOG_MARKER = re.compile(r"<!-- relay: backlog campaign=([A-Za-z0-9._-]+) repository=([0-9a-f]{12}) -->")
 TASK_HEADING = re.compile(r"^## (TASK-\d{4}) (?:—|-) (.+)$")
 WORKER_MODES = {"task", "bug", "repair", "integration-repair"}
+CONTEXT_HISTORY_LIMIT = 20
 TERMINAL_REVIEW_PHASES = {"approved", "needs-user", "blocked"}
 CHILD_LOCK = threading.Lock()
 INTEGRATION_LOCK = threading.Lock()
@@ -1040,6 +1041,19 @@ def campaign_requirements(state: dict, repo: Path) -> str:
     return ""
 
 
+def recent_unique(items: list[dict], keys: tuple[str, ...]) -> list[dict]:
+    seen = set()
+    result = []
+    for item in reversed(items):
+        identity = tuple(json.dumps(item.get(key), sort_keys=True) for key in keys)
+        if identity not in seen:
+            seen.add(identity)
+            result.append(item)
+            if len(result) == CONTEXT_HISTORY_LIMIT:
+                break
+    return list(reversed(result))
+
+
 def context_packet(store: StateStore, repo: Path, assignment_id: str, role: str, mode: str | None, invocation: str) -> dict:
     assignment = _assignment_for_context(store, assignment_id)
     states = store.state.get("taskStates", {})
@@ -1068,8 +1082,8 @@ def context_packet(store: StateStore, repo: Path, assignment_id: str, role: str,
         "assignment": assignment,
         "projectInstructions": applicable_instructions(store, repo, assignment.get("allowedPaths", [])),
         "dependencies": dependencies, "relevantBugs": relevant_bugs,
-        "validationEvidence": task_state.get("validationHistory", []),
-        "previousResults": task_state.get("workerHistory", []) if role == "worker" else [],
+        "validationEvidence": recent_unique(task_state.get("validationHistory", []), ("category", "command", "outcome")),
+        "previousResults": recent_unique(task_state.get("workerHistory", []), ("status", "candidateSha", "changedPaths", "summary")) if role == "worker" else [],
         "review": session, "visitedFingerprints": task_state.get("visitedFingerprints", []),
         "learnings": active_learnings(store.state, assignment) if role == "worker" else [],
         "invocation": invocation,
@@ -1091,10 +1105,13 @@ def record_worker_output(store: StateStore, assignment_id: str, result: dict) ->
             workerSummary=result.get("summary", ""), pendingWorkerSha=result.get("candidateSha", ""),
             changedPaths=list(result.get("changedPaths", [])), pendingLearnings=list(result.get("proposedLearnings", [])),
         )
-        task_state.setdefault("workerHistory", []).append({
+        result_record = {
             "status": result.get("status"), "candidateSha": result.get("candidateSha"),
             "changedPaths": list(result.get("changedPaths", [])), "summary": result.get("summary", ""),
-        })
+        }
+        history = task_state.setdefault("workerHistory", [])
+        if not history or history[-1] != result_record:
+            history.append(result_record)
     store.update(record)
 
 
@@ -1237,20 +1254,21 @@ def _prepare_protocol_sequence(store: StateStore, repo: Path, assignment_id: str
     packet_mode = mode or ("incremental" if role == "verification-reviewer" else "initial" if role == "slice-reviewer" else None)
     packet = json.loads(json.dumps(context_packet(store, repo, assignment_id, role, packet_mode, prompt)))
     context_json = json.dumps(packet, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    context_sha = hashlib.sha256(context_json.encode()).hexdigest()
     schema = ROLE_JSON_SCHEMAS[role]
     schema_json = json.dumps(schema, sort_keys=True, separators=(",", ":"))
     phase = (store.state.get("reviewSessions", {}).get(assignment_id) or store.state.get("taskStates", {}).get(assignment_id) or {}).get("phase", store.state.get("phase"))
     invocation_sha = hashlib.sha256(prompt.encode()).hexdigest()
     schema_sha = hashlib.sha256(schema_json.encode()).hexdigest()
-    existing = next((item for item in store.state.get("protocolSequences", {}).values() if item.get("assignmentId") == assignment_id and item.get("role") == role and item.get("mode") == mode and item.get("candidatePhase") == phase and item.get("invocationSha256") == invocation_sha and item.get("schemaSha256") == schema_sha), None)
+    existing = next((item for item in store.state.get("protocolSequences", {}).values() if item.get("assignmentId") == assignment_id and item.get("role") == role and item.get("mode") == mode and item.get("candidatePhase") == phase and item.get("invocationSha256") == invocation_sha and item.get("schemaSha256") == schema_sha and item.get("contextSha256") == context_sha), None)
     if existing:
         return existing["sequenceId"], existing
-    identity = "|".join((role, assignment_id, mode or "", str(packet.get("candidateSha") or ""), str(phase or ""), hashlib.sha256(context_json.encode()).hexdigest(), hashlib.sha256(schema_json.encode()).hexdigest()))
+    identity = "|".join((role, assignment_id, mode or "", str(packet.get("candidateSha") or ""), str(phase or ""), context_sha, hashlib.sha256(schema_json.encode()).hexdigest()))
     sequence_id = hashlib.sha256(identity.encode()).hexdigest()
     def create(state: dict) -> None:
         state.setdefault("protocolSequences", {}).setdefault(sequence_id, {
             "sequenceId": sequence_id, "assignmentId": assignment_id, "role": role, "mode": mode,
-            "candidatePhase": phase, "context": packet, "contextSha256": hashlib.sha256(context_json.encode()).hexdigest(),
+            "candidatePhase": phase, "context": packet, "contextSha256": context_sha,
             "schema": schema, "schemaSha256": schema_sha, "invocationSha256": invocation_sha, "template": prompt_template(role),
             "status": "open", "rejections": [],
         })
