@@ -2476,10 +2476,11 @@ def _merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignm
             pr = publish_candidate(store, assignment, worktree, branch, replacement)
             session.update(pendingRepairNumber=epoch, acceptedBlockerIds=[], openFindingIds=[])
             store.save()
+            review_base = store.state["worktrees"][assignment_id]["baseSha"] if repair_mode == "integration-repair" else reviewed_sha
             verification = invoke_with_replacements(
                 store, semaphore, worktree, assignment_id, "verification-reviewer",
-                role_prompt("verification-reviewer", assignment, replacement, {"previousCandidate": reviewed_sha, "repairDiff": f"{reviewed_sha}..{replacement}", "providerFailure": status, "expectedReviewEpoch": epoch, "openFindingIds": []}),
-                review=True, validator=lambda value: (validate_incremental_findings(store, worktree, reviewed_sha, replacement, value["findings"]), value)[1],
+                role_prompt("verification-reviewer", assignment, replacement, {"previousCandidate": review_base, "repairDiff": f"{review_base}..{replacement}", "providerFailure": status, "expectedReviewEpoch": epoch, "openFindingIds": []}),
+                review=True, validator=lambda value: (validate_incremental_findings(store, worktree, review_base, replacement, value["findings"]), value)[1],
             )
         except (RuntimeError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as error:
             task_state["error"] = str(error)
@@ -2494,9 +2495,20 @@ def _merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignm
                 store.save()
                 continue
             raise
+        bugs = load_bugs(store)
+        scope_bugs = [bug for bug in bugs if bug.get("source") == assignment_id and bug.get("status") == "needs-user" and str(bug.get("coordinatorReason", "")).startswith("candidate repair exceeds maximum scope:")]
+        reviewed_paths = target_changes(store, worktree, review_base, replacement) if verification["findings"] or scope_bugs else []
+        actual_paths = {normalized_path(path) for path in reviewed_paths}
+        corrected = False
+        for bug in scope_bugs:
+            if not ({normalized_path(path) for path in bug.get("allowedPaths", [])} & actual_paths):
+                bug["status"] = "resolved"
+                corrected = True
+        if corrected:
+            write_bugs(store, bugs)
         dispositions = coordinator_dispositions(
             assignment_id, verification["findings"], maximum_paths=maximum_repair_paths(store, assignment),
-            reviewed_paths=target_changes(store, worktree, reviewed_sha, replacement) if verification["findings"] else [],
+            reviewed_paths=reviewed_paths if verification["findings"] else [],
             requirements=list(assignment.get("requirementContext", [])) + list(assignment.get("acceptanceCriteria", [])),
         )
         new_blockers = record_findings(store, assignment_id, dispositions)
@@ -2524,7 +2536,7 @@ def _merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignm
             merge_subject, merge_body, _merge_hash = canonical_merge_metadata(store.state, assignment, reviewed_sha)
             continue
         reviewed_sha = replacement
-        session["reviewedSha"] = replacement
+        session.update(phase="approved", reviewedSha=replacement, currentCandidateSha=replacement, finalReviewedSha=replacement)
         task_state.pop("integrationRepairStatus", None)
         task_state.pop("integrationValidatedSha", None)
         merge_subject, merge_body, _merge_hash = canonical_merge_metadata(store.state, assignment, reviewed_sha)
@@ -3284,7 +3296,7 @@ def plan_recovery(store: StateStore, tasks: list[dict], deferred: list[str]) -> 
             action["candidateSha"] = task_state.get("pendingWorkerSha") or task_state.get("validationCandidateSha")
         if target == "approved":
             pr = task_state.get("pr") or store.state.get("pullRequests", {}).get(assignment_id)
-            candidate = session.get("reviewedSha") or task_state.get("candidateSha")
+            candidate = task_state.get("integrationValidatedSha") or session.get("reviewedSha") or task_state.get("candidateSha")
             if not pr or not candidate:
                 raise RuntimeError(f"provider recovery is missing PR or reviewed candidate: {assignment_id}")
             live = _inspect_pr_readonly(store, pr["number"])
