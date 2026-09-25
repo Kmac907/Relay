@@ -1631,8 +1631,13 @@ def clean_validation_candidate(store: StateStore, assignment_id: str, worktree: 
     if not candidate:
         return None
     head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"], check=False).stdout.strip()
-    dirty = target_git_paths(store, worktree, "diff", "--name-only", "HEAD") + target_git_paths(store, worktree, "ls-files", "--others", "--exclude-standard")
-    return candidate if head == candidate and not dirty else None
+    tracked = target_git_paths(store, worktree, "diff", "--name-only", "HEAD")
+    untracked = target_git_paths(store, worktree, "ls-files", "--others", "--exclude-standard")
+    if head == candidate and tracked and not untracked:
+        git(worktree, "restore", "--source", "HEAD", "--staged", "--worktree", "--", *tracked, timeout=store.state["validationTimeoutSeconds"])
+        relay_console.emit("DONE", f"operation=candidate-cleanup assignment={assignment_id} paths={len(tracked)}")
+        tracked = target_git_paths(store, worktree, "diff", "--name-only", "HEAD")
+    return candidate if head == candidate and not tracked and not untracked else None
 
 
 def provider_call(store: StateStore, key: str, *args: str, check: bool = True) -> subprocess.CompletedProcess:
