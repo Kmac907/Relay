@@ -828,6 +828,29 @@ class DeterministicCoreTests(unittest.TestCase):
                 self.assertFalse(Path(captured["worker"]["PYTHONUSERBASE"]).exists())
             self.assertEqual(os.environ, original)
 
+    def test_cleanup_removes_an_unregistered_worktree_directory(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            store = self.state_store(root)
+            path = root / "relay-worktrees" / "test" / "TASK-0001"
+            path.mkdir(parents=True)
+            store.state["worktrees"]["TASK-0001"] = {"path": str(path), "root": str(path), "branch": "relay/TASK-0001"}
+            failed = subprocess.CompletedProcess([], 1, "", "not a working tree")
+            absent = subprocess.CompletedProcess([], 0, f"worktree {root}\n", "")
+            with patch("run.tempfile.gettempdir", return_value=str(root)), patch("run.git", side_effect=[failed, absent, subprocess.CompletedProcess([], 0, "", "")]):
+                run.cleanup_worktree(store, "TASK-0001")
+            self.assertFalse(path.exists())
+            self.assertNotIn("TASK-0001", store.state["worktrees"])
+
+    def test_integrated_assignment_retries_worktree_cleanup(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            store.state["taskStates"][assignment["id"]] = {"phase": "integrated"}
+            with patch("run.cleanup_worktree") as cleanup:
+                self.assertTrue(run.process_assignment(store, threading.Semaphore(1), assignment, "task"))
+            cleanup.assert_called_once_with(store, assignment["id"])
+
     def test_original_user_site_is_importable_without_executing_editable_pth(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)

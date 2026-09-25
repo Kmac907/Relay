@@ -2610,7 +2610,10 @@ def cleanup_worktree(store: StateStore, assignment_id: str) -> None:
         repository = Path(store.state["repository"])
         removed = git(repository, "worktree", "remove", "--force", str(path), timeout=store.state["providerTimeoutSeconds"], check=False)
         if removed.returncode and path.exists():
-            return
+            listed = git(repository, "worktree", "list", "--porcelain", timeout=store.state["providerTimeoutSeconds"]).stdout.splitlines()
+            if path.resolve() in {Path(line[9:]).resolve() for line in listed if line.startswith("worktree ")}:
+                return
+            shutil.rmtree(path)
         git(repository, "branch", "-D", record["branch"], timeout=store.state["providerTimeoutSeconds"], check=False)
         cleanup_assignment_environment(store, assignment_id)
         store.state["worktrees"].pop(assignment_id, None)
@@ -2705,6 +2708,7 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
     store.update(initialize)
     task_state = store.state["taskStates"][assignment_id]
     if task_state["phase"] == "integrated":
+        cleanup_worktree(store, assignment_id)
         return True
     try:
         worktree, branch = create_worktree(store, assignment)
