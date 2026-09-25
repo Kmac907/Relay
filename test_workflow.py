@@ -1100,6 +1100,16 @@ class DeterministicCoreTests(unittest.TestCase):
             with patch("run.git", side_effect=git_result), patch("run.target_git_paths", return_value=[]):
                 self.assertEqual(run.clean_validation_candidate(store, assignment["id"], Path(root)), "candidate")
 
+    def test_clean_validation_candidate_restores_tracked_validation_side_effects(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.state_store(root)
+            assignment = ContractTests().task()
+            store.state["taskStates"][assignment["id"]] = {"validationCandidateSha": "candidate"}
+            completed = subprocess.CompletedProcess([], 0, "candidate\n", "")
+            with patch("run.git", return_value=completed) as git_call, patch("run.target_git_paths", side_effect=[["tests/evidence.json"], [], []]):
+                self.assertEqual(run.clean_validation_candidate(store, assignment["id"], Path(root)), "candidate")
+            self.assertIn("restore", git_call.call_args_list[1].args)
+
     def test_incremental_review_may_only_add_repair_diff_findings(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
