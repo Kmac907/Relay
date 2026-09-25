@@ -1053,9 +1053,12 @@ def context_packet(store: StateStore, repo: Path, assignment_id: str, role: str,
     relevant_bugs = [bug for bug in load_bugs(store) if bug.get("source") == assignment_id or any(scopes_may_overlap(left, right) for left in assignment.get("allowedPaths", []) for right in bug.get("allowedPaths", []))]
     task_state = states.get(assignment_id, {})
     session = store.state.get("reviewSessions", {}).get(assignment_id)
+    candidate = task_state.get("candidateSha") or (session or {}).get("currentCandidateSha") or ""
+    if role == "worker":
+        candidate = task_state.get("pendingWorkerSha") or task_state.get("integrationWorkingSha") or candidate
     return {
         "role": role, "mode": mode, "permissions": "write assigned worktree only" if role == "worker" else "read-only",
-        "candidateSha": task_state.get("candidateSha") or task_state.get("pendingWorkerSha") or (session or {}).get("currentCandidateSha") or "",
+        "candidateSha": candidate,
         "campaign": {
             "id": store.state.get("campaignId"), "objective": store.state.get("campaignObjective"),
             "baseSha": store.state.get("baseSha"), "integrationSha": store.state.get("integrationSha") or store.state.get("baseSha"),
@@ -1350,7 +1353,18 @@ def invoke_agent(store: StateStore, semaphore: threading.Semaphore, repo: Path, 
 def invoke_with_replacements(store: StateStore, semaphore: threading.Semaphore, repo: Path, assignment_id: str, role: str, prompt: str, *, mode: str | None = None, review: bool = False, audit: bool = False, validator=None) -> dict:
     sequence_id, sequence = _prepare_protocol_sequence(store, repo, assignment_id, role, prompt, mode)
     if sequence["status"] == "complete" and "result" in sequence:
-        return sequence["result"]
+        if not validator:
+            return sequence["result"]
+        raw = json.dumps(sequence["result"], sort_keys=True)
+        try:
+            return validator(sequence["result"])
+        except ProtocolValidationError as failure:
+            failure.rejected_output = raw
+            rejection = failure
+        except ValueError as failure:
+            rejection = ProtocolValidationError("$", "validator", str(failure), raw)
+        _record_protocol_rejection(store, sequence_id, rejection)
+        relay_console.emit("CORRECT", f"operation={role} assignment={assignment_id} reason={rejection}")
     if sequence["status"] == "operational-failed":
         store.update(lambda state: state["protocolSequences"][sequence_id].update(status="open"))
     while True:
@@ -1536,13 +1550,19 @@ def candidate_integrity(store: StateStore, assignment: dict, worktree: Path, res
         if sha == parent_sha or ancestry.returncode:
             raise ValueError("validation repair must commit a descendant candidate")
     changed = target_changes(store, worktree, assignment_base, sha)
-    if result.get("changedPaths") and sorted(result["changedPaths"]) != sorted(changed):
-        raise ValueError("reported changed paths do not match candidate diff")
+    if "changedPaths" in result and sorted(result["changedPaths"]) != sorted(changed):
+        raise ValueError(f"reported changed paths do not match candidate diff; expected {json.dumps(changed)}")
     allowed = assignment["allowedPaths"]
     outside = sorted(item for item in changed if not allowed_change(item, allowed, scope_directories(store, allowed)))
     if outside:
         raise ValueError(f"candidate changed paths outside assignment scope: {', '.join(outside)}")
     return sha
+
+
+def validate_worker_result(store: StateStore, assignment: dict, worktree: Path, result: dict, parent_sha: str | None = None) -> dict:
+    if result["status"] == "candidate":
+        candidate_integrity(store, assignment, worktree, result, parent_sha)
+    return result
 
 
 def validate_candidate(store: StateStore, assignment: dict, worktree: Path, result: dict) -> str:
@@ -2163,7 +2183,7 @@ def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: di
                         repair = {"candidateSha": session["pendingWorkerSha"]}
                     else:
                         reserve_repair(store, assignment_id, number)
-                        repair = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt("repair", repair_assignment, current_sha, blockers, store.state["taskStates"][assignment_id].get("error", "")), mode="repair", review=True)
+                        repair = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt("repair", repair_assignment, current_sha, blockers, store.state["taskStates"][assignment_id].get("error", "")), mode="repair", review=True, validator=lambda value: validate_worker_result(store, repair_assignment, worktree, value, current_sha))
                         record_worker_output(store, assignment_id, repair)
                         session.update(previousCandidateSha=current_sha, pendingWorkerSha=repair["candidateSha"])
                         store.save()
@@ -2445,7 +2465,7 @@ def _merge_assignment(store: StateStore, semaphore: threading.Semaphore, assignm
             if pending:
                 result = {"candidateSha": pending}
             else:
-                result = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt(repair_mode, assignment, working_sha, blocker, task_state.get("error", "")), mode=repair_mode, review=True)
+                result = invoke_with_replacements(store, semaphore, worktree, assignment_id, "worker", worker_prompt(repair_mode, assignment, working_sha, blocker, task_state.get("error", "")), mode=repair_mode, review=True, validator=lambda value: validate_worker_result(store, assignment, worktree, value, working_sha))
                 record_worker_output(store, assignment_id, result)
             candidate_integrity(store, assignment, worktree, result, working_sha)
             replacement = validate_candidate(store, assignment, worktree, result)
@@ -2694,6 +2714,7 @@ def process_assignment(store: StateStore, semaphore: threading.Semaphore, assign
                     result = invoke_with_replacements(
                         store, semaphore, worktree, assignment_id, "worker",
                         worker_prompt(mode, assignment, candidate or "", [failure] if failure else None, task_state.get("error", "")), mode=mode,
+                        validator=lambda value: validate_worker_result(store, assignment, worktree, value, candidate or None),
                     )
                     if result["status"] == "needs-user":
                         raise RuntimeError(f"worker requires human decision: {result['summary']}")

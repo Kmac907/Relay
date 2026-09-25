@@ -600,6 +600,26 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertTrue(artifact.is_file())
             self.assertNotIn(secret, artifact.read_text(encoding="utf-8"))
 
+    def test_cached_worker_result_is_revalidated_before_reuse(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); store = self.state_store(root)
+            assignment = ContractTests().task(); assignment_id = assignment["id"]
+            store.state["taskStates"][assignment_id] = {"phase": "implementing", "mode": "task"}
+            prompt = run.worker_prompt("task", assignment)
+            sequence_id, sequence = run._prepare_protocol_sequence(store, root, assignment_id, "worker", prompt, "task")
+            invalid = {"mode": "task", "assignmentId": assignment_id, "status": "candidate", "candidateSha": "abc", "changedPaths": ["src/missing.py"], "validation": [], "summary": "done", "proposedLearnings": []}
+            corrected = invalid | {"changedPaths": ["src/file.py"]}
+            sequence.update(status="complete", result=invalid)
+            store.save()
+            def validator(value):
+                if value["changedPaths"] != ["src/file.py"]:
+                    raise ValueError("reported changed paths do not match candidate diff")
+                return value
+            with patch("run.invoke_agent", return_value=corrected) as invoked:
+                self.assertEqual(run.invoke_with_replacements(store, threading.Semaphore(1), root, assignment_id, "worker", prompt, mode="task", validator=validator), corrected)
+            invoked.assert_called_once()
+            self.assertEqual(store.state["protocolSequences"][sequence_id]["rejections"][0]["errors"][0]["code"], "validator")
+
     def test_malformed_json_correction_reports_parser_location(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root); store = self.state_store(root)
@@ -1996,7 +2016,7 @@ class DeterministicCoreTests(unittest.TestCase):
             Path(root, "app", "AGENTS.md").write_text("nested rules", encoding="utf-8")
             store.state["taskStates"] = {
                 "TASK-0001": {"phase": "integrated", "mergedSha": "abc", "workerSummary": "built base", "changedPaths": ["shared/base.py"]},
-                "TASK-0002": {"phase": "repair-1", "validationHistory": [{"outcome": "failed"}], "workerHistory": [{"summary": "first result"}], "visitedFingerprints": ["one"]},
+                "TASK-0002": {"phase": "repair-1", "candidateSha": "reviewed", "pendingWorkerSha": "pending", "integrationWorkingSha": "working", "validationHistory": [{"outcome": "failed"}], "workerHistory": [{"summary": "first result"}], "visitedFingerprints": ["one"]},
             }
             store.state["reviewSessions"]["TASK-0002"] = {"phase": "repair-1"}
             store.state["learnings"] = [{"scope": ["shared/base.py"], "fact": "use base helper", "sourceAssignment": "TASK-0001", "evidenceSha": "abc", "status": "active"}]
@@ -2009,6 +2029,9 @@ class DeterministicCoreTests(unittest.TestCase):
             self.assertEqual(packet["previousResults"][0]["summary"], "first result")
             self.assertEqual(packet["validationEvidence"][0]["outcome"], "failed")
             self.assertEqual(packet["learnings"][0]["fact"], "use base helper")
+            self.assertEqual(packet["candidateSha"], "pending")
+            store.state["taskStates"]["TASK-0002"].pop("pendingWorkerSha")
+            self.assertEqual(run.context_packet(store, Path(root), "TASK-0002", "worker", "repair", "repair this")["candidateSha"], "working")
 
     def test_all_agent_roles_have_bounded_prompt_and_schema(self):
         self.assertEqual(set(run.ROLE_JSON_SCHEMAS), set(run.AGENT_SCHEMAS))
@@ -2257,9 +2280,21 @@ class FakeEndToEndTests(unittest.TestCase):
             environment = os.environ | VALIDATION_ENV | {"RELAY_CODEX": f"{sys.executable} {fake_codex}", "RELAY_GH": f"{sys.executable} {fake_gh}", "RELAY_ALLOW_FAKE_PROVIDER": "1", "FAKE_GH_STATE": str(provider), "FAKE_BOOTSTRAP_PENDING": "1"}
             subprocess.run([sys.executable, str(Path(plan.__file__)), "--repo", str(target), "--requirements", str(requirements)], capture_output=True, text=True, env=environment, check=True)
             command = [sys.executable, str(Path(run.__file__)), "--repo", str(target), "--agent-timeout", "10", "--validation-timeout", "10", "--provider-timeout", "10", "--provider-check-timeout", "1"]
-            with self.assertRaises(subprocess.TimeoutExpired):
-                subprocess.run(command, capture_output=True, text=True, env=environment, timeout=5)
-            state = json.loads((target / ".relay" / "state.json").read_text(encoding="utf-8"))
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment)
+            deadline = time.time() + 30
+            state = {}
+            try:
+                while time.time() < deadline:
+                    state_path = target / ".relay" / "state.json"
+                    if state_path.is_file():
+                        state = json.loads(state_path.read_text(encoding="utf-8"))
+                        if state["agentsBootstrap"]["phase"] in {"checks", "waiting-provider"}:
+                            break
+                    time.sleep(.1)
+                else:
+                    self.fail(f"bootstrap did not reach provider checks: {state.get('agentsBootstrap', {}).get('phase', 'not-started')}")
+            finally:
+                process.kill(); process.communicate(timeout=5)
             self.assertIn(state["agentsBootstrap"]["phase"], {"checks", "waiting-provider"})
             self.assertEqual(state["taskStates"], {})
             resumed = subprocess.run(command, capture_output=True, text=True, env={key: value for key, value in environment.items() if key != "FAKE_BOOTSTRAP_PENDING"}, timeout=30)
