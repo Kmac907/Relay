@@ -1245,6 +1245,25 @@ class DeterministicCoreTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "uncommitted"):
                 run.validate_candidate(store, assignment, target, {"candidateSha": sha})
 
+    def test_candidate_accepts_files_in_an_authorized_new_directory(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = make_git_repository(Path(root))
+            base = git_output(target, "rev-parse", "HEAD").strip()
+            fixture = target / "tests" / "fixtures" / "new-portal" / "outcome.json"
+            fixture.parent.mkdir(parents=True)
+            fixture.write_text("{}\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(target), "add", "tests/fixtures/new-portal/outcome.json"], check=True)
+            subprocess.run(["git", "-C", str(target), "commit", "-m", "fixture"], check=True, capture_output=True)
+            sha = git_output(target, "rev-parse", "HEAD").strip()
+            store = self.state_store(target)
+            run.exclude_relay_files(target)
+            assignment = ContractTests().task()
+            assignment.update(allowedPaths=["tests/fixtures/new-portal"], validationCommands=[])
+            store.state["campaignValidationCommands"] = []
+            store.state["taskStates"][assignment["id"]] = {"phase": "candidate-validation"}
+            store.state["worktrees"][assignment["id"]] = {"baseSha": base}
+            self.assertEqual(run.validate_candidate(store, assignment, target, {"candidateSha": sha}), sha)
+
     def test_out_of_scope_blocker_stops_before_repair(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.state_store(root)
