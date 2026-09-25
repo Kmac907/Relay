@@ -3215,11 +3215,10 @@ def _recovery_snapshot(store: StateStore, assignment: dict, *, adopt_clean_candi
     assignment_id = assignment["id"]
     worktree, record = recovery_worktree(store, assignment_id)
     head = git(worktree, "rev-parse", "HEAD", timeout=store.state["validationTimeoutSeconds"]).stdout.strip()
-    dirty = git(worktree, "status", "--porcelain=v1", "--untracked-files=all", timeout=store.state["validationTimeoutSeconds"]).stdout
-    if dirty and not allow_dirty_repair:
+    untracked_paths = target_git_paths(store, worktree, "ls-files", "--others", "--exclude-standard")
+    dirty_paths = sorted(set(target_git_paths(store, worktree, "diff", "--name-only", "HEAD") + untracked_paths))
+    if dirty_paths and not allow_dirty_repair:
         raise RuntimeError(f"recovery refused unexpected worktree changes: {assignment_id}")
-    untracked_paths = target_git_paths(store, worktree, "ls-files", "--others", "--exclude-standard") if dirty else []
-    dirty_paths = sorted(set(target_git_paths(store, worktree, "diff", "--name-only") + untracked_paths)) if dirty else []
     untracked_roots = {path.split("/", 1)[0] for path in untracked_paths}
     disposable_untracked_roots = sorted(untracked_roots) if untracked_roots and untracked_roots <= {".pytest-temp", ".pytest-tmp"} else []
     task_state = store.state["taskStates"][assignment_id]

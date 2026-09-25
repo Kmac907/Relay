@@ -1535,7 +1535,9 @@ class DeterministicCoreTests(unittest.TestCase):
             (target / "tests/evidence.json").write_text("later validation output\n", encoding="utf-8")
             store.state["taskStates"][assignment["id"]]["phase"] = "slice-review"
             store.state["reviewSessions"][assignment["id"]]["phase"] = "approved"
-            with patch("run.tempfile.gettempdir", return_value=str(root)):
+            real_git = run.git
+            stale = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            with patch("run.tempfile.gettempdir", return_value=str(root)), patch("run.git", side_effect=lambda repo, *args, **kwargs: stale if args[0] == "status" else real_git(repo, *args, **kwargs)):
                 actions = run.plan_recovery(store, [assignment], [])
                 run.apply_recovery(store, [assignment], actions)
             self.assertEqual(actions[0]["discardDirtyPaths"], ["tests/evidence.json"])
@@ -1595,7 +1597,7 @@ class DeterministicCoreTests(unittest.TestCase):
                     output = f"{worktree}\n"
                 elif args[:2] == ("rev-parse", "HEAD"):
                     output = f"{head[0]}\n"
-                elif args[0] == "status":
+                elif args[:3] == ("diff", "--name-only", "HEAD"):
                     output = dirty[0]
                 else:
                     output = ""
@@ -1632,6 +1634,8 @@ class DeterministicCoreTests(unittest.TestCase):
                 elif args[:2] == ("rev-parse", "HEAD"):
                     output = "candidate\n"
                 elif args[0] == "status":
+                    output = ""
+                elif args[:3] == ("diff", "--name-only", "HEAD"):
                     output = ""
                 elif args[0] == "diff":
                     output = "src/dependency.py\n"
