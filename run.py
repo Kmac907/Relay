@@ -2228,6 +2228,10 @@ def run_review(store: StateStore, semaphore: threading.Semaphore, assignment: di
             repaired_sha = session["pendingRepairSha"]
             previous_sha = session["previousCandidateSha"]
             verification = session.get("verificationResult")
+            if verification and (verification.get("candidateSha") != repaired_sha or verification.get("reviewEpoch") != number):
+                session.pop("verificationResult")
+                store.save()
+                verification = None
             if verification is None:
                 verification = invoke_with_replacements(
                     store, semaphore, worktree, assignment_id, "verification-reviewer",

@@ -1120,7 +1120,7 @@ class DeterministicCoreTests(unittest.TestCase):
             assignment = ContractTests().task()
             store.state["taskStates"][assignment["id"]] = {"phase": "repair-2"}
             store.state["worktrees"][assignment["id"]] = {"baseSha": "base"}
-            store.state["reviewSessions"][assignment["id"]] = {"phase": "repair-2", "acceptedBlockerIds": [], "reviewEpoch": 1, "pendingWorkerSha": "new", "previousCandidateSha": "old"}
+            store.state["reviewSessions"][assignment["id"]] = {"phase": "repair-2", "acceptedBlockerIds": [], "reviewEpoch": 1, "pendingWorkerSha": "new", "previousCandidateSha": "old", "verificationResult": {"assignmentId": assignment["id"], "mode": "incremental", "reviewEpoch": 1, "candidateSha": "old", "resolvedFindingIds": [], "findings": []}}
             verified = {"assignmentId": assignment["id"], "mode": "incremental", "reviewEpoch": 2, "candidateSha": "new", "resolvedFindingIds": [], "findings": []}
             with patch("run.candidate_integrity", return_value="new"), patch("run.validate_candidate", return_value="new") as validate, patch("run.invoke_with_replacements", return_value=verified) as agent:
                 self.assertTrue(run.run_review(store, threading.Semaphore(1), assignment, Path(root), "old"))
