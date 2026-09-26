@@ -79,6 +79,8 @@ def validate_tasks(value: object) -> list[dict]:
     if not isinstance(value, dict) or not isinstance(value.get("tasks"), list):
         run.protocol_error("$.tasks", "type", "planning result must contain a tasks list")
     tasks = [validate_dict(item, TASK_SCHEMA, f"$.tasks[{index}]") for index, item in enumerate(value["tasks"])]
+    if len(tasks) == 1:
+        tasks[0]["downstreamConsumer"] = ""
     ids = [task["id"] for task in tasks]
     if len(ids) != len(set(ids)) or any(not TASK_ID.fullmatch(item) for item in ids):
         run.protocol_error("$.tasks", "task-id", "task IDs must be unique TASK-NNNN values")
