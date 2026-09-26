@@ -155,6 +155,12 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(validated["campaignObjective"], "Relay campaign")
         self.assertEqual(validated["tasks"][0]["objective"], "Do the thing")
 
+    def test_single_task_plan_has_no_impossible_downstream_consumer(self):
+        task = self.task()
+        task["downstreamConsumer"] = task["id"]
+        validated = plan.validate_plan({"campaignObjective": "Relay campaign", "campaignValidationCommands": ["python -m unittest"], "tasks": [task]})
+        self.assertEqual(validated["tasks"][0]["downstreamConsumer"], "")
+
     def test_bug_ledger_round_trip(self):
         with tempfile.TemporaryDirectory() as root:
             bug = {"id": "BUG-0001", "title": "Broken", "severity": "P1", "status": "active", "source": "audit", "sourceFindingId": "AUDIT-F1", "location": "x.py:1", "failure": "fails", "reproduction": "python x.py", "requirement": "works", "evidence": "exit 1"}
