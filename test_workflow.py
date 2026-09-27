@@ -43,6 +43,29 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             plan.validate_tasks({"tasks": [task, dict(task)]})
 
+    def test_task_validation_normalizes_command_forms(self) -> None:
+        data = {
+            "tasks": [
+                {
+                    "id": "TASK-001",
+                    "title": "Do work",
+                    "description": "Implement work",
+                    "acceptanceCriteria": ["It works"],
+                    "validation": {"command": "python -m unittest"},
+                },
+                {
+                    "id": "TASK-002",
+                    "title": "Do more work",
+                    "description": "Implement more work",
+                    "acceptanceCriteria": ["It works"],
+                    "validation": [{"command": "python -m unittest -v"}],
+                },
+            ]
+        }
+        self.assertEqual(plan.validate_tasks(data), 2)
+        self.assertEqual(data["tasks"][0]["validation"], ["python -m unittest"])
+        self.assertEqual(data["tasks"][1]["validation"], ["python -m unittest -v"])
+
     def test_bug_validation_requires_evidence(self) -> None:
         with self.assertRaises(ValueError):
             run.validate_bugs({"bugs": [{"id": "BUG-001"}]})

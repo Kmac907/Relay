@@ -75,8 +75,26 @@ def validate_tasks(data: object) -> int:
             raise ValueError(f"tasks[{index}] has a duplicate or invalid id")
         if not isinstance(task["acceptanceCriteria"], list) or not task["acceptanceCriteria"]:
             raise ValueError(f"tasks[{index}].acceptanceCriteria must be non-empty")
-        if not isinstance(task["validation"], list) or not all(isinstance(item, str) for item in task["validation"]):
-            raise ValueError(f"tasks[{index}].validation must be an array of strings")
+        validation = task["validation"]
+        if isinstance(validation, str):
+            validation = [validation]
+        elif isinstance(validation, dict) and isinstance(validation.get("command"), str):
+            validation = [validation["command"]]
+        elif isinstance(validation, list):
+            normalized: list[str] = []
+            for item in validation:
+                if isinstance(item, str):
+                    normalized.append(item)
+                elif isinstance(item, dict) and isinstance(item.get("command"), str):
+                    normalized.append(item["command"])
+                else:
+                    raise ValueError(f"tasks[{index}].validation contains unsupported value: {item!r}")
+            validation = normalized
+        else:
+            raise ValueError(f"tasks[{index}].validation must contain command strings, got: {validation!r}")
+        if not validation or not all(item.strip() for item in validation):
+            raise ValueError(f"tasks[{index}].validation must contain at least one command string")
+        task["validation"] = validation
         ids.add(task_id)
     return len(data["tasks"])
 
