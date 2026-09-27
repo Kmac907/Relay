@@ -10,20 +10,18 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
-
-import relay_console
 
 GENERATED_AGENTS_MARKER = "<!-- relay: generated-target-instructions v1 -->"
 TARGET_AGENTS = f"""{GENERATED_AGENTS_MARKER}
 # Relay target instructions
 
-- Follow the assigned role, mode, paths, and acceptance criteria.
-- Treat `PLAN.md` as user-owned and `tasks.md`, `bugs.md`, and `.relay` as coordinator-owned.
-- Only Workers may modify source, and only within their assigned worktree and allowed paths.
-- Do not create, push, or merge pull requests; change provider settings; spawn subagents; or edit ledgers.
-- Run the assigned validation, make focused commits, and report evidence for every result.
+- Follow the repository's existing patterns and conventions.
+- Make focused changes within the assigned task scope.
+- Run the specified validation before committing.
+- Do not modify `requirements.md`, `plan.md`, `tasks.json`, or `bugs.json`.
 """
 TARGET_AGENTS_SHA256 = hashlib.sha256(TARGET_AGENTS.encode()).hexdigest()
 
@@ -77,28 +75,24 @@ def create(path: Path, github: str | None = None, visibility: str | None = None,
         raise ValueError(f"refusing existing Git repository: {target}")
 
     started = time.monotonic()
-    relay_console.emit("START", operation="initialize", deadline=f"{timeout}s")
     run("git", "-C", str(target), "init", "--initial-branch=main", timeout=timeout)
     create_exclusive(target / "README.md", f"# {target.name}\n")
     create_exclusive(target / "AGENTS.md", TARGET_AGENTS)
     run("git", "-C", str(target), "add", "README.md", "AGENTS.md", timeout=timeout)
-    relay_console.emit("DONE", operation="initialize", elapsed=f"{time.monotonic() - started:.1f}s")
+    print(f"Initialized repository in {time.monotonic() - started:.1f}s")
     started = time.monotonic()
-    relay_console.emit("START", operation="commit", deadline=f"{timeout}s")
     run("git", "-C", str(target), "commit", "-m", "Initial commit", timeout=timeout)
     branch = run("git", "-C", str(target), "branch", "--show-current", capture=True, timeout=timeout).stdout.strip()
     sha = run("git", "-C", str(target), "rev-parse", "HEAD", capture=True, timeout=timeout).stdout.strip()
-    relay_console.emit("DONE", operation="commit", sha=sha[:12], elapsed=f"{time.monotonic() - started:.1f}s")
+    print(f"Committed {sha[:12]} in {time.monotonic() - started:.1f}s")
 
     if github:
         started = time.monotonic()
-        relay_console.emit("START", operation="publish", deadline=f"{timeout}s")
         run("gh", "auth", "status", timeout=timeout)
         run("gh", "repo", "create", github, f"--{visibility}", "--source", str(target), "--remote", "origin", "--push", timeout=timeout)
-        relay_console.emit("DONE", operation="publish", elapsed=f"{time.monotonic() - started:.1f}s")
+        print(f"Published in {time.monotonic() - started:.1f}s")
     elif azure_devops:
         started = time.monotonic()
-        relay_console.emit("START", operation="publish", deadline=f"{timeout}s")
         organization, project, repository = azure_devops
         created = run("az", "repos", "create", "--name", repository, "--organization", f"https://dev.azure.com/{organization}", "--project", project, "--output", "json", capture=True, timeout=timeout)
         data = json.loads(created.stdout)
@@ -106,7 +100,7 @@ def create(path: Path, github: str | None = None, visibility: str | None = None,
             raise ValueError("az repos create returned no remoteUrl")
         run("git", "-C", str(target), "remote", "add", "origin", data["remoteUrl"], timeout=timeout)
         run("git", "-C", str(target), "push", "--set-upstream", "origin", "main", timeout=timeout)
-        relay_console.emit("DONE", operation="publish", elapsed=f"{time.monotonic() - started:.1f}s")
+        print(f"Published in {time.monotonic() - started:.1f}s")
     return target, branch, sha
 
 
@@ -139,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
         path, branch, sha = create(args.path, args.github, args.visibility, args.provider_timeout, tuple(args.azure_devops) if args.azure_devops else None)
     except (ValueError, OSError, json.JSONDecodeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         reason = f"command exited with code {error.returncode}" if isinstance(error, subprocess.CalledProcessError) else "operation timed out" if isinstance(error, subprocess.TimeoutExpired) else str(error).splitlines()[0]
-        relay_console.emit("FAILED", operation="repository", reason=reason)
+        print(f"FAILED repository: {reason}", file=sys.stderr)
         return 1
     print(f"Path:   {path}")
     print(f"Branch: {branch}")
