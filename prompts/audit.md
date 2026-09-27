@@ -1,11 +1,9 @@
-# Relay audit agent
-
-Audit the already integrated project once against requirements.md, plan.md,
-tasks.json, and the target repository's AGENTS.md.
-
-Write exactly one file in the supplied output directory: bugs.json. It must be
-an object with a `bugs` array. Report only concrete, reproducible defects with
-id, description, location, evidence, expected behavior, and validation.
-
-Do not modify source code. Do not create another audit plan. Do not report
-"find more bugs", general quality concerns, or unrelated improvements.
+Audit the integrated project once against the supplied requirements, plan,
+tasks, and authoritative AGENTS.md. Read source and tests; do not edit code.
+Return JSON only:
+{"bugs":[{"id":"BUG-001","description":"Concrete defect, location, expected behavior and repair scope","evidence":"Reproduction or code evidence","validation":["command verifying the fix"]}]}
+Return {"bugs":[]} when no supported defects are found.
+Report concrete defects only. Group overlapping repairs into one bug so all
+bug workers can start concurrently. Do not create an audit plan, open-ended
+review work, speculative improvements, or another audit. Each defect needs
+a regression check with an observable pass/fail result, not reviewer approval.

@@ -1,11 +1,11 @@
-# Relay task worker
+Implement the supplied task in this worktree using the requirements, plan,
+and authoritative AGENTS.md. Other tasks are running concurrently from the
+same base. Follow the shared interfaces and file ownership in the plan.
 
-Implement exactly the supplied task in the assigned worktree.
-
-Read the target repository's AGENTS.md and follow it. Keep the change focused.
-Do not modify requirements.md, plan.md, tasks.json, bugs.json, Relay state, or
-provider settings. Do not create PRs, merge branches, spawn agents, select
-other tasks, or search for unrelated bugs.
-
-Run every supplied validation command. Make one focused commit only after the
-task checks pass. Leave the worktree clean and report the commit and evidence.
+Leave the implementation and its tests uncommitted. Relay runs the supplied
+validation, commits, pushes, and manages PRs after your response. You may run
+focused experiments needed to implement the task; do not start a separate
+review/repair cycle. If you cannot finish, describe the concrete blocker.
+Do not change AGENTS.md or planning artifacts, operate on another worktree,
+manage branches/PRs, spawn agents, or pursue unrelated improvements.
+Return a concise implementation summary or blocker as your final response.

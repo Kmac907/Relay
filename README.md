@@ -4,9 +4,7 @@
   <img src="assets/relay-icon.png" alt="Relay icon" width="180">
 </p>
 
-Relay is a simple parallel Ralph pipeline. It plans once, builds tasks in
-parallel, integrates task PRs, audits the integrated result once, fixes the
-reported bugs in parallel, validates once, and opens one project PR.
+One plan, parallel implementation, one audit, parallel bug fixes, final validation.
 
 ```text
 requirements.md
@@ -15,165 +13,130 @@ requirements.md
 planning -------> plan.md + tasks.json
       |
       v
-build ----------> task worktrees -> task PRs -> relay/integration
+build ----------> TASK worktrees -> task PRs -> relay/integration
       |
       v
-audit ----------> bugs.json -> bug worktrees -> bug PRs
+audit ----------> bugs.json -> BUG worktrees -> bug PRs
       |
       v
 final validation -> project PR -> main -> cleanup
 ```
 
-There is no PM loop, dependency scheduler, workflow database, retry counter,
-repair budget, review epoch, fingerprint ledger, or recursive audit. The phase
-pipeline is finite. A failed task, bug fix, or final validation is blocked with
-evidence instead of being retried forever.
+Requires Python 3.11+, Git, Codex CLI, and authenticated GitHub CLI (`gh`).
+Windows validation commands use PowerShell 7 (`pwsh`); elsewhere they use `sh`.
+GitHub must permit merge commits. Branch protection and required checks are
+respected; required human approval still blocks that PR.
 
-## Requirements
+## Usage
 
-- Python 3.11 or newer.
-- Git with an author configured.
-- Codex available as `codex`.
-- GitHub CLI authenticated with `gh auth login`.
-- A target repository with `main` as its final branch.
+Create a project using the existing repository tool, or use an existing GitHub
+repository with `origin/main`:
 
-Relay shells out to `git`, `codex`, and `gh`. `RELAY_GIT`, `RELAY_GH`, and
-`RELAY_CODEX` may select replacement executables. Relay does not read or store
-provider credentials.
+```powershell
+python repo.py --path C:\Code\Projects\Example --github OWNER/Example --private
+python plan.py --repo C:\Code\Projects\Example --requirements C:\path\requirements.md
+python run.py --repo C:\Code\Projects\Example --dry-run
+python run.py --repo C:\Code\Projects\Example
+```
 
-## Prompts
+`plan.py` calls one read-only planner and saves `plan.md` and `tasks.json`.
+The project's `requirements.md` is the authoritative source for both scripts.
+`tasks.json` contains only tasks. By default, planning reads the project's
+`requirements.md`; `--requirements PATH` imports that file to the project as
+`requirements.md`, replacing its previous contents. Common JSON command shapes
+are normalized locally. Invalid output stops with the original response retained.
 
-Prompt templates are versioned in Relay and resolved relative to the scripts:
+`run.py` starts one agent per independent task simultaneously. The planner
+defines shared interfaces and combines dependent or overlapping work. Each
+agent has a fresh context and its own branch and worktree. Workers implement;
+Relay runs validation and handles commits, pushes, PRs, and merges through `gh`.
+CI waits run concurrently; merges are serialized. All workers finish even if
+another worker fails. Failed work stops progression to the next phase.
+
+The integrated code is audited once. Each reported bug gets one worker and
+worktree. After bug PRs merge, final validation runs the unique task and bug
+commands against the integrated code. Passing validation leads to a project PR
+and merge into `main`. Relay does not update your original working directory.
+
+## Instructions and prompts
+
+Every project has an authoritative `AGENTS.md`. An existing file is preserved;
+Relay creates a minimal file if missing and supplies it to each agent.
+Project conventions and commands belong there. Agent role prompts live in:
 
 ```text
 prompts/planning.md
 prompts/task.md
 prompts/audit.md
 prompts/bug.md
+prompts/merge.md
 ```
 
-They are never copied into target repositories. Runtime context is appended in
-memory for each agent.
+Planner output contains `plan` text and a `tasks` array. Each task contains
+`id`, `title`, `description` (including acceptance criteria), and `validation`
+command strings. Audit output contains a `bugs` array; bugs contain `id`,
+`description`, `evidence`, and `validation`. The prompts include examples.
 
-## Project instructions
+## Status and failures
 
-Each target project should have one authoritative `AGENTS.md`.
+Console events identify each phase, worker, validation command, and PR.
+The live summary shows the phase, active agents, validation, conflict resolution,
+waiting work, merged/total items, blocked items, and total elapsed time. Active
+item IDs and their current operations follow the counts. A final summary remains
+visible after exit. These are in-memory display values, not scheduling state.
+Interactive terminals show a spinner; `--no-spinner` disables it.
+The printed temporary directory contains full agent output, validation logs,
+and worktrees. Failures print the command, output excerpt, and log location.
 
-- `repo.py` creates a minimal one for newly created repositories.
-- Existing `AGENTS.md` files are preserved and never overwritten.
-- `plan.py` and `run.py` read it and provide it to every agent.
-- Project architecture, commands, conventions, and testing rules belong there.
-- Relay orchestration rules belong in Relay prompts, not the target file.
+When GitHub reports a merge conflict, an agent receives Git's conflicting files
+and the task context in an isolated worktree. It chooses and stages the resolution;
+Relay supplies no file-specific resolution rules. Relay validates, commits,
+pushes without force, and attempts to merge the resolved result. The handoff also
+applies to existing PRs and the final project PR. Other workers continue while
+the agent resolves the conflict. An unresolved conflict, failed validation, or
+another failed merge stops with work retained; it does not call the agent again.
 
-## Create a repository
+The orchestration is acyclic: implementation, optional conflict resolution,
+and integration. Audit runs once per campaign; subsequent invocations reuse
+the existing `bugs.json` without regenerating findings or their IDs. Failed validation never
+schedules another agent. There are no
+repair counters, budgets, PM agents, review passes, workflow database, or resume
+engine. This prevents Relay from spawning an endless review/repair cycle. It
+does not guarantee an underlying agent terminates or that every bug is solvable.
+Tests provide repeatable acceptance checks; they do not prove arbitrary code
+correct. Choose meaningful regression and integration checks in the plan.
 
-`repo.py` creates a local repository with `main`, a README, and generic target
-`AGENTS.md`. It refuses a nonempty destination.
+On failure, worktrees and branches are retained for inspection. Running again
+continues the existing `relay/integration` branch. Open task and bug PRs are
+reused, and PRs already merged into integration are skipped without starting
+another agent. Existing PRs pass through GitHub checks and merging; the combined
+result still passes final validation using the saved audit's checks. Open project
+PRs are reused too. A project PR already merged at the current integration commit
+ends the run before starting any agents; the summary says `ALREADY MERGED; NOT
+REVALIDATED`. This does not claim that later findings are fixed. Changed integration
+after a completed project requires a new campaign. Closed, unmerged PRs require
+user action. Unpublished work remains available for manual recovery.
+On success, worktrees are removed after the project PR merges. Cleanup removes
+untracked Python bytecode from `__pycache__` and restores only content-equivalent
+`AGENTS.md` checkout formatting. Actual edits and other untracked files are
+preserved; the final summary reports `cleanup=partial` and the retained count.
+Logs, artifacts, and branches remain available. These artifacts and branch names
+belong to the current planned project; rerunning resumes it rather than starting
+a new project or requesting another audit.
+Do not edit or remove `bugs.json` while resuming a campaign: bug PR IDs refer to
+that saved audit. Starting another campaign in the same repository is not
+automated; deleting branches alone does not remove their old GitHub PR identities.
+
+`RELAY_GIT`, `RELAY_GH`, and `RELAY_CODEX` can name replacement executable paths.
+Agents use Codex's read-only or workspace-write sandbox as appropriate.
+
+## Verification
 
 ```powershell
-python repo.py --path C:\Code\Projects\Example --github OWNER/Example --private
-python repo.py --path C:\Code\Projects\Example --azure-devops ORGANIZATION PROJECT Example
+python -B -m unittest -v test_workflow.py
 ```
 
-For an existing repository, skip this step.
-
-## Plan
-
-```powershell
-python plan.py `
-  --repo C:\Code\Projects\Example `
-  --requirements C:\path\to\requirements.md
-```
-
-The planner creates:
-
-- `plan.md`: human-readable plan;
-- `tasks.json`: independently implementable task list.
-
-The planner performs one agent pass and validates the JSON. It does not run a
-plan-review or plan-repair loop.
-
-## Run
-
-```powershell
-python run.py --repo C:\Code\Projects\Example
-python run.py --repo C:\Code\Projects\Example --dry-run
-python run.py --repo C:\Code\Projects\Example --verbose
-python run.py --repo C:\Code\Projects\Example --no-spinner
-```
-
-The number of agents is derived from the current work:
-
-- one build agent per task;
-- one bug agent per bug.
-
-There is no `--workers` option or internal worker pool. Independent work is
-launched concurrently. GitHub, the provider, the OS, CI, and available disk
-capacity provide the practical limit.
-
-Each agent receives an isolated Git worktree and a fresh context. Task and bug
-branches are deterministic:
-
-```text
-relay/task/TASK-001
-relay/bug/BUG-001
-relay/integration
-```
-
-Task and bug PRs target `relay/integration`. The final project PR targets
-`main`.
-
-## Status output
-
-Relay prints event lines as work progresses:
-
-```text
-[BUILD] starting tasks=8 agents=8
-[TASK-001] started
-[TASK-001] committed abc1234
-[TASK-001] PR #41 merged
-[AUDIT] complete bugs=3
-[BUG-001] PR #52 merged
-[FINAL] validation passed
-[FINAL] project PR #60 merged
-```
-
-Interactive terminals also show a lightweight spinner with phase, active
-agents, completed work, merged PRs, blocked work, and elapsed time. It is
-disabled automatically when output is redirected or explicitly with
-`--no-spinner`. `--verbose` includes prefixed agent output.
-
-## Infinite-loop prevention
-
-The pipeline is acyclic:
-
-```text
-planning -> build -> integration -> audit -> bug fixes -> final validation -> main
-```
-
-The audit runs once. Bug fixes never start another audit. Final validation
-never searches for new bugs or creates repair work. Failed work is blocked with
-the exact command and evidence. Relay uses no attempt counters, retry limits,
-repair budgets, or recursive review loops.
-
-## Cleanup
-
-Normal completion removes temporary worktrees after the project PR merges.
-
-```powershell
-python run.py --repo C:\Code\Projects\Example --cleanup
-```
-
-Cleanup removes only validated temporary Relay worktrees. It preserves source,
-Git history, `AGENTS.md`, `requirements.md`, `plan.md`, `tasks.json`, and
-`bugs.json`.
-
-## Development
-
-```powershell
-python -m unittest -v test_workflow.py
-python -m py_compile plan.py run.py repo.py
-python repo.py --help
-python plan.py --help
-python run.py --help
-```
+The tests exercise real Git repositories, concurrent worktrees, real shell
+validation, task and bug integration, and every terminal failure phase.
+Agent responses and GitHub are simulated; the tests do not spend model tokens
+or create remote PRs.

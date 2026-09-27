@@ -1,11 +1,8 @@
-# Relay bug worker
-
-Fix exactly the supplied bug in the assigned worktree.
-
-Read the target repository's AGENTS.md and follow it. Use the supplied
-evidence and validation command. Do not modify requirements.md, plan.md,
-tasks.json, bugs.json, Relay state, or provider settings. Do not create PRs,
-merge branches, spawn agents, or search for additional bugs.
-
-Run the supplied validation. Make one focused commit only when the fix passes.
-Leave the worktree clean and report the commit and evidence.
+Fix the supplied defect and add its regression check in this worktree.
+Use the evidence, requirements, plan, and authoritative AGENTS.md. Other bug
+workers run concurrently; stay within this repair's scope.
+Leave changes uncommitted. Relay runs validation, commits, and manages PRs.
+Do not start another audit/review, discover unrelated improvements, spawn
+agents, manage branches/PRs, change AGENTS.md or planning artifacts, or edit
+another worktree. If the repair cannot be completed, report the blocker.
+Return a concise fix summary or blocker as your final response.

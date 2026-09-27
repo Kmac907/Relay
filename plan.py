@@ -1,215 +1,157 @@
 #!/usr/bin/env python3
-"""Create plan.md and tasks.json from requirements.md."""
+"""Plan once: requirements.md -> plan.md + tasks.json."""
 from __future__ import annotations
-
 import argparse
+from contextlib import contextmanager
+import itertools
 import json
 import os
-import shlex
+from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
-PROMPT = ROOT / "prompts" / "planning.md"
-AGENT_TIMEOUT = 3600
+PROMPTS = Path(__file__).resolve().parent / "prompts"
+PRINT_LOCK = threading.Lock()
 
 
-def command(name: str) -> list[str]:
-    value = os.environ.get(f"RELAY_{name.upper()}", name)
-    parts = shlex.split(value, posix=os.name != "nt")
-    if os.name == "nt" and parts:
-        parts[0] = shutil.which(parts[0]) or parts[0]
-    return parts
+def say(message: str) -> None:
+    with PRINT_LOCK:
+        print("\r\033[2K" if sys.stdout.isatty() else "", end="")
+        print(message, flush=True)
 
 
-def emit(message: str) -> None:
-    print(message, flush=True)
-
-
-class Spinner:
-    def __init__(self, label: str, disabled: bool) -> None:
-        self.label = label
-        self.disabled = disabled or not sys.stdout.isatty()
-        self.stop_event = threading.Event()
-        self.thread: threading.Thread | None = None
-
-    def start(self) -> None:
-        if not self.disabled:
-            self.thread = threading.Thread(target=self._run, daemon=True)
-            self.thread.start()
-
-    def stop(self) -> None:
-        self.stop_event.set()
-        if self.thread:
-            self.thread.join()
-            print("\r\033[2K", end="", flush=True)
-
-    def _run(self) -> None:
-        frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-        index = 0
-        started = time.monotonic()
-        while not self.stop_event.is_set():
-            elapsed = int(time.monotonic() - started)
-            print(f"\r{frames[index % len(frames)]} PLAN {self.label} elapsed={elapsed}s", end="", flush=True)
-            index += 1
-            self.stop_event.wait(0.35)
-
-
-def validate_tasks(data: object) -> int:
-    if not isinstance(data, dict) or not isinstance(data.get("tasks"), list) or not data["tasks"]:
-        raise ValueError("tasks.json must contain a non-empty tasks array")
-    ids: set[str] = set()
-    for index, task in enumerate(data["tasks"], 1):
-        if not isinstance(task, dict):
-            raise ValueError(f"tasks[{index}] must be an object")
-        for field in ("id", "title", "description", "acceptanceCriteria", "validation"):
-            if field not in task:
-                raise ValueError(f"tasks[{index}] missing {field}")
-        task_id = task["id"]
-        if not isinstance(task_id, str) or not task_id.strip() or task_id in ids:
-            raise ValueError(f"tasks[{index}] has a duplicate or invalid id")
-        if not isinstance(task["acceptanceCriteria"], list) or not task["acceptanceCriteria"]:
-            raise ValueError(f"tasks[{index}].acceptanceCriteria must be non-empty")
-        validation = task["validation"]
-        if isinstance(validation, str):
-            validation = [validation]
-        elif isinstance(validation, dict) and isinstance(validation.get("command"), str):
-            validation = [validation["command"]]
-        elif isinstance(validation, list):
-            normalized: list[str] = []
-            for item in validation:
-                if isinstance(item, str):
-                    normalized.append(item)
-                elif isinstance(item, dict) and isinstance(item.get("command"), str):
-                    normalized.append(item["command"])
-                else:
-                    raise ValueError(f"tasks[{index}].validation contains unsupported value: {item!r}")
-            validation = normalized
-        else:
-            raise ValueError(f"tasks[{index}].validation must contain command strings, got: {validation!r}")
-        if not validation or not all(item.strip() for item in validation):
-            raise ValueError(f"tasks[{index}].validation must contain at least one command string")
-        task["validation"] = validation
-        ids.add(task_id)
-    return len(data["tasks"])
-
-
-def atomic_write(path: Path, content: str) -> None:
-    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent, text=True)
+@contextmanager
+def progress(label: str, disabled: bool = False):
+    stop = threading.Event()
+    started = time.monotonic()
+    def animate():
+        for frame in itertools.cycle("|/-\\"):
+            if stop.wait(0.2):
+                return
+            text = label() if callable(label) else f"{label} elapsed={int(time.monotonic() - started)}s"
+            text = text[:max(0, shutil.get_terminal_size().columns - 3)]
+            with PRINT_LOCK:
+                print(f"\r{frame} {text}", end="", flush=True)
+    thread = None
+    if sys.stdout.isatty() and not disabled:
+        thread = threading.Thread(target=animate, daemon=True)
+        thread.start()
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
-            stream.write(content)
-        os.replace(name, path)
-    except BaseException:
-        try:
-            os.unlink(name)
-        except FileNotFoundError:
-            pass
-        raise
+        yield
+    finally:
+        stop.set()
+        if thread:
+            thread.join()
+            with PRINT_LOCK:
+                print("\r\033[2K", end="", flush=True)
 
 
-def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description=__doc__)
-    result.add_argument("--repo", required=True, type=Path)
-    result.add_argument("--requirements", required=True, type=Path)
-    result.add_argument("--no-spinner", action="store_true")
+def execute(cwd: Path, *args: str, input: str | None = None, log: Path | None = None) -> str:
+    executable = shutil.which(os.environ.get(f"RELAY_{args[0].upper()}", args[0]))
+    if not executable:
+        raise RuntimeError(f"executable not found: {args[0]}")
+    result = subprocess.run([executable, *args[1:]], cwd=cwd, input=input,
+                            capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if log:
+        log.write_text(result.stdout + result.stderr, encoding="utf-8")
+    if result.returncode:
+        raise RuntimeError(f"{subprocess.list2cmdline(list(args))} exited {result.returncode}\n"
+                           f"{(result.stdout + result.stderr)[-4000:]}" + (f"\nLog: {log}" if log else ""))
+    return result.stdout.strip()
+
+
+def agent(repo: Path, role: str, context: dict, output: Path, *, write: bool = False) -> str:
+    instructions = (repo / "AGENTS.md").read_text(encoding="utf-8")
+    prompt = (PROMPTS / f"{role}.md").read_text(encoding="utf-8")
+    prompt += "\nProject AGENTS.md:\n" + instructions + "\nInputs:\n" + json.dumps(context, indent=2)
+    execute(repo, "codex", "exec", "--ephemeral", "--sandbox",
+            "workspace-write" if write else "read-only", "--cd", str(repo),
+            "--output-last-message", str(output), "-", input=prompt, log=output.with_suffix(".log"))
+    if not output.is_file():
+        raise ValueError(f"agent returned no final response; see {output.with_suffix('.log')}")
+    return output.read_text(encoding="utf-8")
+
+
+def decode(text: str):
+    text = text.strip()
+    if text.startswith("```") and text.endswith("```"):
+        text = text.split("\n", 1)[1].rsplit("```", 1)[0]
+    return json.loads(text)
+
+
+def commands(value) -> list[str]:
+    values = value if isinstance(value, list) else [value]
+    result = [item.get("command") if isinstance(item, dict) else item for item in values]
+    if not result or any(not isinstance(item, str) or not item.strip() for item in result):
+        raise ValueError(f"validation must contain command strings; received {value!r}")
     return result
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parser().parse_args(argv)
-    repo = args.repo.expanduser().resolve()
-    requirements = args.requirements.expanduser().resolve()
-    if not repo.is_dir() or not (repo / ".git").exists():
-        parser().error(f"not a Git repository: {repo}")
-    if not requirements.is_file():
-        parser().error(f"requirements file not found: {requirements}")
-    if not PROMPT.is_file():
-        parser().error(f"prompt not found: {PROMPT}")
+def items(data, key: str) -> list[dict]:
+    if not isinstance(data, dict) or not isinstance(data.get(key), list):
+        raise ValueError(f"expected an object with a {key} array")
+    result = data[key]
+    if key == "tasks" and not result:
+        raise ValueError("tasks must not be empty")
+    seen = set()
+    for item in result:
+        if not isinstance(item, dict):
+            raise ValueError(f"invalid {key} entry: {item!r}")
+        identity = item.get("id", "")
+        if not isinstance(identity, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", identity) or identity.casefold() in seen:
+            raise ValueError(f"invalid or duplicate id: {identity!r}")
+        seen.add(identity.casefold())
+        for field in ("description", "evidence") if key == "bugs" else ("title", "description"):
+            if not isinstance(item.get(field), str) or not item[field].strip():
+                raise ValueError(f"{identity}: missing {field}")
+        if item.get("dependencies"):
+            raise ValueError(f"{identity}: tasks must be independently executable; combine dependent work during planning")
+        item["validation"] = commands(item.get("validation"))
+    return result
 
-    started = time.monotonic()
-    emit("[PLAN] starting")
-    before_status = subprocess.run(
-        command("git") + ["-C", str(repo), "status", "--porcelain"],
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    ).stdout
-    agents = (repo / "AGENTS.md").read_text(encoding="utf-8") if (repo / "AGENTS.md").is_file() else "(no AGENTS.md present)"
-    requirement_text = requirements.read_text(encoding="utf-8")
-    with tempfile.TemporaryDirectory(prefix="relay-plan-") as output:
-        output_dir = Path(output)
-        prompt = PROMPT.read_text(encoding="utf-8") + f"""
 
-## Runtime context
-OUTPUT_DIR={output_dir}
-REPOSITORY={repo}
+def project(path: Path) -> Path:
+    repo = path.expanduser().resolve()
+    if Path(execute(repo, "git", "rev-parse", "--show-toplevel")).resolve() != repo:
+        raise ValueError("--repo must name the repository root")
+    if not (repo / "AGENTS.md").is_file():
+        from repo import TARGET_AGENTS
+        (repo / "AGENTS.md").write_text(TARGET_AGENTS, encoding="utf-8")
+    return repo
 
-<AGENTS_MD>
-{agents}
-</AGENTS_MD>
 
-<REQUIREMENTS_MD>
-{requirement_text}
-</REQUIREMENTS_MD>
-"""
-        emit("[PLAN] planning agent running")
-        spinner = Spinner("planning agent running", args.no_spinner)
-        spinner.start()
-        try:
-            result = subprocess.run(
-                command("codex") + ["exec", "--ephemeral", "--dangerously-bypass-approvals-and-sandbox", "--cd", str(repo), "-"],
-                input=prompt,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                capture_output=True,
-                timeout=AGENT_TIMEOUT,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            spinner.stop()
-            emit(f"[PLAN] blocked reason={error}")
-            return 2
-        spinner.stop()
-        after_status = subprocess.run(
-            command("git") + ["-C", str(repo), "status", "--porcelain"],
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        ).stdout
-        if after_status != before_status:
-            emit("[PLAN] blocked reason=planning agent modified the target repository")
-            return 2
-        if result.returncode:
-            emit(f"[PLAN] blocked agent_exit={result.returncode}")
-            if result.stderr:
-                print(result.stderr[-4000:], file=sys.stderr)
-            return 2
-        plan_path = output_dir / "plan.md"
-        tasks_path = output_dir / "tasks.json"
-        if not plan_path.is_file() or not tasks_path.is_file():
-            emit("[PLAN] blocked reason=agent did not create plan.md and tasks.json")
-            return 2
-        try:
-            tasks = json.loads(tasks_path.read_text(encoding="utf-8"))
-            count = validate_tasks(tasks)
-        except (OSError, json.JSONDecodeError, ValueError) as error:
-            emit(f"[PLAN] blocked reason=invalid tasks.json: {error}")
-            return 2
-        emit("[PLAN] validating tasks.json")
-        atomic_write(repo / "plan.md", plan_path.read_text(encoding="utf-8"))
-        atomic_write(repo / "tasks.json", json.dumps(tasks, indent=2) + "\n")
-    emit(f"[PLAN] complete tasks={count} elapsed={time.monotonic() - started:.1f}s")
-    return 0
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", type=Path, required=True)
+    parser.add_argument("--requirements", type=Path, help="import this file as the project's requirements.md")
+    parser.add_argument("--no-spinner", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        repo = project(args.repo)
+        requirements_path = repo / "requirements.md"
+        if args.requirements and args.requirements.resolve() != requirements_path:
+            shutil.copyfile(args.requirements, requirements_path)
+        requirements = requirements_path.read_text(encoding="utf-8")
+        output = Path(tempfile.mkdtemp(prefix="relay-plan-"))
+        say(f"[PLAN] running; output={output}")
+        with progress("planning", args.no_spinner):
+            raw = agent(repo, "planning", {"requirements": requirements}, output / "response.json")
+        result = decode(raw)
+        tasks = items(result, "tasks")
+        if not isinstance(result.get("plan"), str) or not result["plan"].strip():
+            raise ValueError("planner response is missing plan text")
+        (repo / "plan.md").write_text(result["plan"] + "\n", encoding="utf-8")
+        (repo / "tasks.json").write_text(json.dumps({"tasks": tasks}, indent=2) + "\n", encoding="utf-8")
+        say(f"[PLAN] complete tasks={len(tasks)}")
+        return 0
+    except (OSError, ValueError, RuntimeError) as error:
+        say(f"[PLAN] blocked: {error}")
+        return 2
 
 
 if __name__ == "__main__":

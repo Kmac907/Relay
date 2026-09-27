@@ -1,534 +1,360 @@
 #!/usr/bin/env python3
-"""Run Relay's finite parallel build, audit, bug, and validation pipeline."""
+"""Build in parallel, audit once, repair in parallel, validate, merge, clean up."""
 from __future__ import annotations
-
 import argparse
-import asyncio
-import contextlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
-import re
-import shlex
-import shutil
-import subprocess
-import sys
-import tempfile
-import time
 from pathlib import Path
-from typing import Any
+import tempfile
+import threading
+import time
+from collections import Counter
 
-from plan import validate_tasks
+from plan import agent, decode, execute, items, progress, project, say
 
-ROOT = Path(__file__).resolve().parent
-PROMPTS = ROOT / "prompts"
-AGENT_TIMEOUT = 3600
-CHECK_TIMEOUT = 1800
-INTEGRATION_BRANCH = "relay/integration"
-
-
-def command(name: str) -> list[str]:
-    value = os.environ.get(f"RELAY_{name.upper()}", name)
-    parts = shlex.split(value, posix=os.name != "nt")
-    if os.name == "nt" and parts:
-        parts[0] = shutil.which(parts[0]) or parts[0]
-    return parts
+INTEGRATION = "relay/integration"
 
 
-def run_command(program: str, *args: str, cwd: Path | None = None, capture: bool = False) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        command(program) + list(args),
-        cwd=cwd,
-        check=True,
-        capture_output=capture,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=CHECK_TIMEOUT,
-    )
-
-
-def git(repo: Path, *args: str, capture: bool = False) -> str:
-    return run_command("git", "-C", str(repo), *args, capture=capture).stdout.strip() if capture else ""
-
-
-def gh(*args: str, cwd: Path | None = None, capture: bool = False) -> str:
-    result = run_command("gh", *args, cwd=cwd, capture=capture)
-    return result.stdout.strip() if capture else ""
-
-
-def emit(message: str) -> None:
-    print(message, flush=True)
-
-
-class Status:
-    def __init__(self, no_spinner: bool, verbose: bool) -> None:
-        self.no_spinner = no_spinner
-        self.verbose = verbose
-        self.phase = "starting"
-        self.active = 0
-        self.complete = 0
-        self.merged = 0
-        self.blocked = 0
+class Summary:
+    """In-memory display only; never used to decide or resume work."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.phase = "startup"
+        self.states = {}
+        self.error = ""
+        self.retained = None
         self.started = time.monotonic()
-        self.interactive = not no_spinner and sys.stdout.isatty()
-        self._spinner: asyncio.Task[None] | None = None
-        self._stop = False
 
-    def snapshot(self) -> str:
-        elapsed = int(time.monotonic() - self.started)
-        return f"phase={self.phase} active={self.active} complete={self.complete} merged={self.merged} blocked={self.blocked} elapsed={elapsed}s"
+    def begin(self, phase, identities=()):
+        with self.lock:
+            self.phase = phase
+            self.states = dict.fromkeys(identities, ("queued", ""))
 
-    def event(self, message: str) -> None:
-        if self.interactive and self._spinner:
-            print("\r\033[2K", end="", flush=True)
-        emit(message)
+    def set(self, identity, state, detail=""):
+        with self.lock:
+            self.states[identity] = (state, " ".join(detail.split())[:180])
 
-    async def start(self) -> None:
-        if self.no_spinner or not sys.stdout.isatty():
-            self._spinner = asyncio.create_task(self._heartbeat())
-        else:
-            self._spinner = asyncio.create_task(self._spin())
-
-    async def stop(self) -> None:
-        self._stop = True
-        if self._spinner:
-            self._spinner.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._spinner
-            if self.interactive:
-                print("\r\033[2K", end="", flush=True)
-            self._spinner = None
-
-    async def _spin(self) -> None:
-        frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-        index = 0
-        while not self._stop:
-            print(f"\r{frames[index % len(frames)]} {self.phase.upper()} {self.snapshot()}", end="", flush=True)
-            index += 1
-            await asyncio.sleep(0.35)
-
-    async def _heartbeat(self) -> None:
-        while not self._stop:
-            await asyncio.sleep(15)
-            if not self._stop:
-                emit(f"[RUN] {self.snapshot()}")
+    def __call__(self):
+        with self.lock:
+            if self.retained is not None:
+                return (f"PROJECT MERGED | validation=passed | cleanup={'partial' if self.retained else 'complete'} "
+                        f"| retained={self.retained} | total={int(time.monotonic() - self.started)}s")
+            counts = Counter(state for state, _ in self.states.values())
+            active = "; ".join(f"{key}:{state}" + (f" ({detail})" if detail else "")
+                               for key, (state, detail) in self.states.items() if state != "merged")
+            return (f"{self.phase.upper()} | agents={counts['agent']} validating={counts['validating']} "
+                    f"conflicts={counts['resolving']} waiting={counts['ci'] + counts['merging'] + counts['queued'] + counts['publishing']} "
+                    f"merged={counts['merged']}/{len(self.states)} blocked={counts['blocked']} "
+                    f"total={int(time.monotonic() - self.started)}s"
+                    + (f" | {active}" if active else "") + (f" | BLOCKED: {self.error}" if self.error else ""))
 
 
-def load_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
+def check(repo: Path, command: str, log: Path) -> None:
+    shell = ("pwsh", "-NoProfile", "-NonInteractive", "-Command") if os.name == "nt" else ("sh", "-c")
+    execute(repo, *shell, command, log=log)
 
 
-def validate_bugs(data: object) -> list[dict[str, Any]]:
-    if not isinstance(data, dict) or not isinstance(data.get("bugs"), list):
-        raise ValueError("bugs.json must contain a bugs array")
-    result: list[dict[str, Any]] = []
-    ids: set[str] = set()
-    for index, bug in enumerate(data["bugs"], 1):
-        if not isinstance(bug, dict):
-            raise ValueError(f"bugs[{index}] must be an object")
-        for field in ("id", "description", "location", "evidence", "expected", "validation"):
-            if field not in bug or not isinstance(bug[field], str) or not bug[field].strip():
-                raise ValueError(f"bugs[{index}] missing valid {field}")
-        if bug["id"] in ids:
-            raise ValueError(f"duplicate bug id: {bug['id']}")
-        ids.add(bug["id"])
-        result.append(bug)
-    return result
+def pull_request(repo: Path, branch: str, base: str, title: str, body: Path) -> str:
+    url = execute(repo, "gh", "pr", "create", "--head", branch, "--base", base,
+                  "--title", title, "--body-file", str(body))
+    say(f"[PR] {url}")
+    return url
 
 
-def atomic_write(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent, text=True)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
-            stream.write(content)
-        os.replace(name, path)
-    except BaseException:
+def wait_checks(repo: Path, url: str) -> None:
+    checks = json.loads(execute(repo, "gh", "pr", "view", url, "--json", "statusCheckRollup"))
+    if checks["statusCheckRollup"]:
+        execute(repo, "gh", "pr", "checks", url, "--watch")
+
+
+def merge(repo: Path, url: str, sha: str) -> None:
+    execute(repo, "gh", "pr", "merge", url, "--merge", "--match-head-commit", sha)
+    if json.loads(execute(repo, "gh", "pr", "view", url, "--json", "state"))["state"] != "MERGED":
+        raise RuntimeError(f"PR has not merged: {url}")
+
+
+def worktree(repo: Path, path: Path, base: str, branch: str | None = None) -> None:
+    mode = ["-b", branch] if branch else ["--detach"]
+    execute(repo, "git", "worktree", "add", *mode, str(path), base)
+    source, destination = repo / "AGENTS.md", path / "AGENTS.md"
+    if not destination.exists() or destination.read_text(encoding="utf-8") != source.read_text(encoding="utf-8"):
+        destination.write_bytes(source.read_bytes())
+
+
+def cleanup_worktree(repo: Path, path: Path) -> None:
+    root = path.resolve()
+    if root == repo.resolve() or Path(execute(path, "git", "rev-parse", "--show-toplevel")).resolve() != root:
+        raise ValueError(f"not a temporary worktree root: {path}")
+    # Only untracked Python bytecode; never delete source or tracked cache files.
+    for name in execute(path, "git", "ls-files", "--others", "-z").split("\0"):
+        relative = Path(name)
+        if "__pycache__" not in relative.parts or relative.suffix != ".pyc":
+            continue
+        cache = path / relative
+        if cache.is_symlink() or not cache.resolve().is_relative_to(root):
+            continue
+        cache.unlink()
         try:
-            os.unlink(name)
-        except FileNotFoundError:
-            pass
-        raise
+            cache.parent.rmdir()
+        except OSError:
+            pass  # Other files in the directory must be retained.
+    # Repair only checkout-format differences from older Relay AGENTS.md copies.
+    if (execute(path, "git", "ls-tree", "--name-only", "HEAD", "--", "AGENTS.md")
+            and execute(path, "git", "status", "--porcelain", "--", "AGENTS.md")
+            and not execute(path, "git", "diff", "HEAD", "--", "AGENTS.md")
+            and not execute(path, "git", "diff", "--cached", "--", "AGENTS.md")):
+        execute(path, "git", "restore", "--worktree", "--", "AGENTS.md")
+    execute(repo, "git", "worktree", "remove", str(path))
 
 
-def add_worktree(repo: Path, branch: str, base: str, path: Path) -> None:
+def integrate(repo, url, sha, item, kind, directory, context, merge_lock, summary):
+    identity = item["id"]
+    summary.set(identity, "ci", url)
+    wait_checks(repo, url)
     try:
-        run_command("git", "-C", str(repo), "show-ref", "--verify", f"refs/heads/{branch}")
-        run_command("git", "-C", str(repo), "worktree", "add", str(path), branch)
-    except subprocess.CalledProcessError:
-        run_command("git", "-C", str(repo), "worktree", "add", "-b", branch, str(path), base)
+        summary.set(identity, "merging", url)
+        with merge_lock:
+            merge(repo, url, sha)
+        return
+    except RuntimeError:
+        pr = json.loads(execute(repo, "gh", "pr", "view", url, "--json",
+                                "mergeable,baseRefName,headRefName,headRefOid"))
+        if pr["mergeable"] != "CONFLICTING" or pr["headRefOid"] != sha:
+            raise
 
-
-def remove_worktree(repo: Path, path: Path) -> None:
+    summary.set(identity, "resolving", url)
+    say(f"[{identity}] agent resolving merge conflict: {url}")
+    execute(repo, "git", "fetch", "origin", pr["baseRefName"], pr["headRefName"])
+    target = execute(repo, "git", "rev-parse", "origin/" + pr["baseRefName"])
+    path = directory / f"{kind}-{identity}-merge"
+    worktree(repo, path, sha)
+    instructions = (path / "AGENTS.md").read_bytes()
     try:
-        run_command("git", "-C", str(repo), "worktree", "remove", "--force", str(path))
-    except (OSError, subprocess.CalledProcessError):
-        pass
+        execute(path, "git", "merge", "--no-commit", "--no-ff", target)
+    except RuntimeError as error:
+        conflicts = execute(path, "git", "diff", "--name-only", "--diff-filter=U").splitlines()
+        if not conflicts:
+            raise
+        agent(path, "merge", {**context, "item": item, "pr": url, "base": target,
+                             "conflicts": conflicts, "git_output": str(error)},
+              directory / f"{kind}-{identity}-merge.txt", write=True)
+    if execute(path, "git", "diff", "--name-only", "--diff-filter=U"):
+        raise RuntimeError(f"{url}: agent left unresolved conflicts; work retained at {path}")
+    execute(path, "git", "diff", "--cached", "--check")
+    if execute(path, "git", "rev-parse", "HEAD") != sha or execute(path, "git", "rev-parse", "MERGE_HEAD") != target:
+        raise RuntimeError(f"{url}: agent changed the merge history; work retained at {path}")
+    if (path / "AGENTS.md").read_bytes() != instructions:
+        raise RuntimeError(f"{url}: agent changed AGENTS.md; work retained at {path}")
+    for index, command in enumerate(item["validation"]):
+        summary.set(identity, "validating", command)
+        check(path, command, directory / f"{kind}-{identity}-merge-check-{index}.log")
+    execute(path, "git", "add", "--all")
+    execute(path, "git", "commit", "-m", f"Resolve integration conflicts for {identity}")
+    resolved = execute(path, "git", "rev-parse", "HEAD")
+    execute(path, "git", "push", "origin", f"HEAD:refs/heads/{pr['headRefName']}")
+    summary.set(identity, "ci", url)
+    wait_checks(repo, url)
+    summary.set(identity, "merging", url)
+    with merge_lock:
+        merge(repo, url, resolved)
 
 
-def branch_exists(repo: Path, branch: str) -> bool:
-    try:
-        run_command("git", "-C", str(repo), "show-ref", "--verify", f"refs/heads/{branch}")
+def worker(repo: Path, item: dict, kind: str, base: str, directory: Path,
+           context: dict, merge_lock: threading.Lock, summary: Summary | None = None) -> None:
+    summary = summary or Summary()
+    identity = item["id"]
+    path = directory / f"{kind}-{identity}"
+    branch = f"relay/{kind}/{identity}"
+    existing = json.loads(execute(repo, "gh", "pr", "list", "--head", branch,
+                                  "--base", INTEGRATION, "--state", "all",
+                                  "--json", "url,state,headRefOid,mergeCommit"))
+    if existing:
+        pr = existing[0]
+        if pr["state"] == "MERGED":
+            execute(repo, "git", "merge-base", "--is-ancestor", pr["mergeCommit"]["oid"], base)
+            say(f"[{identity}] already integrated {pr['url']}")
+            summary.set(identity, "merged", pr["url"])
+            return
+        if pr["state"] != "OPEN":
+            raise RuntimeError(f"{identity}: existing PR was closed without merging: {pr['url']}")
+        say(f"[{identity}] continuing existing PR {pr['url']}")
+        integrate(repo, pr["url"], pr["headRefOid"], item, kind, directory, context, merge_lock, summary)
+        summary.set(identity, "merged", pr["url"])
+        say(f"[{identity}] merged {pr['url']}")
+        return
+    say(f"[{identity}] starting worktree={path}")
+    worktree(repo, path, base, branch)
+    instructions = (path / "AGENTS.md").read_bytes()
+    response = directory / f"{kind}-{identity}.txt"
+    summary.set(identity, "agent")
+    agent(path, kind, {**context, "item": item}, response, write=True)
+    if (path / "AGENTS.md").read_bytes() != instructions:
+        raise RuntimeError(f"{identity}: agent changed AGENTS.md")
+    if execute(path, "git", "rev-parse", "HEAD") != base:
+        raise RuntimeError(f"{identity}: agent changed Git history; expected uncommitted implementation")
+    for index, command in enumerate(item["validation"]):
+        summary.set(identity, "validating", command)
+        say(f"[{identity}] validating: {command}")
+        check(path, command, directory / f"{kind}-{identity}-check-{index}.log")
+    execute(path, "git", "add", "--all")
+    changed = execute(path, "git", "diff", "--cached", "--name-only").splitlines()
+    if {"requirements.md", "plan.md", "tasks.json", "bugs.json"}.intersection(changed):
+        raise RuntimeError(f"{identity}: changed a planning artifact")
+    if not [name for name in changed if name != "AGENTS.md"]:
+        raise RuntimeError(f"{identity}: no implementation changes")
+    execute(path, "git", "commit", "-m", f"{identity}: {item.get('title', 'bug fix')}")
+    sha = execute(path, "git", "rev-parse", "HEAD")
+    summary.set(identity, "publishing")
+    execute(path, "git", "push", "origin", branch)
+    url = pull_request(repo, branch, INTEGRATION, f"{identity}: {item.get('title', 'bug fix')}", response)
+    integrate(repo, url, sha, item, kind, directory, context, merge_lock, summary)
+    summary.set(identity, "merged", url)
+    say(f"[{identity}] merged {url}")
+
+
+def parallel(repo: Path, entries: list[dict], kind: str, directory: Path, context: dict, summary=None) -> bool:
+    summary = summary or Summary()
+    summary.begin("build" if kind == "task" else "bug fixes", [item["id"] for item in entries])
+    if not entries:
         return True
-    except subprocess.CalledProcessError:
-        return False
+    execute(repo, "git", "fetch", "origin", INTEGRATION)
+    base = execute(repo, "git", "rev-parse", f"origin/{INTEGRATION}")
+    lock = threading.Lock()
+    say(f"[{kind.upper()}] items={len(entries)} running in parallel")
+    passed = True
+    with ThreadPoolExecutor(max_workers=len(entries)) as executor:
+        futures = {executor.submit(worker, repo, item, kind, base, directory, context, lock, summary): item for item in entries}
+        for future in as_completed(futures):
+            identity = futures[future]["id"]
+            try:
+                future.result()
+            except (OSError, ValueError, RuntimeError) as error:
+                passed = False
+                summary.set(identity, "blocked", str(error))
+                say(f"[{identity}] blocked: {error}\nWork retained: {directory / (kind + '-' + identity)}")
+    return passed
 
 
-def ensure_integration(repo: Path) -> None:
-    base = "main"
-    if not branch_exists(repo, INTEGRATION_BRANCH):
-        run_command("git", "-C", str(repo), "branch", INTEGRATION_BRANCH, base)
+def pipeline(repo: Path, data: dict, directory: Path, summary=None) -> bool:
+    summary = summary or Summary()
+    tasks = items(data, "tasks")
+    requirements = (repo / "requirements.md").read_text(encoding="utf-8")
+    context = {"requirements": requirements, "plan": (repo / "plan.md").read_text(encoding="utf-8")}
+    execute(repo, "gh", "auth", "status")
+    execute(repo, "git", "fetch", "origin", "main")
+    project_pr = None
+    if execute(repo, "git", "ls-remote", "--heads", "origin", INTEGRATION):
+        execute(repo, "git", "fetch", "origin", INTEGRATION)
+        existing = json.loads(execute(repo, "gh", "pr", "list", "--head", INTEGRATION,
+                                      "--base", "main", "--state", "all",
+                                      "--json", "url,state,headRefOid,mergeCommit"))
+        project_pr = existing[0] if existing else None
+        if project_pr and project_pr["state"] == "MERGED":
+            if project_pr["headRefOid"] != execute(repo, "git", "rev-parse", f"origin/{INTEGRATION}"):
+                raise RuntimeError("integration changed after the project merged; start a new campaign instead of reusing old task/bug IDs")
+            execute(repo, "git", "merge-base", "--is-ancestor", project_pr["mergeCommit"]["oid"], "origin/main")
+            say(f"[RUN] project already merged: {project_pr['url']}; no agents or validation run; artifacts retained")
+            summary.begin("already merged; not revalidated", ["project"])
+            summary.set("project", "merged", project_pr["url"])
+            return True
+        if project_pr and project_pr["state"] != "OPEN":
+            raise RuntimeError(f"project PR was closed without merging: {project_pr['url']}")
+        say(f"[RUN] continuing {INTEGRATION}")
     else:
+        execute(repo, "git", "push", "origin", f"refs/remotes/origin/main:refs/heads/{INTEGRATION}")
+    if not parallel(repo, tasks, "task", directory, context, summary=summary):
+        return False
+
+    audit_tree = directory / "audit"
+    bugs_file = repo / "bugs.json"
+    if bugs_file.exists():
+        bugs = items(json.loads(bugs_file.read_text(encoding="utf-8")), "bugs")
+        say(f"[AUDIT] reusing bugs.json bugs={len(bugs)}; no new audit")
+    else:
+        execute(repo, "git", "fetch", "origin", INTEGRATION)
+        base = execute(repo, "git", "rev-parse", f"origin/{INTEGRATION}")
+        worktree(repo, audit_tree, base)
+        say("[AUDIT] running")
+        summary.begin("audit", ["audit"])
+        summary.set("audit", "agent")
+        raw = agent(audit_tree, "audit", {**context, "tasks": tasks}, directory / "audit.json")
+        bugs = items(decode(raw), "bugs")
+        bugs_file.write_text(json.dumps({"bugs": bugs}, indent=2) + "\n", encoding="utf-8")
+        say(f"[AUDIT] complete bugs={len(bugs)}")
+    if not parallel(repo, bugs, "bug", directory, context, summary=summary):
+        return False
+
+    execute(repo, "git", "fetch", "origin", INTEGRATION)
+    final_sha = execute(repo, "git", "rev-parse", f"origin/{INTEGRATION}")
+    final_tree = directory / "final"
+    worktree(repo, final_tree, final_sha)
+    validations = dict.fromkeys(command for item in tasks + bugs for command in item["validation"])
+    summary.begin("final validation", ["project"])
+    for index, command in enumerate(validations):
+        say(f"[FINAL] validating: {command}")
+        summary.set("project", "validating", command)
+        check(final_tree, command, directory / f"final-check-{index}.log")
+    if execute(final_tree, "git", "diff", "HEAD", "--name-only"):
+        raise RuntimeError("final validation modified tracked files; validated code must match the project PR")
+    say("[FINAL] validation passed")
+    body = directory / "project-pr.md"
+    body.write_text(context["plan"], encoding="utf-8")
+    summary.begin("project PR", ["project"])
+    summary.set("project", "publishing")
+    url = project_pr["url"] if project_pr else pull_request(repo, INTEGRATION, "main", "Relay project integration", body)
+    integrate(repo, url, final_sha, {"id": "project", "description": "Integrate the validated project into main",
+              "validation": list(validations)}, "project", directory, context, threading.Lock(), summary)
+    summary.set("project", "merged", url)
+    say(f"[FINAL] merged {url}")
+    paths = [directory / f"task-{item['id']}" for item in tasks]
+    paths += [directory / f"bug-{item['id']}" for item in bugs] + [audit_tree, final_tree]
+    paths += [directory / f"task-{item['id']}-merge" for item in tasks]
+    paths += [directory / f"bug-{item['id']}-merge" for item in bugs] + [directory / "project-project-merge"]
+    summary.phase = "cleanup"
+    retained = 0
+    for path in paths:
+        if not path.exists():
+            continue
         try:
-            run_command("git", "-C", str(repo), "fetch", "origin", INTEGRATION_BRANCH)
-            fast_forward_branch(repo, INTEGRATION_BRANCH)
-        except subprocess.CalledProcessError:
-            pass
-    run_command("git", "-C", str(repo), "push", "--set-upstream", "origin", INTEGRATION_BRANCH)
+            cleanup_worktree(repo, path)
+        except (OSError, ValueError, RuntimeError) as error:
+            retained += 1
+            say(f"[CLEANUP] retained {path}: {error}")
+    summary.retained = retained
+    say(f"[RUN] project merged; cleanup={'partial' if retained else 'complete'}; logs={directory}")
+    summary.phase = "cleanup partial" if retained else "complete"
+    return True
 
 
-def refresh_integration(repo: Path) -> None:
-    run_command("git", "-C", str(repo), "fetch", "origin", INTEGRATION_BRANCH)
-    fast_forward_branch(repo, INTEGRATION_BRANCH)
-
-
-def fast_forward_branch(repo: Path, branch: str) -> None:
-    local = git(repo, "rev-parse", branch, capture=True)
-    remote = git(repo, "rev-parse", f"origin/{branch}", capture=True)
-    run_command("git", "-C", str(repo), "merge-base", "--is-ancestor", local, remote)
-    run_command("git", "-C", str(repo), "update-ref", f"refs/heads/{branch}", remote, local)
-
-
-def parse_pr_number(text: str) -> str:
-    match = re.search(r"/pull/(\d+)", text)
-    if not match:
-        raise ValueError("gh pr create returned no pull request URL")
-    return match.group(1)
-
-
-def task_branch(prefix: str, item_id: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", item_id).strip("-")
-    return f"relay/{prefix}/{safe}"
-
-
-def prompt(name: str, context: str) -> str:
-    path = PROMPTS / name
-    return path.read_text(encoding="utf-8") + "\n\n## Runtime context\n" + context
-
-
-async def run_codex(worktree: Path, text: str, extra_dirs: list[Path] | None = None) -> tuple[int, str]:
-    args = command("codex") + [
-        "exec",
-        "--ephemeral",
-        "--dangerously-bypass-approvals-and-sandbox",
-        "--cd",
-        str(worktree),
-    ]
-    for directory in extra_dirs or []:
-        args.extend(["--add-dir", str(directory)])
-    args.append("-")
-    process = await asyncio.create_subprocess_exec(
-        *args,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", type=Path, required=True)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--no-spinner", action="store_true")
+    args = parser.parse_args(argv)
+    summary = Summary()
     try:
-        output, _ = await asyncio.wait_for(process.communicate(text.encode()), AGENT_TIMEOUT)
-    except asyncio.TimeoutError:
-        process.kill()
-        await process.wait()
-        return 124, "agent timed out"
-    return process.returncode or 0, output.decode(errors="replace")
-
-
-def worktree_clean(path: Path) -> bool:
-    return not run_command("git", "-C", str(path), "status", "--porcelain", capture=True).stdout.strip()
-
-
-def changed_files(path: Path, base: str) -> list[str]:
-    result = run_command("git", "-C", str(path), "diff", "--name-only", f"{base}..HEAD", capture=True)
-    return [line for line in result.stdout.splitlines() if line.strip()]
-
-
-async def create_pr_and_merge(
-    repo: Path,
-    branch: str,
-    base: str,
-    title: str,
-    body: str,
-    merge_lock: asyncio.Lock,
-) -> str:
-    output = await asyncio.to_thread(
-        gh,
-        "pr",
-        "create",
-        "--base",
-        base,
-        "--head",
-        branch,
-        "--title",
-        title,
-        "--body",
-        body,
-        cwd=repo,
-        capture=True,
-    )
-    number = parse_pr_number(output)
-    await asyncio.to_thread(gh, "pr", "checks", number, "--required", "--watch", cwd=repo)
-    async with merge_lock:
-        await asyncio.to_thread(gh, "pr", "merge", number, "--squash", "--delete-branch", cwd=repo)
-        await asyncio.to_thread(refresh_integration, repo)
-    return number
-
-
-async def run_item(
-    repo: Path,
-    item: dict[str, Any],
-    kind: str,
-    base: str,
-    status: Status,
-    merge_lock: asyncio.Lock,
-) -> bool:
-    item_id = item["id"]
-    branch = task_branch("task" if kind == "task" else "bug", item_id)
-    path = Path(tempfile.mkdtemp(prefix=f"relay-{kind}-{item_id}-"))
-    status.active += 1
-    status.event(f"[{item_id}] started")
-    try:
-        await asyncio.to_thread(add_worktree, repo, branch, base, path)
-        agents = (repo / "AGENTS.md").read_text(encoding="utf-8") if (repo / "AGENTS.md").is_file() else "(no AGENTS.md present)"
-        context = f"""
-REPOSITORY={repo}
-WORKTREE={path}
-BRANCH={branch}
-AGENTS_MD:
-{agents}
-ITEM_JSON:
-{json.dumps(item, indent=2)}
-"""
-        template = "task.md" if kind == "task" else "bug.md"
-        code, output = await run_codex(path, prompt(template, context))
-        if status.verbose and output:
-            for line in output.splitlines()[-80:]:
-                status.event(f"[{item_id}] {line}")
-        if code:
-            raise RuntimeError(f"agent exited {code}")
-        if not await asyncio.to_thread(worktree_clean, path):
-            raise RuntimeError("worktree is dirty after agent exit")
-        files = await asyncio.to_thread(changed_files, path, base)
-        if not files:
-            raise RuntimeError("agent produced no committed changes")
-        sha = await asyncio.to_thread(git, path, "rev-parse", "HEAD", capture=True)
-        status.event(f"[{item_id}] committed {sha[:12]}")
-        await asyncio.to_thread(run_command, "git", "-C", str(path), "push", "--set-upstream", "origin", branch)
-        title = f"{item_id}: {item.get('title', item.get('description', 'change'))}"
-        body = f"Automated Relay {kind}.\n\n{json.dumps(item, indent=2)}"
-        number = await create_pr_and_merge(repo, branch, INTEGRATION_BRANCH, title, body, merge_lock)
-        status.event(f"[{item_id}] PR #{number} merged")
-        status.complete += 1
-        status.merged += 1
-        return True
-    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-        status.blocked += 1
-        status.event(f"[{item_id}] blocked reason={str(error).splitlines()[0]}")
-        return False
-    finally:
-        status.active -= 1
-        await asyncio.to_thread(remove_worktree, repo, path)
-
-
-async def run_items(repo: Path, items: list[dict[str, Any]], kind: str, status: Status) -> bool:
-    if not items:
-        return True
-    status.phase = "build" if kind == "task" else "bugs"
-    status.event(f"[{status.phase.upper()}] starting {kind}s={len(items)} agents={len(items)}")
-    merge_lock = asyncio.Lock()
-    results = await asyncio.gather(*(run_item(repo, item, kind, INTEGRATION_BRANCH, status, merge_lock) for item in items))
-    return all(results)
-
-
-async def audit(repo: Path, status: Status) -> list[dict[str, Any]] | None:
-    status.phase = "audit"
-    status.event("[AUDIT] starting")
-    path = Path(tempfile.mkdtemp(prefix="relay-audit-"))
-    output = Path(tempfile.mkdtemp(prefix="relay-audit-output-"))
-    try:
-        await asyncio.to_thread(add_worktree, repo, "relay/audit", INTEGRATION_BRANCH, path)
-        agents = (repo / "AGENTS.md").read_text(encoding="utf-8") if (repo / "AGENTS.md").is_file() else "(no AGENTS.md present)"
-        context = f"""
-REPOSITORY={repo}
-WORKTREE={path}
-OUTPUT_DIR={output}
-AGENTS_MD:
-{agents}
-requirements.md:
-{(repo / 'requirements.md').read_text(encoding='utf-8')}
-plan.md:
-{(repo / 'plan.md').read_text(encoding='utf-8')}
-tasks.json:
-{(repo / 'tasks.json').read_text(encoding='utf-8')}
-"""
-        code, text = await run_codex(path, prompt("audit.md", context), [output])
-        if status.verbose and text:
-            for line in text.splitlines()[-80:]:
-                status.event(f"[AUDIT] {line}")
-        if code:
-            raise RuntimeError(f"audit agent exited {code}")
-        candidate = output / "bugs.json"
-        if not candidate.is_file():
-            raise RuntimeError("audit agent did not create bugs.json")
-        bugs = validate_bugs(load_json(candidate))
-        atomic_write(repo / "bugs.json", json.dumps({"bugs": bugs}, indent=2) + "\n")
-        status.event(f"[AUDIT] complete bugs={len(bugs)}")
-        return bugs
-    except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as error:
-        status.blocked += 1
-        status.event(f"[AUDIT] blocked reason={str(error).splitlines()[0]}")
-        return None
-    finally:
-        await asyncio.to_thread(remove_worktree, repo, path)
-        shutil.rmtree(output, ignore_errors=True)
-
-
-async def final_validation(repo: Path, status: Status, tasks: list[dict[str, Any]], bugs: list[dict[str, Any]]) -> bool:
-    status.phase = "final"
-    status.event("[FINAL] validation started")
-    path = Path(tempfile.mkdtemp(prefix="relay-final-"))
-    commands: list[str] = []
-    for item in [*tasks, *bugs]:
-        for check in item.get("validation", []):
-            if check not in commands:
-                commands.append(check)
-    try:
-        await asyncio.to_thread(add_worktree, repo, "relay/final", INTEGRATION_BRANCH, path)
-        for check in commands:
-            process = await asyncio.create_subprocess_shell(
-                check,
-                cwd=path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            output, _ = await asyncio.wait_for(process.communicate(), CHECK_TIMEOUT)
-            if process.returncode:
-                text = output.decode(errors="replace")[-4000:]
-                raise RuntimeError(f"{check} exited {process.returncode}: {text}")
-        status.event("[FINAL] validation passed")
-        return True
-    except (OSError, RuntimeError, subprocess.TimeoutExpired, asyncio.TimeoutError) as error:
-        status.blocked += 1
-        status.event(f"[FINAL] blocked reason={str(error).splitlines()[0]}")
-        return False
-    finally:
-        await asyncio.to_thread(remove_worktree, repo, path)
-
-
-async def project_pr(repo: Path, status: Status) -> bool:
-    status.phase = "project-pr"
-    status.event("[FINAL] project PR creating")
-    try:
-        output = await asyncio.to_thread(
-            gh,
-            "pr",
-            "create",
-            "--base",
-            "main",
-            "--head",
-            INTEGRATION_BRANCH,
-            "--title",
-            "Relay project integration",
-            "--body",
-            "Automated Relay project PR after final validation.",
-            cwd=repo,
-            capture=True,
-        )
-        number = parse_pr_number(output)
-        await asyncio.to_thread(gh, "pr", "checks", number, "--required", "--watch", cwd=repo)
-        await asyncio.to_thread(gh, "pr", "merge", number, "--squash", "--delete-branch", cwd=repo)
-        status.event(f"[FINAL] project PR #{number} merged")
-        return True
-    except (OSError, ValueError, subprocess.CalledProcessError) as error:
-        status.blocked += 1
-        status.event(f"[FINAL] project PR blocked reason={str(error).splitlines()[0]}")
-        return False
-
-
-def cleanup(repo: Path) -> None:
-    temp_root = Path(tempfile.gettempdir()).resolve()
-    result = run_command("git", "-C", str(repo), "worktree", "list", "--porcelain", capture=True).stdout
-    current: Path | None = None
-    for line in result.splitlines() + [""]:
-        if line.startswith("worktree "):
-            current = Path(line[9:]).resolve()
-        elif not line and current and current != repo.resolve() and current.parent == temp_root and current.name.startswith("relay-"):
-            remove_worktree(repo, current)
-            current = None
-
-
-def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description=__doc__)
-    result.add_argument("--repo", required=True, type=Path)
-    result.add_argument("--dry-run", action="store_true")
-    result.add_argument("--no-spinner", action="store_true")
-    result.add_argument("--verbose", action="store_true")
-    result.add_argument("--cleanup", action="store_true")
-    return result
-
-
-async def main_async(args: argparse.Namespace) -> int:
-    repo = args.repo.expanduser().resolve()
-    if not repo.is_dir() or not (repo / ".git").exists():
-        emit(f"[RUN] blocked reason=not a Git repository: {repo}")
-        return 2
-    if args.cleanup:
-        cleanup(repo)
-        emit("[CLEANUP] complete")
-        return 0
-    for required in ("plan.md", "tasks.json"):
-        if not (repo / required).is_file():
-            emit(f"[RUN] blocked reason=missing {required}")
-            return 2
-    try:
-        tasks_data = load_json(repo / "tasks.json")
-        validate_tasks(tasks_data)
-    except (OSError, json.JSONDecodeError, ValueError) as error:
-        emit(f"[RUN] blocked reason=invalid tasks.json: {str(error).splitlines()[0]}")
-        return 2
-    tasks = tasks_data["tasks"]
-    status = Status(args.no_spinner, args.verbose)
-    await status.start()
-    try:
-        status.phase = "prepare"
+        repo = project(args.repo)
+        data = json.loads((repo / "tasks.json").read_text(encoding="utf-8"))
+        tasks = items(data, "tasks")
         if args.dry_run:
-            status.event(f"[DRY-RUN] tasks={len(tasks)} agents={len(tasks)}")
+            say(f"[PLAN] tasks={len(tasks)} agents={len(tasks)}")
             return 0
-        await asyncio.to_thread(ensure_integration, repo)
-        if not await run_items(repo, tasks, "task", status):
-            return 2
-        bugs = await audit(repo, status)
-        if bugs is None:
-            return 2
-        if not await run_items(repo, bugs, "bug", status):
-            return 2
-        if not await final_validation(repo, status, tasks, bugs):
-            return 2
-        if not await project_pr(repo, status):
-            return 2
-        status.phase = "cleanup"
-        cleanup(repo)
-        status.event("[CLEANUP] complete")
-        status.event("[RUN] complete")
-        return 0
-    except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
-        status.blocked += 1
-        status.event(f"[RUN] blocked reason={str(error).splitlines()[0]}")
+        directory = Path(tempfile.mkdtemp(prefix="relay-run-"))
+        say(f"[RUN] worktrees and logs: {directory}")
+        with progress(summary, args.no_spinner):
+            return 0 if pipeline(repo, data, directory, summary) else 2
+    except (OSError, ValueError, RuntimeError, KeyError) as error:
+        with summary.lock:
+            summary.error = " ".join(str(error).split())[:240]
+            summary.states = {key: value if value[0] == "merged" else ("blocked", "")
+                              for key, value in summary.states.items()}
+        say(f"[RUN] blocked: {error}")
         return 2
     finally:
-        await status.stop()
-
-
-def main(argv: list[str] | None = None) -> int:
-    return asyncio.run(main_async(parser().parse_args(argv)))
+        if not args.dry_run:
+            say(f"[SUMMARY] {summary()}")
 
 
 if __name__ == "__main__":
