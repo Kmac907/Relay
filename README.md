@@ -1,5 +1,9 @@
 # Relay
 
+<p align="center">
+  <img src="assets/relay-icon.png" alt="Relay icon" width="180">
+</p>
+
 Relay is a simple parallel Ralph pipeline. It plans once, builds tasks in
 parallel, integrates task PRs, audits the integrated result once, fixes the
 reported bugs in parallel, validates once, and opens one project PR.
